@@ -97,8 +97,10 @@ SQLite 对每篇文章逐条提交，并保存当前关键词的 next_result_ind
   MYSQL_PORT=3306
   MYSQL_DATABASE=social
   MYSQL_USER=数据库用户
-  MYSQL_PASSWORD=数据库密码
+  MYSQL_PASSWORD=
   MYSQL_ENABLED=1
+
+MYSQL_PASSWORD 仅在实际运行环境中设置，或通过启动脚本隐藏输入；不要把真实密码写入文档、脚本或配置文件。
 
 入库状态保存在每个关键词目录的 mysql_import_status.json。入库失败只标记当前关键词，retry 会重新入库。每批入库会先读取数据库中现有的微信公众号文章，以“平台+文章ID/标准链接+正文双向80%相似度”做全局去重，不再把项目放入文章自然键；评论自然键同样不含项目。五台机器通过 MySQL GET_LOCK 串行执行去重和入库，避免并发冲突。
 

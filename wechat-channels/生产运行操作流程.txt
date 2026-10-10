@@ -15,7 +15,7 @@
 机器2双击：worker-02\启动Redis动态工作节点.bat
 机器3双击：worker-03\启动Redis动态工作节点.bat
 
-Redis任务分发机另双击根目录：启动集中日志接收.bat
+Redis任务分发机另执行：powershell -ExecutionPolicy Bypass -File common\start-central-log-sink.ps1
 该接收器不执行采集，只把三台节点回传到Redis的脱敏日志持续保存到central-logs目录；关闭后再次启动会从原子游标续收。
 
 三、任务如何分配

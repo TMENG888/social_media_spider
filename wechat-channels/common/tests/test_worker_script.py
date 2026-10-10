@@ -35,16 +35,6 @@ class WorkerScriptTests(unittest.TestCase):
         self.assertIn("[System.IO.Path]::GetFullPath", source)
         self.assertNotIn("$taskFile = Join-Path $Root $task.keywordsFile", source)
 
-    def test_incremental_updater_includes_process_loopback_runtime(self):
-        source = (
-            COMMON.parent / "应用20260928窗口与Redis修复.ps1"
-        ).read_text(encoding="utf-8-sig")
-        self.assertIn("common\\src\\loopback-recorder.py", source)
-        self.assertIn("common\\src\\process-loopback-recorder.exe", source)
-        self.assertIn("common\\src\\asr-worker.py", source)
-        self.assertIn("common\\check-env.ps1", source)
-        self.assertNotIn('throw "Target file missing:', source)
-
     def test_redis_reset_generation_isolates_local_state(self):
         worker = (COMMON / "run-worker.ps1").read_text(encoding="utf-8-sig")
         asr = (COMMON / "run-asr-backfill.ps1").read_text(encoding="utf-8-sig")

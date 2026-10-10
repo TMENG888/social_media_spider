@@ -61,7 +61,7 @@ common\sql\upgrade_existing_ods_to_utf8mb4.sql。升级前，入库器会自动�
 6. 三台worker默认均为mixed，可并行领取不同关键词；每次重启会优先回收至多1个租约已过期的主任务pending，之后继续未读关键词，并公平检查精准视频补采。仍可通过REDIS_WORKER_ROLE=primary/mixed/asr手工覆盖角色。
 7. 同一个 REDIS_RUN_ID 重启不会重复播种；需要全新重跑时更换 REDIS_RUN_ID，不要直接删除 Redis 全库。
 8. REDIS.env.example 给出了变量示例。URL 中不要写密码，密码在启动时掩码输入。
-9. 各节点继续保留 worker-0N\logs 下的本机按日日志，同时把脱敏后的任务事件与子进程输出写入 wechat:channels:<RUN_ID>:logs。任务分发机双击根目录“启动集中日志接收.bat”，即可持续落盘到 central-logs\<RUN_ID>\<日期>，同时生成 all.log/all.jsonl 和按消费者拆分的日志。Redis日志流默认近似保留20万条，集中接收端用原子游标断点续收；日志失败不影响爬虫任务。
+9. 各节点继续保留 worker-0N\logs 下的本机按日日志，同时把脱敏后的任务事件与子进程输出写入 wechat:channels:<RUN_ID>:logs。任务分发机执行 `powershell -ExecutionPolicy Bypass -File common\start-central-log-sink.ps1`，即可持续落盘到 central-logs\<RUN_ID>\<日期>，同时生成 all.log/all.jsonl 和按消费者拆分的日志。Redis日志流默认近似保留20万条，集中接收端用原子游标断点续收；日志失败不影响爬虫任务。
 
 六、断点、去重与入库
 
@@ -89,7 +89,6 @@ common/src/redis_task_queue.py：Redis Streams 播种、领取、心跳、异常
 common/src/redis_log_sink.py：任务分发机集中接收Redis日志并按日期、消费者落盘。
 common/run-redis-worker.ps1：Redis 动态节点入口，一次输入环境配置后持续领任务。
 common/build-three-worker-shards.py：从两份任务 JSON 重建三机分片。
-根目录“生产部署文件清单.txt”：跨机器复制范围、必需文件和可清理目录说明。
 根目录“生产运行操作流程.txt”：Redis 三机启动、领取、断点、重试、死信和停机流程。
 
 八、已知平台边界
@@ -134,7 +133,7 @@ mixed节点领取video-retry后只做一次有上限的目标卡片扫描：近�
 音频回采优先使用Windows音频会话中的WeChatAppEx PID；视频暂停使音频会话暂时消失时，回退使用当前视频详情窗口所属PID继续进程级回采，不再盲目退回全系统端点。视频时长以详情播放器“已播/总时长”的总时长为准，避免把搜索卡片的自动播放剩余时长误当完整时长而截断字幕。实机已分别验证worker-02与worker-03完成Redis领取、精准定位、微信进程录音、Faster-Whisper回填、completed终态及redis_video_retry_acked。
 
 【2026-09-30 有界旧任务恢复与集中日志】
-主扫描节点重启后不再永久绕过旧pending：若旧任务租约已静默超过REDIS_RECLAIM_IDLE_SECONDS（默认300秒），本次进程优先XAUTOCLAIM至多1个旧关键词；处理一次后继续未采集的新关键词，避免同一异常关键词循环霸占节点。每台机器的任务开始、领取、子进程逐行输出和结束码同步进入当前Run ID的有界Redis日志流，密码写入前脱敏；任务分发机通过“启动集中日志接收.bat”断点接收并生成可检索JSONL和人工可读LOG。
+主扫描节点重启后不再永久绕过旧pending：若旧任务租约已静默超过REDIS_RECLAIM_IDLE_SECONDS（默认300秒），本次进程优先XAUTOCLAIM至多1个旧关键词；处理一次后继续未采集的新关键词，避免同一异常关键词循环霸占节点。每台机器的任务开始、领取、子进程逐行输出和结束码同步进入当前Run ID的有界Redis日志流，密码写入前脱敏；任务分发机通过 `common\start-central-log-sink.ps1` 断点接收并生成可检索JSONL和人工可读LOG。
 
 【2026-09-30 安全停止同步】
 worker-01/02/03的“安全停止当前任务.bat”统一改为在同目录原子替换带请求时间、worker编号和来源的stop.requested。主扫描或ASR补采会完成当前视频，持久化SQLite/Redis检查点、导出并入库，然后停止外层Redis节点且不再领取下一项；收到停止标记、当前任务收尾和节点停止事件会进入集中日志。任务分发机上的集中日志接收器不随采集worker停止，以便收完最后日志。

@@ -6,8 +6,11 @@ browsers/
 runs/
 logs/
 central-logs/
+release-packages/
 maintenance-backups/
 .update-backups/
+.pytest_cache/
+.credentials/
 worker-*/
 tasks/
 task-queue.json
@@ -25,6 +28,7 @@ __pycache__/
 *.mp3
 *.mp4
 search-surface.png
+deployment-file-manifest.json
 *.env
 MYSQL.env
 REDIS.env
