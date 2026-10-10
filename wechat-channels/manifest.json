@@ -1,0 +1,80 @@
+{
+  "name": "微信视频号三机分布式部署包",
+  "version": "2026.10.06-channels-small-download-recovery",
+  "platform": "微信视频号",
+  "dateStart": "2026-01-01",
+  "dateEnd": "now",
+  "workers": ["worker-01", "worker-02", "worker-03"],
+  "keywordCounts": {"topic1": 223, "topic2": 53, "total": 276},
+  "execution": {
+    "topicOrder": ["topic1", "topic2"],
+    "mode": "static_shards_or_redis_streams",
+    "transitionDelaySeconds": 10,
+    "topic1CollectComments": false,
+    "topic2CollectComments": true,
+    "pipeline": [
+      "first_detail_visit_metadata_interactions_topic2_comments_and_full_audio",
+      "durable_video_checkpoint_after_recording",
+      "node_local_persistent_asr_background_backfill",
+      "exact_video_retry_only_for_unresolved_failures"
+    ],
+    "rpaBlocksOnAsr": false,
+    "retryPolicy": {
+      "keywordImmediateAttempts": 1,
+      "videoAttemptsPerRun": 1,
+      "videoAttemptsBeforeDeadLetter": 3,
+      "exactRetryCardScan": "single bounded pass; no full-keyword rebuild and no periodic long break while only comparing card identities",
+      "completedCardsOpenDetailOnResume": false,
+      "pendingVideoPreventsFinalCompletion": true,
+      "pendingVideoMovesToIndependentRetryStream": true,
+      "crossKeywordDedupe": "project + canonical finder/share article_key"
+    },
+    "redis": {
+      "optional": true,
+      "consumerGroup": "channels-workers",
+      "retryConsumerGroup": "channels-workers-video-retry",
+      "leaseHeartbeatSeconds": 30,
+      "heartbeatFailureLimit": 3,
+      "reclaimIdleSeconds": 300,
+      "ackAfter": "annual keyword scan reaches cutoff/exhaustion and every unfinished child video is durably staged to video-retry; partial/safe-stop scans stage committed child videos but keep the primary keyword pending",
+      "scheduling": "worker-01/02/03 all default to mixed; Redis leases assign different keyword tasks concurrently, each node performs first-visit metadata/comments/full-audio capture and reuses one local persistent large-v3 service; exact-video retries are interleaved fairly",
+      "crossMachineAsr": "a retry worker may create missing local SQLite state and hydrate the exact checkpoint from Redis; resolved Redis URL/password/run-id are propagated to the child process",
+      "safeStop": "atomically write a timestamped per-worker marker; finish the current video, salvage and import committed metadata, idempotently stage missing ASR work, publish stop lifecycle events to central logging, then stop the outer Redis worker before another task is claimed; the dispatcher log sink remains running for final logs",
+      "completionCheck": "both consumer-group pending count and unread lag must be zero before a worker declares the queue complete",
+      "emptyResultCheckpoint": "the first explicit empty result is always partial_empty_unverified/partial_inconsistent_empty, is never XACKed as complete, and is retried from the top on a later run",
+      "searchPacing": "per-worker randomized UI jitter plus one Redis Lua search-submit token shared by all workers in the run; token spacing is 12-25 seconds and does not gate detail parsing, playback, ASR, export or MySQL",
+      "videoCheckpointScope": "full row, comments, full-audio artifact/job, field completeness, retry and dead-letter status",
+      "loadMoreRecovery": "when the search surface disappears during lazy loading, rebuild the same keyword twice; if recovery is exhausted, persist partial_search_window_unavailable without acknowledging the Redis task",
+      "asrRecoveryScope": "normal recovery is limited to the current keyword; an exact video retry restores only its article key and never drains unrelated local WAV jobs",
+      "resetGeneration": "each Redis namespace reset creates a new central generation token; workers isolate SQLite and runs by run-id plus generation so stale local completion state cannot skip freshly seeded work",
+      "centralLogging": "each worker keeps its daily local transcript and also appends credential-redacted task/child output to a bounded per-run Redis Stream; the dispatcher sink persists combined and per-consumer JSONL/text logs"
+    }
+  },
+  "database": {
+    "enabledByDefault": true,
+    "database": "social",
+    "postTable": "ods_social_media_post",
+    "commentTable": "ods_social_media_comment",
+    "credentialsSource": "environment variables MYSQL_USER/MYSQL_PASSWORD",
+    "charset": "utf8mb4; legacy utf8mb3 columns receive a non-BMP compatibility fallback until the supplied migration is applied"
+  },
+  "fieldMapping": {
+    "点赞": "文章点赞数",
+    "推荐": "文章收藏数",
+    "转发": "文章分享数",
+    "评论": "文章评论数",
+    "播放": "文章标注（页面可见时）"
+  },
+  "pagination": {
+    "schemaVersion": "channels-pagination-v1",
+    "maxResultsPerKeyword": 0,
+    "zeroMeans": "unlimited until confirmed exhaustion, 2026-01-01 cutoff, or operator safe stop",
+    "partialResume": "restart from newest and idempotently upsert by finder id",
+    "nextKeywordGate": "current keyword must have a complete_* status"
+  },
+  "compliance": {
+    "scope": "public or authorized content only",
+    "captcha": "never bypass; stop and wait for operator",
+    "login": "operator completes login/QR verification on each machine"
+  }
+}

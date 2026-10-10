@@ -1,0 +1,13 @@
+{
+  "url": "redis://127.0.0.1:6379/0",
+  "username": "",
+  "campaign": "douyin-example-run",
+  "leaseMs": 300000,
+  "heartbeatMs": 30000,
+  "commandTimeoutMs": 10000,
+  "heartbeatRetryMs": 5000,
+  "leaseSafetyMs": 20000,
+  "maxAttempts": 3,
+  "retryDelayMs": 60000
+}
+

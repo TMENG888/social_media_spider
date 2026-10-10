@@ -1,0 +1,20 @@
+{
+  "name": "baidu-news-playwright-rpa",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "crawl": "node src/index.mjs",
+    "discover": "node src/index.mjs --mode discover",
+    "batch": "node src/run-batch.mjs",
+    "acceptance": "node src/build-acceptance.mjs",
+    "tasks:keywords": "node src/build-keyword-tasks.mjs",
+    "tasks:workers": "node src/build-worker-keyword-tasks.mjs",
+    "tasks:crawl": "node src/build-crawl-tasks.mjs",
+    "import:mysql": "node src/import-mysql.mjs"
+  },
+  "dependencies": {
+    "mysql2": "^3.15.0",
+    "playwright": "^1.62.1"
+  }
+}

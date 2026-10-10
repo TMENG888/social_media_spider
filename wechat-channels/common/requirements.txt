@@ -1,0 +1,7 @@
+openpyxl>=3.1
+Pillow>=10
+pywinauto>=0.6.9
+pywin32>=306
+faster-whisper>=1.1
+soundcard>=0.4.6
+pycaw>=20260927

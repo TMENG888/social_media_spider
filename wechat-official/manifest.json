@@ -1,0 +1,67 @@
+{
+  "name": "微信公众号五机分布式部署包",
+  "version": "2026.09.24-wechat-distributed.24",
+  "platform": "微信公众号",
+  "dateStart": "2026-01-01",
+  "dateEnd": "now",
+  "workers": ["worker-01", "worker-02", "worker-03", "worker-04", "worker-05"],
+  "execution": {
+    "topicOrder": ["topic1", "topic2"],
+    "mode": "sequential",
+    "transitionDelaySeconds": 300,
+    "topic1CollectComments": false,
+    "topic2CollectComments": true
+  },
+  "database": {
+    "enabledByDefault": true,
+    "host": "mysql.example.com",
+    "port": 3306,
+    "database": "social",
+    "postTable": "ods_social_media_post",
+    "commentTable": "ods_social_media_comment",
+    "credentialsSource": "environment variables MYSQL_USER/MYSQL_PASSWORD"
+  },
+  "deduplication": {
+    "scope": ["keyword postprocess", "all-worker merge", "existing MySQL corpus before each import"],
+    "articleNaturalKey": "platform + articleId; canonical URL when articleId is empty",
+    "bodyRule": "exact normalized body or bidirectional 5-character shingle similarity >= 0.80",
+    "shortBodyRule": "under 5 normalized characters only exact equality can match",
+    "titleOnlyMatch": false,
+    "emptyBodyRule": "articleId or canonical URL only",
+    "survivorOrder": ["earliest published time", "earliest fetched time", "smallest id or input order"],
+    "mergeRule": "maximum engagement counts, fill empty fields, retain richer content/media, force article image info null",
+    "auditOutputs": true
+  },
+  "logging": {
+    "scope": "one independent log directory per worker",
+    "pathPattern": "worker-xx/logs/wechat-worker-YYYY-MM-DD.log",
+    "sameDayMode": "append",
+    "captures": ["wrapper", "environment check", "mysql preflight", "PowerShell", "Python", "Node", "exceptions", "exit code"],
+    "passwordCaptured": false
+  },
+  "displayProfiles": {
+    "supported": ["2560x1440", "1920x1080"],
+    "supportedScalePercent": [100, 150],
+    "scaleAwareFallbackCoordinates": true,
+    "promptBeforeLiveRun": true,
+    "autoMaximizeWechatWindows": true
+  },
+  "wechatUiCompatibility": {
+    "versionRestriction": false,
+    "versionUsage": "diagnostics and coordinate fallback only",
+    "layouts": ["detached", "embedded"],
+    "selection": "automatic runtime UIA detection",
+    "articleTabGuard": "verify RootWebArea title is keyword - 文章 - 搜一搜; abort rather than collect 全部/视频"
+  },
+  "pagination": {
+    "schemaVersion": "wechat-pagination-v2",
+    "maxResultsPerKeyword": 0,
+    "zeroMeans": "unlimited until confirmed exhaustion or operator safe stop",
+    "cutoffOldStreak": 1,
+    "cutoffBehavior": "require 最新 sort; stop the current keyword at the first dated result before 2026-01-01",
+    "topVerification": "require RootWebArea vertical scroll percent 0.0 before interpreting index 0",
+    "partialResume": "restart from newest index 0 and idempotently upsert known URLs so inserted new articles cannot shift a numeric checkpoint",
+    "lazyLoadStableRounds": 8,
+    "recheckLegacyExhausted": true
+  }
+}

@@ -1,0 +1,33 @@
+视频号三机部署包：small模型更新（2026-10-05）
+
+生产默认模型已统一为small，保留CPU int8、常驻模型及现有断点/精准补采机制。
+worker-01、worker-02、worker-03均读取common/collector_config.json，无需分别修改任务分片。
+
+其他机器的更新顺序：
+1. 使用安全停止脚本结束当前任务，等待采集程序及其ASR子进程退出。
+2. 将更新包解压到该机器“视频号”根目录，按相对路径覆盖同名文件。
+3. 保留worker目录、.state、runs、日志、凭据及Redis任务，不重置任务。
+4. 重新启动原来的工作节点入口。
+5. 检查persistent_asr_service_ready日志的model为small。
+
+更新文件：
+common/collector_config.json
+common/src/asr-worker.py
+common/src/channels_pc_collector.py
+common/src/channels_browser_enricher.mjs
+common/src/redis_task_queue.py
+common/src/asr_model_loader.py
+common/tests/test_asr_model_loader.py（回归测试，不参与采集运行）
+common/tests/test_small_asr_default.py（回归测试，不参与采集运行）
+manifest.json
+small模型更新说明.txt
+
+注意：
+- 更新包不含模型权重、录音、数据库密码或Redis密码。
+- 本机已缓存small；其他机器若没有缓存，首次启动需要联网下载，期间会比后续启动慢。
+- 启动先检查本地完整模型：存在时仅使用本地缓存；不存在时自动在线下载并检查模型文件。日志会输出cache_check、cache_ready或download_start/download_complete。
+- 下载失败会明确报错并保留已有缓存，不回退large-v3，不把字幕任务判为成功；恢复网络后重启重试。
+- 浏览器媒体转写允许WECHAT_ASR_MODEL显式覆盖默认值；若机器设置过此环境变量，应删除旧值或改为small。
+- 运行中的常驻模型不会自动更换，必须安全停止后重启。
+- 本次只切换模型。此前测试中的OpenCC繁转简尚未接入生产；模型切换也不等同于已修复热词污染。
+- 无需删除large-v3缓存；旧缓存不会因存在而被自动选用。

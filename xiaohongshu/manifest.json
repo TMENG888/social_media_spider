@@ -1,0 +1,41 @@
+{
+  "version": "xhs-portable-20261006-production-ui-v8",
+  "platform": "小红书",
+  "workerCount": 5,
+  "dispatch": {
+    "default": "redis",
+    "fallback": "explicit-local-only",
+    "taskManifest": "common/tasks/redis-tasks.json",
+    "taskManifestHash": "a882c405db1603edc798af390f2559c5afb4338d83b135927039b2ecbbd8898f",
+    "claimOrder": "original-requirement-order-topic1-then-topic2",
+    "taskCount": 331,
+    "topicCounts": { "专题一": 223, "专题二": 108 },
+    "leaseMs": 300000,
+    "heartbeatMs": 30000,
+    "maxAttempts": 3,
+    "semantics": "at-least-once-keyword-task-with-idempotent-mysql-import"
+  },
+  "dateWindow": { "cutoff": "2026-01-01", "targetYear": 2026, "stopWindow": 8, "maxSearchScrolls": null },
+  "collectionPolicy": {
+    "专题一": { "posts": true, "comments": false, "project": "全国地产设计产品力监测", "category": null },
+    "专题二": { "posts": true, "comments": true, "project": "北京臻澐项目口碑", "category": null }
+  },
+  "databaseImport": { "mode": "automatic", "humanReviewRequired": false, "batchSize": 20, "credentialInput": "hidden-process-only" },
+  "redisCredential": { "storage": "per-worker-windows-dpapi", "scope": "current-windows-user-and-machine", "plaintextInPackage": false, "validateBeforeSave": true, "validateBeforeCollection": true },
+  "asr": {
+    "mode": "durable-background-queue",
+    "model": "faster-whisper-small-offline",
+    "jobStore": "checkpoint.sqlite/asr_job",
+    "qualityPasses": ["vad", "no_vad", "chunked_recovery", "head_prefix"],
+    "maxAttemptsPerVideo": 3,
+    "mysqlBackfill": "idempotent-upsert-with-redis-lease-guard",
+    "restartRecovery": "downloading-or-running-to-retry-pending",
+    "deadLetterPolicy": "keep-base-post-and-real-error-without-fake-transcript"
+  },
+  "workers": ["worker-01", "worker-02", "worker-03", "worker-04", "worker-05"],
+  "portableLayout": "common and assigned worker directory are siblings",
+  "productionConnectionVerified": true,
+  "redisEndpoint": "redis://127.0.0.1:6379/0",
+  "redisAclUsername": "xhs_worker",
+  "redisService": "xhs-redis"
+}

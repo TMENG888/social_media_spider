@@ -1,0 +1,11 @@
+{
+ "targetYear":2026,"minPublishedDate":"2026-01-01","category":null,
+ "collectionPhases":"posts_then_authors","visitAuthorProfile":false,"collectAllCurrentYear":true,
+ "maxSearchScrolls":0,"maxNotesPerKeyword":0,"searchStopWindow":8,"maxStagnantRounds":15,
+ "navigationTimeoutMs":45000,"maxCommentScrolls":0,
+ "detailDelayMs":[5000,10000],"batchSize":8,"batchCooldownMs":[45000,90000],
+ "authorDelayMs":[10000,15000],"authorBatchSize":8,"authorBatchCooldownMs":[45000,90000],
+ "asrEnabled":true,"asrModel":"small","asrModelPath":"runtime/asr-models/faster-whisper-small",
+ "asrLocalFilesOnly":true,"asrDevice":"cpu","asrComputeType":"int8_float32",
+ "asrCpuThreads":1,"asrBeamSize":1,"asrMaxAttempts":3,"asrKeepMedia":true
+}

@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {retryImport,isTransient} from '../src/mysql-import-retry.mjs';
+assert.equal(isTransient('read ECONNRESET'),true);
+assert.equal(isTransient('Access denied'),false);
+let calls=0, waits=[];
+assert.equal(await retryImport(async()=>++calls===1?{code:2,error:'ECONNRESET'}:{code:0,error:''},async ms=>waits.push(ms)),0);
+assert.equal(calls,2);assert.deepEqual(waits,[5000]);
+calls=0;waits=[];
+assert.equal(await retryImport(async()=>{calls++;return {code:2,error:'ETIMEDOUT'};},async ms=>waits.push(ms)),2);
+assert.equal(calls,3);assert.deepEqual(waits,[5000,10000]);
+calls=0;
+assert.equal(await retryImport(async()=>{calls++;return {code:2,error:'Access denied'};},async()=>assert.fail()),2);
+assert.equal(calls,1);
+console.log('mysql import retry tests passed: transient recovery, bounded failure, permanent error');

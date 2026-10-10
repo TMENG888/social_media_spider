@@ -1,0 +1,40 @@
+{
+  "wait_short": 0.8,
+  "wait_search_suggest": 1.5,
+  "wait_page": 3.0,
+  "wait_article": 3.0,
+  "wait_load_more": 1.5,
+  "result_scroll_rounds": 120,
+  "max_consecutive_position_skips": 3,
+  "load_more_rounds": 8,
+  "recheck_legacy_exhausted": true,
+  "restart_partial_from_top": true,
+  "skip_known_fingerprint_on_rescan": true,
+  "fast_verify_known_url_on_rescan": true,
+  "wait_known_article": 1.2,
+  "search_window_recovery_attempts": 3,
+  "search_window_recovery_wait_seconds": 2,
+  "keyword_retry_attempts": 5,
+  "keyword_retry_backoff_seconds": 10,
+  "keyword_retry_passes": 2,
+  "cutoff_old_streak": 1,
+  "submit_search_with_enter": false,
+  "web_points": {
+    "article_tab": [400, 132]
+  },
+  "embedded_web_points": {
+    "latest_sort_default": [0.155, 75],
+    "article_tab_by_version": {
+      "4.1.11": [0.410, 28],
+      "4.1.13": [0.410, 28],
+      "4.1.15": [0.410, 28]
+    },
+    "article_tab_default": [0.41, 28]
+  },
+  "points": {
+    "main_search_box": [150, 55],
+    "soso_entry": [170, 95],
+    "article_more": [1245, 55],
+    "copy_link": [1175, 150]
+  }
+}

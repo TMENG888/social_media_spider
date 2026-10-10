@@ -1,0 +1,17 @@
+{
+  "name": "xiaohongshu-playwright-rpa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "crawl": "node src/index.mjs",
+    "validate": "node src/validate-output.mjs",
+    "setup:asr": "python -m pip install -r requirements-asr.txt",
+    "import:mysql": "node src/import-mysql.mjs"
+  },
+  "dependencies": {
+    "mysql2": "^3.15.0",
+    "playwright": "^1.62.1",
+    "redis": "^6.2.1"
+  }
+}
