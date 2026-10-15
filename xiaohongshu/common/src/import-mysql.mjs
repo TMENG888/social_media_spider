@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { assertLocalLease, withImportLease } from "./lease-guard.mjs";
 import { createImportBatches, retryImportBatch, IMPORT_PENDING_EXIT_CODE } from "./import-recovery.mjs";
 import { writeJsonAtomic } from "./checkpoint.mjs";
+import {recordCommittedPosts,subtitleWriteCount} from './monitor-telemetry.mjs';
 
 function argsOf(argv) {
   const out = {};
@@ -22,7 +23,7 @@ export function mysqlConnectionOptions() {
   const user = process.env.MYSQL_USER, password = process.env.MYSQL_PASSWORD;
   if (!user || !password) throw new Error("请通过当前进程环境变量 MYSQL_USER 和 MYSQL_PASSWORD 提供数据库凭据，不要写入配置文件");
   return {
-    host: String(process.env.MYSQL_HOST || "mysql.example.com"),
+    host: String(process.env.MYSQL_HOST || "127.0.0.1"),
     port: Number(process.env.MYSQL_PORT || 3306),
     database: String(process.env.MYSQL_DATABASE || "social"),
     user, password, charset: "utf8mb4", supportBigNumbers: true, bigNumberStrings: true, connectTimeout: 15000
@@ -110,9 +111,30 @@ export function updateFieldAssignment(table,field){
   return table==='ods_social_media_post' && ['作者粉丝数','作者点赞数'].includes(field)
     ? `\`${field}\`=COALESCE(\`${field}\`,?)` : `\`${field}\`=?`;
 }
+export function importRowMatches(table,fields,actual,expected){
+  return fields.filter(field=>field!=='id').every(field=>{
+    const current=actual[field],incoming=expected[field];
+    // Match the existing phase-one COALESCE write policy exactly.
+    if(table==='ods_social_media_post'&&['作者粉丝数','作者点赞数'].includes(field)&&current!=null)return true;
+    if(current instanceof Date){const date=new Date(incoming);return incoming!=null&&Number.isFinite(date.getTime())&&current.getTime()===date.getTime();}
+    if(current==null||incoming==null)return current===incoming;
+    if(typeof incoming==='boolean'&&['0','1'].includes(String(current)))return Number(incoming)===Number(current);
+    return String(current)===String(incoming);
+  });
+}
+export async function rowsNeedingImport(connection,table,fields,rows,uniqueWhere){
+  if(!['ods_social_media_post','ods_social_media_comment'].includes(table))throw new Error('Unsupported import table');
+  const pending=[];
+  for(const row of rows){
+    const {sql,values}=uniqueWhere(row);
+    const [actual]=await connection.execute(`SELECT ${fields.map(f=>`\`${f}\``).join(',')} FROM \`${table}\` WHERE ${sql} LIMIT 2`,values);
+    if(actual.length!==1||!importRowMatches(table,fields,actual[0],row))pending.push(row);
+  }
+  return pending;
+}
 async function upsertRows(connection, table, fields, rows, uniqueWhere) {
   if (!rows.length) return { inserted: 0, updated: 0 };
-  let id = await nextId(connection, table), inserted = 0, updated = 0;
+  let id = await nextId(connection, table), inserted = 0, updated = 0, videoContentWrites = 0;
   const dataFields = fields.filter((f) => f !== "id");
   const insertSql = `INSERT INTO \`${table}\` (${fields.map((f) => `\`${f}\``).join(",")}) VALUES (${fields.map(() => "?").join(",")})`;
   // Phase-one exports (including old checkpoints and ASR callbacks) must never
@@ -121,18 +143,20 @@ async function upsertRows(connection, table, fields, rows, uniqueWhere) {
   for (const row of rows) {
     await assertLocalLease();
     const { sql, values } = uniqueWhere(row);
-    const [existing] = await connection.execute(`SELECT \`id\` FROM \`${table}\` WHERE ${sql} LIMIT 1 FOR UPDATE`, values);
+    const [existing] = await connection.execute(`SELECT \`id\`${table==='ods_social_media_post'?',`文章视频内容`':''} FROM \`${table}\` WHERE ${sql} LIMIT 1 FOR UPDATE`, values);
     if (existing.length) {
       row.id = String(existing[0].id);
       await connection.execute(updateSql, [...dataFields.map((f) => row[f]), row.id]);
+      if(table==='ods_social_media_post')videoContentWrites+=subtitleWriteCount(existing[0]['文章视频内容'],row['文章视频内容']);
       updated += 1;
     } else {
       id += 1n; row.id = id.toString();
       await connection.execute(insertSql, fields.map((f) => row[f]));
+      if(table==='ods_social_media_post')videoContentWrites+=subtitleWriteCount(null,row['文章视频内容']);
       inserted += 1;
     }
   }
-  return { inserted, updated };
+  return { inserted, updated, videoContentWrites };
 }
 export async function importRows({ posts = [], comments = [], verify = false, lockTimeoutSeconds = 15,
   batchRows = 10, maxAttempts = 4, retryDelayMs = 2000, onProgress = async () => {} } = {}) {
@@ -165,7 +189,7 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
   }, { maxAttempts, retryDelayMs, verifyLease,
     onRetry: info => console.warn(`[入库兜底] 数据库预检暂时失败（${info.code}）；稍后重连（${info.attempt}/${info.maxAttempts}）`) });
   const batches = createImportBatches(posts, comments, batchRows);
-  const progress = { postResult: { inserted: 0, updated: 0 }, commentResult: { inserted: 0, updated: 0 },
+  const progress = { postResult: { inserted: 0, updated: 0, verifiedUnchanged: 0 }, commentResult: { inserted: 0, updated: 0, verifiedUnchanged: 0 },
     committedBatches: 0, totalBatches: batches.length, charsetCompatibility: compatibility };
   try {
     for (const [index, batch] of batches.entries()) {
@@ -173,16 +197,28 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
         const connection = await mysql.createConnection(mysqlConnectionOptions());
         let acquired = false, transaction = false;
         try {
+          // A failed tail must not wait behind the shared write lock merely
+          // to rewrite earlier committed batches. Verify all effective fields
+          // read-only first; only genuine differences enter the write path.
+          const postChanges=await rowsNeedingImport(connection,'ods_social_media_post',POST_FIELDS,batch.posts,row=>({sql:'`文章id`=? AND `平台`=? AND `项目`=?',values:[row.文章id,row.平台,row.项目]}));
+          const commentChanges=await rowsNeedingImport(connection,'ods_social_media_comment',COMMENT_FIELDS,batch.comments,row=>({sql:'`评论id`=? AND `文章id`=? AND `平台`=? AND `项目`=?',values:[row.评论id,row.文章id,row.平台,row.项目]}));
+          await verifyLease();
+          if(!postChanges.length&&!commentChanges.length)return {
+            postResult:{inserted:0,updated:0,videoContentWrites:0,verifiedUnchanged:batch.posts.length},
+            commentResult:{inserted:0,updated:0,verifiedUnchanged:batch.comments.length}};
           const [lock] = await connection.query("SELECT GET_LOCK('social_xhs_distributed_import', ?) AS acquired", [lockTimeoutSeconds]);
           if (Number(lock[0]?.acquired) !== 1) throw Object.assign(new Error('等待小红书分布式入库锁超时，请稍后重试'), { code: 'MYSQL_IMPORT_LOCK_TIMEOUT' });
           acquired = true;
           await verifyLease();
           await connection.query('SET SESSION innodb_lock_wait_timeout=15');
           await connection.beginTransaction(); transaction = true;
-          const postResult = await upsertRows(connection, "ods_social_media_post", POST_FIELDS, batch.posts, row => ({ sql: "`文章id`=? AND `平台`=? AND `项目`=?", values: [row["文章id"], row["平台"], row["项目"]] }));
-          const commentResult = await upsertRows(connection, "ods_social_media_comment", COMMENT_FIELDS, batch.comments, row => ({ sql: "`评论id`=? AND `文章id`=? AND `平台`=? AND `项目`=?", values: [row["评论id"], row["文章id"], row["平台"], row["项目"]] }));
+          const postResult = await upsertRows(connection, "ods_social_media_post", POST_FIELDS, postChanges, row => ({ sql: "`文章id`=? AND `平台`=? AND `项目`=?", values: [row["文章id"], row["平台"], row["项目"]] }));
+          const commentResult = await upsertRows(connection, "ods_social_media_comment", COMMENT_FIELDS, commentChanges, row => ({ sql: "`评论id`=? AND `文章id`=? AND `平台`=? AND `项目`=?", values: [row["评论id"], row["文章id"], row["平台"], row["项目"]] }));
+          postResult.verifiedUnchanged=batch.posts.length-postChanges.length;
+          commentResult.verifiedUnchanged=batch.comments.length-commentChanges.length;
           await verifyLease();
           await connection.commit(); transaction = false;
+          await recordCommittedPosts(connection,postChanges,postResult,new Date().toISOString());
           return { postResult, commentResult };
         } catch (error) {
           if (transaction) await connection.rollback().catch(() => {});
@@ -194,7 +230,7 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
         }
       }, { maxAttempts, retryDelayMs, verifyLease,
         onRetry: info => console.warn(`[入库兜底] 第${index + 1}/${batches.length}批，${info.code}；已释放连接，${Math.ceil(info.delayMs / 1000)}秒后重试（${info.attempt}/${info.maxAttempts}）`) });
-      for (const kind of ['postResult', 'commentResult']) for (const count of ['inserted', 'updated']) progress[kind][count] += result[kind][count];
+      for (const kind of ['postResult', 'commentResult']) for (const count of ['inserted', 'updated','verifiedUnchanged']) progress[kind][count] += result[kind][count]||0;
       progress.committedBatches++;
       await onProgress({ ...progress, postResult: { ...progress.postResult }, commentResult: { ...progress.commentResult } });
       if (index + 1 < batches.length) {

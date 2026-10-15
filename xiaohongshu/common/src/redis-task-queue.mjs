@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { maySkipExhausted } from "./retry-disposition.mjs";
 
 // All keys are explicit and share a Redis Cluster hash tag. Never construct keys in Lua.
-const KEY_NAMES = ["payloads", "statuses", "attempts", "tokens", "owners", "pending", "leases", "results", "errors", "failed"];
+const KEY_NAMES = ["payloads", "statuses", "attempts", "tokens", "owners", "pending", "leases", "results", "errors", "failed", "deferrals"];
 const PRELUDE = `
 if redis.replicate_commands then redis.replicate_commands() end
 local function now_ms()
@@ -72,17 +73,34 @@ local owner, token = ARGV[1], ARGV[2]
 local lease_ms, max_attempts, retry_delay = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
 local now = now_ms()
 -- Bounded recovery keeps a single claim from monopolizing Redis after a large outage.
+if KEYS[12] then
+  local cooldown=redis.call('HGET',KEYS[12],'state')
+  if cooldown then
+    local s=cjson.decode(cooldown)
+    if s.manualRequired or (s.untilMs or 0)>now then
+      return redis.error_reply('RATE_LIMIT_COOLDOWN_ACTIVE')
+    end
+  end
+end
 local expired = redis.call('ZRANGEBYSCORE', KEYS[7], '-inf', now, 'LIMIT', 0, 1000)
 for _, id in ipairs(expired) do
+  if not ARGV[6] or ARGV[6] == '' or id == ARGV[6] then
   if redis.call('HGET', KEYS[2], id) == 'leased' then
     retry_or_fail(id, now, max_attempts, retry_delay,
       cjson.encode({message = 'Lease expired before confirmation', code = 'LEASE_EXPIRED', at = now}))
   else
     clear_lease(id)
   end
+  end
 end
 while true do
-  local next_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', now, 'LIMIT', 0, 1)
+  local next_ids
+  if ARGV[6] and ARGV[6] ~= '' then
+    local ready_at = tonumber(redis.call('ZSCORE', KEYS[6], ARGV[6]))
+    next_ids = ready_at and ready_at <= now and {ARGV[6]} or {}
+  else
+    next_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', now, 'LIMIT', 0, 1)
+  end
   if #next_ids == 0 then return false end
   local id = next_ids[1]
   redis.call('ZREM', KEYS[6], id)
@@ -126,13 +144,23 @@ const COMPLETE = PRELUDE + `
 local id, token = ARGV[1], ARGV[2]
 local now = now_ms()
 if not check_lease(id, token, now) then return redis.error_reply('LEASE_LOST') end
+local result=cjson.decode(ARGV[3])
+if type(result)=='table' and result.disposition=='no_change' then
+ local e=result.noChangeEvidence
+ if result.status~='completed_with_skips' or result.accepted~=false or type(e)~='table'
+  or type(e.beforeDigest)~='string' or #e.beforeDigest~=64 or e.beforeDigest~=e.afterDigest
+  or e.importOk~=true or e.freshSearch~=true or e.accepted~=false then
+  return redis.error_reply('INVALID_NO_CHANGE_EVIDENCE')
+ end
+end
+local status=type(result)=='table' and result.status=='completed_with_skips' and 'completed_with_skips' or 'completed'
 clear_lease(id)
 redis.call('ZREM', KEYS[6], id)
 redis.call('ZREM', KEYS[10], id)
 redis.call('HDEL', KEYS[9], id)
-redis.call('HSET', KEYS[2], id, 'completed')
+redis.call('HSET', KEYS[2], id, status)
 redis.call('HSET', KEYS[8], id, ARGV[3])
-return cjson.encode({taskId = id, status = 'completed', completedAt = now})
+return cjson.encode({taskId = id, status = status, completedAt = now})
 `;
 
 const FAIL = PRELUDE + `
@@ -140,7 +168,31 @@ local id, token = ARGV[1], ARGV[2]
 local now = now_ms()
 if not check_lease(id, token, now) then return redis.error_reply('LEASE_LOST') end
 local status, retry_at, attempt = retry_or_fail(id, now, tonumber(ARGV[4]), tonumber(ARGV[5]), ARGV[3])
+if status=='failed' and ARGV[6]=='allow_content_skip' then
+  local evidence=cjson.decode(ARGV[7])
+  evidence.status='skipped_unresolved'; evidence.accepted=false
+  evidence.attempts=attempt; evidence.dispositionAt=now
+  evidence.policy='20261013-user-authorized-finite-skip'
+  redis.call('HSET',KEYS[8],id,cjson.encode(evidence))
+  redis.call('HSET',KEYS[2],id,'skipped_unresolved')
+  redis.call('ZREM',KEYS[10],id)
+  status='skipped_unresolved'
+end
 return cjson.encode({taskId = id, status = status, retryAt = retry_at, attempt = attempt})
+`;
+
+// Quality exhaustion is a retained failure, not completion or a retry reset.
+const PARK = PRELUDE + `
+local id, token = ARGV[1], ARGV[2]
+local now = now_ms()
+if not check_lease(id, token, now) then return redis.error_reply('LEASE_LOST') end
+clear_lease(id)
+redis.call('ZREM', KEYS[6], id)
+redis.call('HSET', KEYS[2], id, 'failed')
+redis.call('HSET', KEYS[8], id, ARGV[3])
+redis.call('HSET', KEYS[9], id, ARGV[4])
+redis.call('ZADD', KEYS[10], now, id)
+return cjson.encode({taskId=id,status='failed',requiresReview=true,attempt=tonumber(redis.call('HGET',KEYS[3],id)) or 0})
 `;
 
 const RELEASE = PRELUDE + `
@@ -161,7 +213,7 @@ return cjson.encode({taskId = id, status = 'pending', releasedAt = now, attempt 
 
 const STATS = PRELUDE + `
 local now = now_ms()
-local counts = {pending = 0, leased = 0, completed = 0, failed = 0, total = 0}
+local counts = {pending = 0, leased = 0, completed = 0, completed_with_skips = 0, skipped_unresolved = 0, failed = 0, total = 0}
 for _, status in ipairs(redis.call('HVALS', KEYS[2])) do
   if status ~= 'excluded' then
     counts.total = counts.total + 1
@@ -179,6 +231,29 @@ end
 return cjson.encode({counts = counts, failed = failed, serverTime = now,
   ready = redis.call('ZCOUNT', KEYS[6], '-inf', now),
   expiredLeases = redis.call('ZCOUNT', KEYS[7], '-inf', now)})
+`;
+
+// A transient node/import failure is not a content attempt, but it cannot be
+// released forever with a rolled-back counter. This budget is cross-machine.
+const DEFER = PRELUDE + `
+local id, token = ARGV[1], ARGV[2]
+local now = now_ms()
+if not check_lease(id,token,now) then return redis.error_reply('LEASE_LOST') end
+local evidence=cjson.decode(ARGV[3])
+if type(evidence)~='table' then return redis.error_reply('INVALID_DEFER_EVIDENCE') end
+local count=redis.call('HINCRBY',KEYS[11],id,1)
+local attempt=math.max(0,(tonumber(redis.call('HGET',KEYS[3],id)) or 1)-1)
+clear_lease(id)
+redis.call('HSET',KEYS[3],id,attempt)
+evidence.deferrals=count; evidence.requiresAction=count>=3; evidence.accepted=false
+redis.call('HSET',KEYS[8],id,cjson.encode(evidence))
+redis.call('HSET',KEYS[9],id,cjson.encode({message=evidence.error or 'NODE_OR_IMPORT_DEFERRED',code='BOUNDED_DEFER',deferrals=count,at=now}))
+local status=count>=3 and 'failed' or 'pending'
+redis.call('HSET',KEYS[2],id,status)
+redis.call('ZREM',KEYS[6],id)
+if status=='failed' then redis.call('ZADD',KEYS[10],now,id)
+else redis.call('ZADD',KEYS[6],now+math.max(1000,tonumber(ARGV[4]))*math.pow(2,count-1),id) end
+return cjson.encode({taskId=id,status=status,deferrals=count,attempt=attempt,requiresAction=count>=3})
 `;
 
 export class LeaseLostError extends Error {
@@ -224,6 +299,9 @@ function jsonPayload(value, name) {
 
 /** A node-redis client must be connected by the caller; credentials never enter this module. */
 export class RedisTaskQueue {
+  async defer(taskId,token,result={}) {
+    return this.evaluate(DEFER,[identity(taskId,'taskId'),identity(token,'token'),jsonPayload(result,'result'),String(this.retryDelayMs)],taskId);
+  }
   constructor({ client, prefix = "xhs", campaign, leaseMs = 300000, maxAttempts = 3, retryDelayMs = 60000 } = {}) {
     if (!client || typeof client.eval !== "function") throw new TypeError("A connected node-redis client is required");
     if (!/^xhs(?::[A-Za-z0-9_-]+)*$/u.test(prefix)) throw new TypeError("prefix must stay inside the xhs namespace");
@@ -260,11 +338,28 @@ export class RedisTaskQueue {
     return this.evaluate(PUBLISH, arguments_);
   }
 
-  async claim(workerId) {
-    const claimed = await this.evaluate(CLAIM, [identity(workerId, "workerId"), randomUUID(), this.leaseMs, this.maxAttempts, this.retryDelayMs]);
+  async claim(workerId, taskId = null) {
+    // The extra guard key shares this queue's cluster tag; no cross-slot script.
+    const keys=this.cooldownKey ? [...this.keys,this.cooldownKey] : this.keys;
+    let raw;
+    try{raw=await this.client.eval(CLAIM,{keys,arguments:[identity(workerId,"workerId"),randomUUID(),this.leaseMs,this.maxAttempts,this.retryDelayMs,taskId==null?'':identity(taskId,'taskId')].map(String)});}
+    catch(error){
+      if(/RATE_LIMIT_COOLDOWN_ACTIVE/.test(String(error.message)))error.code='RATE_LIMIT_COOLDOWN_ACTIVE';
+      throw error;
+    }
+    const claimed=raw==null || raw===false ? null : JSON.parse(raw);
     if (!claimed) return null;
     const { payload, ...lease } = claimed;
     return { ...lease, task: JSON.parse(payload) };
+  }
+
+  inspect(taskId) {
+    return this.evaluate(`local id=ARGV[1]; return cjson.encode({taskId=id,status=redis.call('HGET',KEYS[2],id) or 'missing',attempts=tonumber(redis.call('HGET',KEYS[3],id)) or 0,leaseUntil=tonumber(redis.call('ZSCORE',KEYS[7],id))})`,[identity(taskId,'taskId')]);
+  }
+
+  verifyExisting(task) {
+    const id=identity(task.redisTaskId??task.id,'taskId');
+    return this.evaluate(`local id=ARGV[1]; if redis.call('HEXISTS',KEYS[2],id)==0 then return redis.error_reply('SELECTED_TASK_UNAVAILABLE') end; if redis.call('HGET',KEYS[1],id)~=ARGV[2] then return redis.error_reply('TASK_PAYLOAD_CONFLICT '..id) end; return cjson.encode({added=0,existing=1,total=redis.call('HLEN',KEYS[2])})`,[id,jsonPayload(task,'task')]);
   }
 
   renew(taskId, token) {
@@ -279,15 +374,21 @@ export class RedisTaskQueue {
     return this.evaluate(COMPLETE, [identity(taskId, "taskId"), identity(token, "token"), jsonPayload(result ?? null, "result")], taskId);
   }
 
-  fail(taskId, token, error) {
+  fail(taskId, token, error, result = null) {
     const message = error instanceof Error
       ? { name: error.name, message: error.message, code: error.code ?? null }
       : { message: String(error ?? "Task failed") };
-    return this.evaluate(FAIL, [identity(taskId, "taskId"), identity(token, "token"), JSON.stringify(message), this.maxAttempts, this.retryDelayMs], taskId);
+    return this.evaluate(FAIL, [identity(taskId, "taskId"), identity(token, "token"), JSON.stringify(message), this.maxAttempts, this.retryDelayMs,
+      maySkipExhausted(result) ? 'allow_content_skip' : '', jsonPayload(result ?? {}, "result")], taskId);
   }
 
   release(taskId, token) {
     return this.evaluate(RELEASE, [identity(taskId, "taskId"), identity(token, "token")], taskId);
+  }
+
+  park(taskId, token, result) {
+    return this.evaluate(PARK,[identity(taskId,"taskId"),identity(token,"token"),jsonPayload(result,"result"),
+      JSON.stringify({code:"ASR_REVIEW_REQUIRED",message:result?.error||"字幕质量重试耗尽，需要审核或新修复策略"})],taskId);
   }
 
   async stats() {

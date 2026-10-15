@@ -73,6 +73,10 @@ class ClientAudioCaptureError(RuntimeError):
     """The client playback could not yield a trustworthy audio recording."""
 
 
+class AsrQualityRejectedError(RuntimeError):
+    """Inference worked; retrying the identical service locally is not recovery."""
+
+
 def request_graceful_stop(_signum=None, _frame=None) -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = True
@@ -462,6 +466,7 @@ def assess_asr_text_quality(
         and (speech_seconds is None or speech < 0.8)
     )
     common_hallucination = normalized in {
+        "字幕by索兰娅",
         "请不吝点赞订阅转发打赏支持明镜与点点栏目",
         "请点赞订阅转发打赏支持明镜与点点栏目",
         "请不吝点赞订阅转发打赏支持明镜与点点",
@@ -479,7 +484,11 @@ def assess_asr_text_quality(
         and len(normalized) < max(12, int(capture * 0.15))
     )
     reason = None
-    if prompt_echo:
+    letters = [ch for ch in text if ch.isalpha()]
+    unsupported_letters = [ch for ch in letters if not re.match(r"[A-Za-z\u3400-\u9fff]", ch)]
+    if len(unsupported_letters) >= 4 and len(unsupported_letters) / max(1, len(letters)) > 0.25:
+        reason = "unexpected_script_for_zh_decoder"
+    elif prompt_echo:
         reason = "prompt_echo"
     elif len(normalized) >= 40 and repeat_ratio >= 0.45:
         reason = "looping_repetition"
@@ -498,6 +507,21 @@ def assess_asr_text_quality(
         "low_speech_density_warning": sparse_long_audio,
     }
     return (text if reason is None else None), audit
+
+
+def require_trustworthy_asr_result(text, audits):
+    """Rejected nonempty decoding is not evidence that the source is silent."""
+    def evidence(values):
+        for value in values:
+            if not isinstance(value,dict):
+                continue
+            yield value
+            yield from evidence(value.get("chunks") or [])
+    rejected = any((a.get("quality") or {}).get("accepted") is False
+                   and (a.get("quality") or {}).get("reason") not in (None, "empty")
+                   for a in evidence(audits))
+    if not text and rejected:
+        raise AsrQualityRejectedError("ASR_QUALITY_REVIEW_REQUIRED：解码候选被质量门槛拒绝，不得标无内容")
 
 
 def asr_output_needs_review(
@@ -591,7 +615,9 @@ def transcribe_sparse_audio_in_chunks(
             break
         try:
             options = dict(base_options)
-            options.pop("language", None)  # Let the configured model distinguish Mandarin/Cantonese per chunk.
+            # Short/music-heavy chunks have unreliable language detection.
+            # Mandarin and Cantonese both use Whisper's zh language token.
+            options["language"] = "zh"
             options["vad_filter"] = True
             options["vad_parameters"] = {
                 "threshold": float(config.get("client_asr_chunk_vad_threshold", 0.20)),
@@ -669,6 +695,7 @@ def transcribe_audio_with_recovery(
     base_options = {
         "language": "zh",
         "beam_size": int(config.get("client_asr_beam_size", 8)),
+        "temperature": 0.0,
         "vad_filter": True,
         "vad_parameters": {
             "threshold": float(config.get("client_asr_vad_threshold", 0.35)),
@@ -1739,6 +1766,11 @@ def capture_client_audio_asr(
             text, info, segment_list, fallback_used, pass_audits = transcribe_audio_with_recovery(
                 _ASR_MODEL, wav_path, config, prompt_context, capture_seconds,
             )
+            try:
+                require_trustworthy_asr_result(text, pass_audits)
+            except Exception:
+                keep_wav = True
+                raise
             quality = next((
                 item["quality"] for item in pass_audits
                 if item.get("pass") in (1, 2) and item.get("quality", {}).get("accepted")
@@ -1861,6 +1893,7 @@ def transcribe_pending_client_audio(
                     and (item.get("quality") or {}).get("accepted")
                 ), passes[-1].get("quality") if passes else {})
                 text = clean_asr_text(response.get("text"))
+                require_trustworthy_asr_result(text, passes)
                 print(json.dumps({
                     "event": "persistent_asr_request_complete",
                     "id": request_id,
@@ -1876,6 +1909,8 @@ def transcribe_pending_client_audio(
                     "quality": quality,
                 }, ensure_ascii=False), flush=True)
                 return text
+            except AsrQualityRejectedError:
+                raise
             except Exception as persistent_error:
                 # The local in-process implementation remains a correctness
                 # fallback. A service crash must slow one task down, never
@@ -1891,6 +1926,7 @@ def transcribe_pending_client_audio(
         text, info, segment_list, fallback_used, pass_audits = transcribe_audio_with_recovery(
             _ASR_MODEL, job.wav_path, config, job.prompt_context, job.capture_seconds,
         )
+        require_trustworthy_asr_result(text, pass_audits)
         quality = next((
             item["quality"] for item in pass_audits
             if item.get("pass") in (1, 2) and item.get("quality", {}).get("accepted")
@@ -2078,6 +2114,17 @@ class BackgroundAsrQueue:
                         return
                     article_key, keyword, job, payload = item
                     now = datetime.now().isoformat(timespec="seconds")
+                    disposition = connection.execute(
+                        "SELECT status FROM video_checkpoint WHERE keyword=? AND fingerprint=?",
+                        (keyword, payload.get("fingerprint")),
+                    ).fetchone()
+                    if disposition and disposition[0] == "skipped_unresolved":
+                        connection.execute(
+                            "UPDATE asr_job SET status='skipped_unresolved',updated_at=? WHERE article_key=? AND keyword=?",
+                            (now, article_key, keyword),
+                        )
+                        connection.commit()
+                        continue
                     attempt_row = connection.execute(
                         "SELECT attempts FROM asr_job WHERE article_key=? AND keyword=?",
                         (article_key, keyword),
@@ -2107,6 +2154,13 @@ class BackgroundAsrQueue:
                     stage_candidate(connection, article_key, keyword, text,
                                     approved=bool(text) and not needs_review,
                                     reason=asr_error or 'quality gates passed; replacement audited')
+                    if needs_review or not text:
+                        # A short/empty decode is not proof of absent speech.
+                        # Use the same bounded failure path and real counter
+                        # as decoder-quality exceptions, retaining the audit.
+                        raise AsrQualityRejectedError(
+                            'ASR_QUALITY_REVIEW_REQUIRED：录音识别为空或不完整，不能作为已验收口播或无内容'
+                        )
                     if text and not needs_review:
                         connection.execute(
                             "UPDATE captured_article SET video_content=?, "
@@ -2144,7 +2198,7 @@ class BackgroundAsrQueue:
                             project=checkpoint[0] or payload.get("project") or "",
                             fingerprint=checkpoint[4],
                             status="completed" if text and not needs_review else "retry_pending",
-                            retry_count=int(checkpoint[1] or 0),
+                            retry_count=max(attempts, int(checkpoint[1] or 0)),
                             row=row,
                             comments=comments,
                             asr_status=asr_status,
@@ -2169,12 +2223,13 @@ class BackgroundAsrQueue:
                             (asr_job_status, str(exc), datetime.now().isoformat(timespec="seconds"), article_key, keyword),
                         )
                         connection.execute(
-                            "UPDATE video_checkpoint SET status=?, asr_status=?, last_error=?, updated_at=? "
-                            "WHERE keyword=? AND fingerprint=?",
+                            "UPDATE video_checkpoint SET status=?, asr_status=?, last_error=?, updated_at=?, "
+                            "retry_count=MAX(COALESCE(retry_count,0),?) "
+                            "WHERE keyword=? AND fingerprint=? AND status!='skipped_unresolved'",
                             (
                                 "dead_letter" if asr_job_status == "dead_letter" else "retry_pending",
                                 asr_job_status, str(exc), datetime.now().isoformat(timespec="seconds"),
-                                keyword, payload.get("fingerprint"),
+                                attempts, keyword, payload.get("fingerprint"),
                             ),
                         )
                         connection.commit()
@@ -2196,7 +2251,7 @@ class BackgroundAsrQueue:
                             project=payload.get("project") or "",
                             fingerprint=payload.get("fingerprint") or article_key,
                             status="dead_letter" if asr_job_status == "dead_letter" else "retry_pending",
-                            retry_count=int(checkpoint[2] or 0) if checkpoint else 0,
+                            retry_count=max(attempts, int(checkpoint[2] or 0) if checkpoint else 0),
                             row=row,
                             comments=comments,
                             asr_status=asr_job_status,
@@ -3635,6 +3690,10 @@ def upsert_video_checkpoint(
     result_index: int | None = None,
     remote_store: RedisVideoCheckpointStore | None = None,
 ) -> dict:
+    prior_status=connection.execute("SELECT status FROM video_checkpoint WHERE keyword=? AND fingerprint=?",(keyword,fingerprint)).fetchone()
+    if prior_status and prior_status[0]=="skipped_unresolved":
+        # A replay/rescan is not authorization to reopen an exhausted video.
+        return load_video_checkpoints(connection,keyword)[fingerprint]
     now = datetime.now().isoformat(timespec="seconds")
     row_value = asdict(row) if row is not None else None
     comments_value = comments if comments is not None else []
@@ -3659,7 +3718,7 @@ def upsert_video_checkpoint(
             published_at=COALESCE(excluded.published_at, video_checkpoint.published_at),
             video_duration=COALESCE(excluded.video_duration, video_checkpoint.video_duration),
             status=excluded.status,
-            retry_count=excluded.retry_count,
+            retry_count=MAX(video_checkpoint.retry_count,excluded.retry_count),
             field_completeness=CASE WHEN excluded.field_completeness='{}'
                 THEN video_checkpoint.field_completeness ELSE excluded.field_completeness END,
             asr_status=COALESCE(excluded.asr_status, video_checkpoint.asr_status),
@@ -3690,6 +3749,9 @@ def upsert_video_checkpoint(
         "last_error": last_error, "screenshot_path": screenshot_path,
         "row": row_value, "comments": comments_value, "updated_at": now,
     }
+    # Publish the merged durable record, not the sparse arguments of a status
+    # update. Otherwise a failure erases the identity required on another node.
+    payload.update(load_video_checkpoints(connection, keyword)[fingerprint])
     if remote_store is not None:
         remote_store.put(fingerprint, payload)
         if row is not None and article_key and status in {
@@ -3877,6 +3939,28 @@ def status_with_deferred_video_retries(status: str, retry_pending_count: int) ->
     if status.startswith("complete_"):
         return status if status.endswith("_with_deferred_retry") else f"{status}_with_deferred_retry"
     return "partial_retry_pending"
+
+
+def record_precise_search_miss(connection, *, keyword, project, retry_fingerprint,
+                              scan_status, seen_fingerprints, max_attempts, remote_store=None):
+    """A verified bounded exact search miss is an attempt, not an endless defer.
+
+    This is not proof of deletion or success. Access/stop failures never enter it.
+    """
+    if scan_status!='partial_retry_target_not_found' or not retry_fingerprint or retry_fingerprint in seen_fingerprints:
+        return None
+    cp=load_video_checkpoints(connection,keyword).get(retry_fingerprint)
+    if not cp or cp.get('status') in {'completed','no_content','not_applicable','skipped_unresolved'}:
+        return None
+    row=cp.get('row') or {}
+    if not str(row.get('url') or '').strip() or not str(row.get('title') or cp.get('title') or '').strip():
+        return None
+    return record_video_failure(connection,keyword=keyword,project=project,
+        fingerprint=retry_fingerprint,result_index=cp.get('result_index'),
+        title=str(row.get('title') or cp.get('title') or ''),
+        author_name=row.get('author_name') or cp.get('author_name'),raw_card_text=cp.get('raw_card_text') or '',
+        error='DETAIL_UNAVAILABLE: target not observed after verified bounded exact search; not proof of deletion',
+        screenshot_path=None,max_attempts=max_attempts,remote_store=remote_store)
 
 
 def migrate_legacy_video_state(connection: sqlite3.Connection) -> None:
@@ -4760,6 +4844,13 @@ def reset_search_results_to_top(config: dict) -> list:
         "无法确认文章结果列表已经回到顶部："
         + json.dumps(last_payload or {}, ensure_ascii=False)
     )
+
+
+def precise_retry_load_config(config):
+    """Cap one no-growth probe; do not change ordinary annual scan settings."""
+    return {**config,
+        'load_more_rounds':min(6,max(3,int(config.get('load_more_rounds',8)))),
+        'load_more_search_recovery_attempts':min(1,max(0,int(config.get('load_more_search_recovery_attempts',2))))}
 
 
 def load_more_search_results(
@@ -6247,6 +6338,8 @@ def collect_live_keyword(
             "keyword": keyword,
             "records": hydrated_remote,
         }, ensure_ascii=False), flush=True)
+    if STOP_REQUESTED or (stop_file and stop_file.exists()):
+        return {"keyword": keyword, "complete": False, "status": "partial_safe_stop"}
     if asr_backfill_mode and retry_fingerprint:
         from precise_video_retry import try_direct_retry
         direct_result = try_direct_retry(sys.modules[__name__], keyword, project,
@@ -6551,7 +6644,7 @@ def collect_live_keyword(
             previous_count = len(results)
             try:
                 results, grew = load_more_search_results(
-                    web, previous_count, config, keyword=keyword,
+                    web, previous_count, precise_retry_load_config(config) if retry_fingerprint else config, keyword=keyword,
                 )
             except SearchWindowUnavailableError as exc:
                 status = "partial_search_window_unavailable"
@@ -6756,7 +6849,7 @@ def collect_live_keyword(
             )
         )
         completed_for_phase = checkpoint and (
-            checkpoint_status == "dead_letter"
+            checkpoint_status in {"dead_letter","skipped_unresolved"}
             or (
                 asr_backfill_mode
                 and checkpoint_asr_is_reusable
@@ -7469,6 +7562,13 @@ def collect_live_keyword(
     # A previously failed video may disappear from the current search result
     # set. Count that as a bounded retry instead of leaving the keyword pending
     # forever with no observable way to reach the card.
+    precise_miss=record_precise_search_miss(connection,keyword=keyword,project=project,
+        retry_fingerprint=retry_fingerprint,scan_status=status,
+        seen_fingerprints=seen_fingerprints_this_run,
+        max_attempts=int(config.get('video_retry_max_attempts',3)),remote_store=remote_store)
+    if precise_miss:
+        print(json.dumps({'event':'redis_retry_verified_search_miss_counted',
+            'fingerprint':retry_fingerprint,'status':precise_miss[0],'retry_count':precise_miss[1]},ensure_ascii=False),flush=True)
     current_checkpoints = load_video_checkpoints(connection, keyword)
     for fingerprint, checkpoint in current_checkpoints.items():
         if not should_age_missing_retry(
@@ -7546,7 +7646,7 @@ def collect_live_keyword(
         status = f"{status}_with_dead_letters"
         update_task_state(
             connection, keyword, project, result_index, old_streak, status,
-            f"完成扫描，但有 {dead_letter_count} 个视频进入死信表等待人工复核",
+            f"完成扫描；{dead_letter_count} 个耗尽视频明确跳过，保留失败证据，不计采集成功",
         )
     complete = status.startswith("complete_")
     return {

@@ -90,9 +90,39 @@ class RedisVideoCheckpointStore:
         if not self.enabled or not fingerprint:
             return
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self._command(self.url, self.password, "HSET", self.state_key, fingerprint, encoded)
+        effective=self._command(self.url,self.password,"EVAL","""
+local new=cjson.decode(ARGV[2])
+local raw=redis.call('HGET',KEYS[1],ARGV[1])
+if raw then
+ local old=cjson.decode(raw)
+ if old.status=='skipped_unresolved' then return raw end
+ local function filled(v) return v~=nil and v~=cjson.null and v~='' end
+ if filled(old.article_key) and filled(new.article_key) and old.article_key~=new.article_key then
+  return redis.error_reply('CHECKPOINT_IDENTITY_CONFLICT')
+ end
+ if type(old.row)=='table' and type(new.row)=='table' then
+  if filled(old.row.url) and filled(new.row.url) and old.row.url~=new.row.url then
+   return redis.error_reply('CHECKPOINT_IDENTITY_CONFLICT')
+  end
+  for _,field in ipairs({'url','title','author_name','video_duration','文章链接','文章标题','文章作者','文章视频时长'}) do
+   if not filled(new.row[field]) then new.row[field]=old.row[field] end
+  end
+ end
+ if type(old.retry_count)=='number' and old.retry_count>(type(new.retry_count)=='number' and new.retry_count or 0) then
+  new.retry_count=old.retry_count
+ end
+ for _,field in ipairs({'row','article_key','published_at','asr_status','title','author_name'}) do
+  if not filled(new[field]) then new[field]=old[field] end
+ end
+end
+local encoded=cjson.encode(new)
+redis.call('HSET',KEYS[1],ARGV[1],encoded)
+return encoded
+""",1,self.state_key,fingerprint,encoded)
+        payload.update(json.loads(effective))
         if payload.get("status") == "dead_letter":
-            self._command(self.url, self.password, "HSET", self.dead_key, fingerprint, encoded)
+            self._command(self.url, self.password, "HSET", self.dead_key, fingerprint,
+                          json.dumps(payload,ensure_ascii=False,separators=(",",":")))
 
     def remove_dead_letter(self, fingerprint: str) -> None:
         if self.enabled and fingerprint:

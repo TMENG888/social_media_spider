@@ -39,6 +39,44 @@ export async function visibleAny(page, selector) {
   }));
 }
 
+export async function searchEndpointSnapshot(page,keyword,count) {
+  const contextValid=isKeywordSearchUrl(page.url(),keyword);
+  const state=await page.evaluate(selector=>{
+    const visible=node=>{
+      const r=node.getBoundingClientRect();if(!(r.width>0&&r.height>0))return false;
+      for(let parent=node;parent;parent=parent.parentElement){
+        const s=getComputedStyle(parent);
+        if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<0.05||parent.getAttribute('aria-hidden')==='true')return false;
+      }
+      return true;
+    };
+    const cards=[...document.querySelectorAll(selector)].filter(node=>node.querySelector('a[href*="/search_result/"],a[href*="/explore/"]'));
+    const last=cards.at(-1); let scroller=document.scrollingElement;
+    for(let parent=last?.parentElement;parent&&parent!==document.body;parent=parent.parentElement){
+      if(/auto|scroll/.test(getComputedStyle(parent).overflowY)&&parent.scrollHeight>parent.clientHeight+8){scroller=parent;break;}
+    }
+    const height=scroller?.scrollHeight||0,top=scroller?.scrollTop||0,viewport=scroller?.clientHeight||0;
+    const labels=[...document.querySelectorAll('div,p,span')].filter(node=>!node.closest(selector)&&visible(node)).map(node=>node.textContent?.trim()||'');
+    const terminal=labels.some(t=>/^(没有更多了?|暂无更多(内容|笔记|结果)?|已显示全部(结果)?|到底了|没有更多(内容|笔记|结果)了?)$/.test(t));
+    const loading=labels.some(t=>/^(正在)?加载中[.。…]*$/.test(t))||[...document.querySelectorAll('[aria-busy="true"]')].some(visible);
+    const loadFailed=labels.some(t=>/^(加载失败|网络异常|网络错误|点击重试)[，,。 .]*(请稍后重试|点击重试)?$/.test(t));
+    const href=last?.querySelector('a[href*="/search_result/"],a[href*="/explore/"]')?.getAttribute('href')||'';
+    const lastId=last?.getAttribute('data-note-id')||href.match(/\/(?:search_result|explore)\/([a-zA-Z0-9]+)/)?.[1]||null;
+    return {rendered:cards.some(visible),height,top,viewport,atBottom:Boolean(height&&viewport&&top+viewport>=height-8),terminal,loading,loadFailed,lastId};
+  },RESULT_SELECTOR);
+  return {...state,count,contextValid};
+}
+
+export async function advanceSearchScroll(page) {
+  await page.evaluate(selector=>{
+    const last=[...document.querySelectorAll(selector)].at(-1); let scroller=document.scrollingElement;
+    for(let parent=last?.parentElement;parent&&parent!==document.body;parent=parent.parentElement){
+      if(/auto|scroll/.test(getComputedStyle(parent).overflowY)&&parent.scrollHeight>parent.clientHeight+8){scroller=parent;break;}
+    }
+    scroller?.scrollBy({top:Math.max((scroller.clientHeight||innerHeight)*1.6,1400),behavior:'instant'});
+  },RESULT_SELECTOR);
+}
+
 export async function latestSortSnapshot(page) {
   // Read one current DOM snapshot. Clicks may destroy the whole panel, so a
   // locator captured before the click must never be awaited for attributes.

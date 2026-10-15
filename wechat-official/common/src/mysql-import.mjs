@@ -14,7 +14,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 const postsFile = path.resolve(String(args.posts || ''));
 const commentsFile = args.comments && args.comments !== true ? path.resolve(String(args.comments)) : null;
 const statusFile = path.resolve(String(args.status || path.join(path.dirname(postsFile), 'mysql_import_status.json')));
-const host = process.env.MYSQL_HOST || 'mysql.example.com';
+const host = process.env.MYSQL_HOST || '127.0.0.1';
 const port = Number(process.env.MYSQL_PORT || 3306);
 const database = process.env.MYSQL_DATABASE || 'social';
 const user = process.env.MYSQL_USER;

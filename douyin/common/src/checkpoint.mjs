@@ -3,6 +3,7 @@ import path from "node:path";
 import { inTargetYear } from "./collection-policy.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { POST_FIELDS, COMMENT_FIELDS, canonicalDouyinPostUrl } from "./schema.mjs";
+import {normaliseCommentResult} from './comment-threads.mjs';
 
 const now = () => new Intl.DateTimeFormat("sv-SE", {
   timeZone: "Asia/Shanghai", dateStyle: "short", timeStyle: "medium", hourCycle: "h23"
@@ -22,6 +23,8 @@ export function openCheckpoint(dbPath) {
       result_json TEXT,
       last_error TEXT,
       updated_at TEXT NOT NULL,
+      import_status TEXT NOT NULL DEFAULT 'pending',
+      import_error TEXT,
       PRIMARY KEY(keyword, note_id)
     );
     CREATE TABLE IF NOT EXISTS run_meta (
@@ -65,10 +68,14 @@ export function openCheckpoint(dbPath) {
       PRIMARY KEY(keyword, note_id)
     );
   `);
+  const columns = new Set(db.prepare('PRAGMA table_info(candidate)').all().map(row => row.name));
+  if (!columns.has('import_status')) db.exec("ALTER TABLE candidate ADD COLUMN import_status TEXT NOT NULL DEFAULT 'pending'");
+  if (!columns.has('import_error')) db.exec('ALTER TABLE candidate ADD COLUMN import_error TEXT');
   // A killed process cannot still own a local download/inference operation.
   // Keep the durable job and retry only this video on the next start.
   db.prepare(`UPDATE asr_job SET status='retry_pending',last_error=COALESCE(last_error,'进程中断后恢复'),updated_at=?
-    WHERE status IN ('downloading','running','waiting_import')`).run(now());
+    WHERE status IN ('downloading','running','waiting_import','partial_review')`).run(now());
+  db.prepare("UPDATE asr_job SET status='dead_letter',last_error=COALESCE(last_error,'ASR_ATTEMPTS_EXHAUSTED'),updated_at=? WHERE status IN ('pending','retry_pending') AND attempts>=max_attempts").run(now());
   return db;
 }
 
@@ -94,7 +101,7 @@ export function saveCandidates(db, keyword, links, offset = 0) {
 }
 
 export function checkpointCandidates(db, keyword) {
-  return db.prepare("SELECT note_id AS noteId,url,candidate_index AS candidateIndex,status,attempts,result_json AS resultJson,last_error AS lastError FROM candidate WHERE keyword=? ORDER BY candidate_index,note_id").all(keyword).map(row => {
+  return db.prepare("SELECT note_id AS noteId,url,candidate_index AS candidateIndex,status,attempts,result_json AS resultJson,last_error AS lastError,import_status AS importStatus,import_error AS importError FROM candidate WHERE keyword=? ORDER BY candidate_index,note_id").all(keyword).map(row => {
     let result = null;
     try { result = JSON.parse(row.resultJson); } catch {}
     const publishedAt = result?.post?.["文章时间地点"] || result?.publishedAt || null;
@@ -114,11 +121,11 @@ export function markCompleted(db, keyword, note, result, {asrJob=null,asrMaxAtte
       result.post.文章视频内容=priorJob.transcript;
       result.postTextAudit=priorResult.postTextAudit;
     }
-    db.prepare(`UPDATE candidate SET status='completed',attempts=attempts+1,result_json=?,last_error=NULL,updated_at=?
+    db.prepare(`UPDATE candidate SET status='completed',attempts=attempts+1,result_json=?,last_error=NULL,import_status='pending',import_error=NULL,updated_at=?
       WHERE keyword=? AND note_id=?`).run(JSON.stringify(result), now(), keyword, note.noteId);
     if(asrJob){
       enqueueAsrJob(db,asrJob,asrMaxAttempts);
-      db.prepare("UPDATE asr_job SET status='waiting_import' WHERE keyword=? AND note_id=? AND status NOT IN ('completed','running','downloading')").run(keyword,note.noteId);
+      db.prepare("UPDATE asr_job SET status='waiting_import' WHERE keyword=? AND note_id=? AND status NOT IN ('completed','dead_letter','running','downloading')").run(keyword,note.noteId);
     }
     db.exec('COMMIT');
   }catch(error){db.exec('ROLLBACK');throw error;}
@@ -134,21 +141,55 @@ export function markFailed(db, keyword, note, error) {
     WHERE keyword=? AND note_id=?`).run(String(error?.message || error || "unknown error"), now(), keyword, note.noteId);
 }
 
+export function markImportPending(db, keyword, noteIds, error) {
+  const update = db.prepare("UPDATE candidate SET import_status='pending',import_error=?,updated_at=? WHERE keyword=? AND note_id=? AND status='completed'");
+  db.exec('BEGIN IMMEDIATE');
+  try { for (const id of noteIds) update.run(String(error?.message || error), now(), keyword, id); db.exec('COMMIT'); }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+
+export function markBaseImported(db, keyword, noteIds) {
+  const update = db.prepare("UPDATE candidate SET import_status='imported',import_error=NULL,updated_at=? WHERE keyword=? AND note_id=? AND status='completed'");
+  db.exec('BEGIN IMMEDIATE');
+  try { for (const id of noteIds) update.run(now(), keyword, id); db.exec('COMMIT'); }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+
+// Recover only durable articles demoted by the old SQL-stop bug. Keep any
+// incomplete comment audit for ordinary detail recovery; never invent completion.
+export function recoverSavedImportFailures(db, task, year = 2026) {
+  const recovered = [];
+  for (const row of checkpointCandidates(db, task.keyword)) {
+    if (row.status !== 'failed' || !/^(?:STOP_REQUESTED：.*(?:入库|已安全停止)|MYSQL_IMPORT_LOCK_WAIT_TIMEOUT|Lock wait timeout exceeded|Deadlock found)/u.test(row.lastError || '')) continue;
+    const post = row.result?.post;
+    if (!post || String(post.文章id) !== row.noteId || post.平台 !== '抖音' || !post.项目 ||
+        post.文章链接 !== canonicalDouyinPostUrl(row.noteId) || !post.作者id ||
+        !inTargetYear(post.文章时间地点, year, task.cutoff || `${year}-01-01`) ||
+        !['视频','图文'].includes(post.内容类型) ||
+        (post.内容类型 === '视频' && !post.文章视频链接) || !Array.isArray(row.result.comments) ||
+        (task.collectComments && typeof row.result.audit?.commentsComplete !== 'boolean')) continue;
+    db.prepare("UPDATE candidate SET status='completed',import_status='pending',import_error=last_error,last_error=NULL,updated_at=? WHERE keyword=? AND note_id=? AND status='failed'")
+      .run(now(), task.keyword, row.noteId);
+    recovered.push(row.noteId);
+  }
+  return recovered;
+}
+
 export function enqueueAsrJob(db, job, maxAttempts = 3) {
   const timestamp = now();
   db.prepare(`INSERT INTO asr_job(keyword,note_id,article_id,media_url,media_path,referer,prompt,status,attempts,max_attempts,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'pending',0,?,?,?)
     ON CONFLICT(keyword,note_id) DO UPDATE SET
       article_id=excluded.article_id,media_url=excluded.media_url,
-      media_path=CASE WHEN asr_job.status='dead_letter' THEN excluded.media_path ELSE COALESCE(asr_job.media_path,excluded.media_path) END,
+      media_path=COALESCE(asr_job.media_path,excluded.media_path),
       referer=excluded.referer,prompt=excluded.prompt,
       status=CASE
-        WHEN asr_job.status IN ('completed','running','downloading') THEN asr_job.status
+        WHEN asr_job.status IN ('completed','dead_letter','running','downloading') THEN asr_job.status
         ELSE 'pending'
       END,
-      attempts=CASE WHEN asr_job.status='dead_letter' THEN 0 ELSE asr_job.attempts END,
-      max_attempts=excluded.max_attempts,
-      last_error=CASE WHEN asr_job.status='completed' THEN asr_job.last_error ELSE NULL END,
+      attempts=asr_job.attempts,
+      max_attempts=asr_job.max_attempts,
+      last_error=asr_job.last_error,
       updated_at=excluded.updated_at`)
     .run(String(job.keyword), String(job.noteId), String(job.articleId), String(job.mediaUrl), job.mediaPath || null,
       job.referer || null, job.prompt || null, Math.max(1, Number(maxAttempts) || 3), timestamp, timestamp);
@@ -202,6 +243,9 @@ export function completeAsrJob(db, job, output) {
   const result = JSON.parse(row.resultJson);
   const noSpeechStatuses = new Set(["no_speech", "no_audio_track", "empty_audio_track", "silent_audio"]);
   const noSpeech = !output.text && noSpeechStatuses.has(output.audit?.status);
+  if (output.audit?.quality?.accepted === false || (!output.text && !noSpeech)) {
+    throw new Error('ASR_RESULT_UNVERIFIED：空白、质量拒绝或未知状态不能完成字幕作业');
+  }
   result.post["文章视频内容"] = output.text || null;
   result.postTextAudit = {
     ...(result.postTextAudit || {}), subtitle_source: output.source || "audio_asr",
@@ -280,9 +324,26 @@ export function importedStats(db, keyword) {
   return Object.fromEntries(rows.map((row) => [row.target_table, row.n]));
 }
 
+export function migrateCheckpointCommentThreads(db){
+  const rows=db.prepare("SELECT keyword,note_id,result_json FROM candidate WHERE result_json IS NOT NULL").all();
+  let changed=0,deferred=0;
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_thread_migration_backup(keyword TEXT NOT NULL,note_id TEXT NOT NULL,result_json TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(keyword,note_id)); BEGIN IMMEDIATE;`);
+  try{
+    for(const row of rows){
+      let before;try{before=JSON.parse(row.result_json);}catch{continue;}
+      const after=normaliseCommentResult(before);
+      if(after.audit?.comments?.aggregation_mode==='legacy_unresolved')deferred++;
+      if(after===before)continue;
+      db.prepare('INSERT OR IGNORE INTO comment_thread_migration_backup(keyword,note_id,result_json,created_at) VALUES(?,?,?,?)').run(row.keyword,row.note_id,row.result_json,now());
+      db.prepare("UPDATE candidate SET result_json=?,import_status='pending',updated_at=? WHERE keyword=? AND note_id=?").run(JSON.stringify(after),now(),row.keyword,row.note_id);changed++;
+    }
+    db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
+  return {changed,deferred};
+}
 export function completedResults(db) {
   return db.prepare("SELECT result_json FROM candidate WHERE status='completed' AND result_json IS NOT NULL ORDER BY keyword,candidate_index,note_id")
-    .all().map((row) => JSON.parse(row.result_json));
+    .all().map((row) => normaliseCommentResult(JSON.parse(row.result_json)));
 }
 
 const speechKey = value => String(value || "").replace(/[^0-9A-Za-z\u4e00-\u9fff]+/g, "");
@@ -300,8 +361,7 @@ export function repairCheckpointDataQuality(db) {
   const rows = db.prepare("SELECT keyword,note_id,result_json FROM candidate WHERE status='completed' AND result_json IS NOT NULL").all();
   let links = 0, asr = 0;
   const update = db.prepare("UPDATE candidate SET result_json=?,updated_at=? WHERE keyword=? AND note_id=?");
-  const resetAsr = db.prepare(`UPDATE asr_job SET status='dead_letter',attempts=max_attempts,transcript=NULL,audit_json=NULL,last_error='ASR_QUALITY_RECHECK_REQUIRED',updated_at=? WHERE keyword=? AND note_id=?`);
-  const permitCandidateRetry = db.prepare("UPDATE candidate SET attempts=MIN(attempts,2),updated_at=? WHERE keyword=? AND note_id=?");
+  const resetAsr = db.prepare(`UPDATE asr_job SET status=CASE WHEN attempts>=max_attempts THEN 'dead_letter' ELSE 'retry_pending' END,last_error='ASR_QUALITY_RECHECK_REQUIRED',updated_at=? WHERE keyword=? AND note_id=?`);
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const row of rows) {
@@ -318,7 +378,6 @@ export function repairCheckpointDataQuality(db) {
         result.postTextAudit = { ...(result.postTextAudit || {}), subtitle_source: null,
           subtitle_status: "asr_failed", subtitle_error: "ASR_QUALITY_RECHECK_REQUIRED" };
         resetAsr.run(now(), row.keyword, row.note_id);
-        permitCandidateRetry.run(now(), row.keyword, row.note_id);
         asr += 1; changed = true;
       }
       if (changed) update.run(JSON.stringify(result), now(), row.keyword, row.note_id);
@@ -353,7 +412,7 @@ export async function exportCheckpoint(db, outputDir, extra = {}) {
         ...(rejectAsr ? { 文章视频内容: null } : {}) },
       postTextAudit: rejectAsr ? { ...(result.postTextAudit || {}), subtitle_source: null,
         subtitle_status: "asr_failed", subtitle_error: "ASR_QUALITY_RECHECK_REQUIRED" } : result.postTextAudit,
-      comments: extra.collectComments === false ? [] : (result.comments || []).map(comment => ({ ...comment, ...taskLabels, 文章链接: articleUrl }))
+      comments: extra.collectComments === false || result.audit?.comments?.aggregation_mode==='legacy_unresolved' ? [] : (result.comments || []).map(comment => ({ ...comment, ...taskLabels, 文章链接: articleUrl }))
     };
   });
   const posts = [...new Map(results.filter((x) => x?.post).map((x) => [`${x.post["平台"]}:${x.post["文章id"]}:${x.post["项目"]}`, x.post])).values()];

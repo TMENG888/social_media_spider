@@ -35,4 +35,24 @@ REDIS.env
 redis-config.json
 *密码*
 *credential*
+output/
+.portable-build/
+.cache/
+maintenance-archives/
+*.dpapi
+*.pem
+*.key
+*.pfx
+*.p12
+*.har
+*.webm
+*.flac
+*.ogg
+*.7z
+*.tar*
+storage-state*.json
+cookies*.json
+user-data/
+browser-profile*/
+wechat-channels/feishu-monitor/config.json
 

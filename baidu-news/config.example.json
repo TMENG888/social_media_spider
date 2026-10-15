@@ -1,0 +1,17 @@
+{
+  "query": "中国海外集团 住宅",
+  "startDate": "2026-01-01",
+  "maxPages": 20,
+  "maxItems": 200,
+  "batchSize": 10,
+  "minContentLength": 100,
+  "headless": false,
+  "browserExecutable": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+  "navigationTimeoutMs": 30000,
+  "listDelayMs": [8000, 15000],
+  "detailDelayMs": [6000, 12000],
+  "maxRetries": 2,
+  "maxSecurityRetries": 2,
+  "securityCooldownMs": [120000, 300000],
+  "saveHtml": false
+}

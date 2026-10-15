@@ -56,7 +56,7 @@ async function askSecret(prompt) {
 }
 
 const cli = parseArgs(process.argv);
-const host = String(cli.host || process.env.MYSQL_HOST || "mysql.example.com");
+const host = String(cli.host || process.env.MYSQL_HOST || "127.0.0.1");
 const port = Number(cli.port || process.env.MYSQL_PORT || 3306);
 const database = String(cli.database || process.env.MYSQL_DATABASE || "social");
 const table = String(cli.table || process.env.MYSQL_TABLE || "ods_social_media_post");

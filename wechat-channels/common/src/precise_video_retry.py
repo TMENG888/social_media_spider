@@ -3,10 +3,29 @@ import json
 import time
 from dataclasses import fields
 
-def open_saved_video(c, url, config):
+def open_saved_video(c, url, config, *, locator_query=None):
     if not c.is_valid_channels_share_url(url):
         raise ValueError('Not a trusted WeChat Channels URL')
-    web = c.get_search_window(wait_seconds=4)
+    try:
+        web = c.get_search_window(wait_seconds=4)
+    except c.SearchWindowUnavailableError:
+        # An idle node may only have the main WeChat window.  Merely polling
+        # cannot create the URL-capable surface. Reuse the production recovery
+        # route (login/stop checks and distributed pacing included), but bound
+        # this bootstrap separately from the later content search fallback.
+        query = str(locator_query or '').strip()
+        if not query:
+            raise RuntimeError('URL bootstrap requires a stored title or keyword')
+        bootstrap = dict(config)
+        bootstrap['search_window_recovery_attempts'] = max(1, min(2,
+            int(config.get('search_window_recovery_attempts', 5))))
+        print(json.dumps({'event':'retry_direct_url_bootstrap',
+                          'query':query,
+                          'max_attempts':bootstrap['search_window_recovery_attempts']},
+                         ensure_ascii=False), flush=True)
+        c.search_in_web(query, bootstrap)
+        # Recovery can rebuild Chromium windows. Never retain a prior handle.
+        web = c.get_search_window(wait_seconds=4)
     web.set_focus()
     bounds = web.rectangle()
     def header_edits():
@@ -43,6 +62,8 @@ def open_saved_video(c, url, config):
     edits[0].click_input()
     c.set_clipboard(url)
     c.keyboard.send_keys('^a^v{ENTER}', pause=0.05)
+    print(json.dumps({'event':'retry_direct_url_submitted', 'url':url},
+                     ensure_ascii=False), flush=True)
     c.wait_for(lambda: c.has_video_detail_window(), timeout=12)
     surface = c.get_video_detail_window(wait_seconds=6)
     c.pause_active_video_if_running(surface)
@@ -80,8 +101,12 @@ def try_direct_retry(c, keyword, project, fingerprint, config, db, remote, colle
         return None
     surface = None
     try:
-        surface = open_saved_video(c, url, config)
+        surface = open_saved_video(c, url, config,
+                                   locator_query=data.get('title') or cp.get('title') or keyword)
         records, details, title, author, duration = verify_target(c, surface, cp)
+        print(json.dumps({'event':'retry_direct_url_identity_verified',
+                          'keyword':keyword, 'fingerprint':fingerprint,
+                          'duration':duration}, ensure_ascii=False), flush=True)
     except Exception as exc:
         print(json.dumps({'event':'retry_direct_url_fallback', 'keyword':keyword,
                           'fingerprint':fingerprint, 'error':str(exc)}, ensure_ascii=False), flush=True)

@@ -6,7 +6,7 @@ $WorkerRoot = if ($env:WECHAT_WORKER_ROOT) { Resolve-Path $env:WECHAT_WORKER_ROO
 if ($Mode -eq 'check') { & (Join-Path $Common 'check-env.ps1'); exit $LASTEXITCODE }
 $dbEnabled = $env:MYSQL_ENABLED -ne '0'
 if ($dbEnabled) {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = 'mysql.example.com' }
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
   if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
   if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }

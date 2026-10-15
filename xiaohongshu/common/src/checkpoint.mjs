@@ -29,6 +29,10 @@ export function openCheckpoint(dbPath) {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS scope_audit (
+      keyword TEXT NOT NULL,note_id TEXT NOT NULL,assessment_json TEXT NOT NULL,
+      checked_at TEXT NOT NULL,PRIMARY KEY(keyword,note_id)
+    );
     -- 增量入库断点表：登记已写入 MySQL 的帖子/评论，异常终止后恢复时据此避免重复入库与漏库。
     CREATE TABLE IF NOT EXISTS note_dead_letter (
       keyword TEXT NOT NULL, note_id TEXT NOT NULL, url TEXT NOT NULL,
@@ -68,7 +72,8 @@ export function openCheckpoint(dbPath) {
   // A killed process cannot still own a local download/inference operation.
   // Keep the durable job and retry only this video on the next start.
   db.prepare(`UPDATE asr_job SET status='retry_pending',last_error=COALESCE(last_error,'进程中断后恢复'),updated_at=?
-    WHERE status IN ('downloading','running','waiting_import')`).run(now());
+    WHERE status IN ('downloading','running','waiting_import','partial_review')`).run(now());
+  db.prepare("UPDATE asr_job SET status='dead_letter',last_error=COALESCE(last_error,'ASR_ATTEMPTS_EXHAUSTED'),updated_at=? WHERE status IN ('pending','retry_pending') AND attempts>=max_attempts").run(now());
   return db;
 }
 
@@ -107,14 +112,33 @@ export function markCompleted(db, keyword, note, result, {asrJob=null,asrMaxAtte
   // a crash or SQL failure before the base article import has finished.
   db.exec('BEGIN IMMEDIATE');
   try{
+    retainCompletedAsrEvidence(db,keyword,note.noteId,result);
     db.prepare(`UPDATE candidate SET status='completed',attempts=attempts+1,result_json=?,last_error=NULL,updated_at=?
       WHERE keyword=? AND note_id=?`).run(JSON.stringify(result), now(), keyword, note.noteId);
     if(asrJob){
       enqueueAsrJob(db,asrJob,asrMaxAttempts);
-      db.prepare("UPDATE asr_job SET status='waiting_import' WHERE keyword=? AND note_id=? AND status<>'completed'").run(keyword,note.noteId);
+      db.prepare("UPDATE asr_job SET status='waiting_import' WHERE keyword=? AND note_id=? AND status NOT IN ('completed','dead_letter','running','downloading')").run(keyword,note.noteId);
     }
     db.exec('COMMIT');
   }catch(error){db.exec('ROLLBACK');throw error;}
+}
+
+function retainCompletedAsrEvidence(db,keyword,noteId,result) {
+  // Detail refreshes must not erase an already verified background transcript.
+  // Restore only blank fields with the same article identity and a trustworthy
+  // durable audit; never overwrite a new nonempty text or revive failed jobs.
+  if(!result?.post || result.post.内容类型!=='视频' || String(result.post.文章视频内容||'').trim())return false;
+  const job=db.prepare('SELECT status,article_id,transcript,audit_json FROM asr_job WHERE keyword=? AND note_id=?').get(keyword,noteId);
+  if(job?.status!=='completed'||String(job.article_id)!==String(result.post.文章id))return false;
+  let audit;try{audit=JSON.parse(job.audit_json||'null');}catch{return false;}
+  const text=String(job.transcript||'');
+  const noSpeech=!text&&['no_speech','no_audio_track','empty_audio_track','silent_audio'].includes(audit?.status);
+  if(audit?.quality?.accepted===false||(!noSpeech&&(!text||audit?.status!=='ok')))return false;
+  const before=JSON.stringify(result);
+  result.post.文章视频内容=text||null;
+  result.postTextAudit={...(result.postTextAudit||{}),subtitle_source:'audio_asr',
+    subtitle_status:text?'extracted':'no_speech',subtitle_error:null,subtitle_audit:audit};
+  return JSON.stringify(result)!==before;
 }
 
 export function markSkipped(db, keyword, note, reason, publishedAt = null) {
@@ -122,9 +146,15 @@ export function markSkipped(db, keyword, note, reason, publishedAt = null) {
     WHERE keyword=? AND note_id=?`).run(String(reason || ""), JSON.stringify({ publishedAt, source: "detail_page" }), now(), keyword, note.noteId);
 }
 
-export function markFailed(db, keyword, note, error) {
+export function markFailed(db, keyword, note, error, maxAttempts = 3) {
   db.prepare(`UPDATE candidate SET status='failed',attempts=attempts+1,last_error=?,updated_at=?
     WHERE keyword=? AND note_id=?`).run(String(error?.message || error || "unknown error"), now(), keyword, note.noteId);
+  const row=db.prepare("SELECT attempts FROM candidate WHERE keyword=? AND note_id=?").get(keyword,note.noteId);
+  if(Number(row?.attempts)>=maxAttempts){
+    // Keep the actual failure count; do not manufacture another attempt.
+    return markNoteDeadLetter(db,keyword,note,error,maxAttempts,false);
+  }
+  return 'failed';
 }
 
 export function enqueueAsrJob(db, job, maxAttempts = 3) {
@@ -133,31 +163,35 @@ export function enqueueAsrJob(db, job, maxAttempts = 3) {
     VALUES(?,?,?,?,?,?,?,'pending',0,?,?,?)
     ON CONFLICT(keyword,note_id) DO UPDATE SET
       article_id=excluded.article_id,media_url=excluded.media_url,
-      media_path=CASE WHEN asr_job.status='dead_letter' THEN excluded.media_path ELSE COALESCE(asr_job.media_path,excluded.media_path) END,
+      media_path=COALESCE(asr_job.media_path,excluded.media_path),
       referer=excluded.referer,prompt=excluded.prompt,
       status=CASE
-        WHEN asr_job.status='completed' THEN 'completed'
+        WHEN asr_job.status IN ('completed','dead_letter','running','downloading') THEN asr_job.status
         ELSE 'pending'
       END,
-      attempts=CASE WHEN asr_job.status='dead_letter' THEN 0 ELSE asr_job.attempts END,
-      max_attempts=excluded.max_attempts,
-      last_error=CASE WHEN asr_job.status='completed' THEN asr_job.last_error ELSE NULL END,
+      attempts=asr_job.attempts,
+      max_attempts=asr_job.max_attempts,
+      last_error=asr_job.last_error,
       updated_at=excluded.updated_at`)
     .run(String(job.keyword), String(job.noteId), String(job.articleId), String(job.mediaUrl), job.mediaPath || null,
       job.referer || null, job.prompt || null, Math.max(1, Number(maxAttempts) || 3), timestamp, timestamp);
 }
 
-export function markNoteDeadLetter(db, keyword, note, error) {
+export function markNoteDeadLetter(db, keyword, note, error, maxAttempts=3, countAttempt=true) {
   const message=String(error?.message||error),timestamp=now();
   db.exec('BEGIN IMMEDIATE');
   try{
-    const changed=db.prepare("UPDATE candidate SET status='dead_letter',attempts=attempts+1,last_error=?,updated_at=? WHERE keyword=? AND note_id=?")
-      .run(message,timestamp,keyword,note.noteId);
+    const row=db.prepare("SELECT attempts FROM candidate WHERE keyword=? AND note_id=?").get(keyword,note.noteId);
+    const attempts=Number(row?.attempts||0)+(countAttempt?1:0);
+    const status=attempts>=maxAttempts?'dead_letter':'failed';
+    const changed=db.prepare("UPDATE candidate SET status=?,attempts=?,last_error=?,updated_at=? WHERE keyword=? AND note_id=?")
+      .run(status,attempts,message,timestamp,keyword,note.noteId);
     if(Number(changed.changes)!==1)throw new Error('DEAD_LETTER_CANDIDATE_MISSING');
-    db.prepare(`INSERT INTO note_dead_letter(keyword,note_id,url,reason,created_at,updated_at) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(keyword,note_id) DO UPDATE SET url=excluded.url,reason=excluded.reason,status='dead_letter',updated_at=excluded.updated_at`)
-      .run(keyword,note.noteId,note.url,message,timestamp,timestamp);
+    db.prepare(`INSERT INTO note_dead_letter(keyword,note_id,url,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(keyword,note_id) DO UPDATE SET url=excluded.url,reason=excluded.reason,status=excluded.status,updated_at=excluded.updated_at`)
+      .run(keyword,note.noteId,note.url,message,status==='dead_letter'?'dead_letter':'retry_pending',timestamp,timestamp);
     db.exec('COMMIT');
+    return status;
   }catch(error){db.exec('ROLLBACK');throw error;}
 }
 
@@ -167,6 +201,7 @@ export function claimAsrJob(db) {
     const row = db.prepare(`SELECT keyword,note_id AS noteId,article_id AS articleId,media_url AS mediaUrl,
       media_path AS mediaPath,referer,prompt,status,attempts,max_attempts AS maxAttempts
       FROM asr_job WHERE status IN ('pending','retry_pending') AND attempts < max_attempts
+      AND NOT EXISTS(SELECT 1 FROM candidate c WHERE c.keyword=asr_job.keyword AND c.note_id=asr_job.note_id AND c.status='skipped_irrelevant')
       ORDER BY updated_at,keyword,note_id LIMIT 1`).get();
     if (!row) {
       db.exec("COMMIT");
@@ -195,6 +230,9 @@ export function completeAsrJob(db, job, output) {
   const result = JSON.parse(row.resultJson);
   const noSpeechStatuses = new Set(["no_speech", "no_audio_track", "empty_audio_track", "silent_audio"]);
   const noSpeech = !output.text && noSpeechStatuses.has(output.audit?.status);
+  if (output.audit?.quality?.accepted === false || (!output.text && !noSpeech)) {
+    throw new Error('ASR_RESULT_UNVERIFIED：空白、质量拒绝或未知状态不能完成字幕作业');
+  }
   result.post["文章视频内容"] = output.text || null;
   result.postTextAudit = {
     ...(result.postTextAudit || {}), subtitle_source: output.source || "audio_asr",
@@ -248,7 +286,7 @@ export function deferAsrJob(db, job, error) {
 }
 
 export function asrJobStats(db) {
-  const counts = Object.fromEntries(db.prepare("SELECT status,COUNT(*) AS n FROM asr_job GROUP BY status").all().map(row => [row.status, Number(row.n)]));
+  const counts = Object.fromEntries(db.prepare("SELECT status,COUNT(*) AS n FROM asr_job WHERE NOT EXISTS(SELECT 1 FROM candidate c WHERE c.keyword=asr_job.keyword AND c.note_id=asr_job.note_id AND c.status='skipped_irrelevant') GROUP BY status").all().map(row => [row.status, Number(row.n)]));
   return { ...counts, pendingTotal: ["pending", "retry_pending", "downloading", "running", "waiting_import"].reduce((sum, key) => sum + (counts[key] || 0), 0) };
 }
 
@@ -291,16 +329,18 @@ export function needsAsrQualityRetry(result) {
 
 export function repairCheckpointDataQuality(db) {
   const rows = db.prepare("SELECT keyword,note_id,result_json FROM candidate WHERE status='completed' AND result_json IS NOT NULL").all();
-  let links = 0, asr = 0;
+  let links = 0, asr = 0, restoredAsr = 0;
   const update = db.prepare("UPDATE candidate SET result_json=?,updated_at=? WHERE keyword=? AND note_id=?");
-  const resetAsr = db.prepare(`UPDATE asr_job SET status='dead_letter',attempts=max_attempts,transcript=NULL,audit_json=NULL,last_error='ASR_QUALITY_RECHECK_REQUIRED',updated_at=? WHERE keyword=? AND note_id=?`);
-  const permitCandidateRetry = db.prepare("UPDATE candidate SET attempts=MIN(attempts,2),updated_at=? WHERE keyword=? AND note_id=?");
+  const resetAsr = db.prepare(`UPDATE asr_job SET status=CASE WHEN attempts>=max_attempts THEN 'dead_letter' ELSE 'retry_pending' END,last_error='ASR_QUALITY_RECHECK_REQUIRED',updated_at=? WHERE keyword=? AND note_id=?`);
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const row of rows) {
       let result;
       try { result = JSON.parse(row.result_json); } catch { continue; }
       let changed = false;
+      if(retainCompletedAsrEvidence(db,row.keyword,row.note_id,result)){
+        restoredAsr += 1; changed = true;
+      }
       if (result.post) {
         const fixed = canonicalXhsNoteUrl(result.post["文章id"] || row.note_id, result.post["文章链接"]);
         if (fixed && fixed !== result.post["文章链接"]) { result.post["文章链接"] = fixed; links += 1; changed = true; }
@@ -311,14 +351,13 @@ export function repairCheckpointDataQuality(db) {
         result.postTextAudit = { ...(result.postTextAudit || {}), subtitle_source: null,
           subtitle_status: "asr_failed", subtitle_error: "ASR_QUALITY_RECHECK_REQUIRED" };
         resetAsr.run(now(), row.keyword, row.note_id);
-        permitCandidateRetry.run(now(), row.keyword, row.note_id);
         asr += 1; changed = true;
       }
       if (changed) update.run(JSON.stringify(result), now(), row.keyword, row.note_id);
     }
     db.exec("COMMIT");
   } catch (error) { db.exec("ROLLBACK"); throw error; }
-  return { links, asr };
+  return { links, asr, restoredAsr };
 }
 
 const csvCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
@@ -363,6 +402,12 @@ export async function exportCheckpoint(db, outputDir, extra = {}) {
   await atomicWrite(path.join(outputDir, "comment_thread_audit.jsonl"), commentThreadAudits.map(JSON.stringify).join("\n") + (commentThreadAudits.length ? "\n" : ""));
   const deadLetters=db.prepare("SELECT keyword,note_id AS noteId,url,reason,status,created_at AS createdAt,updated_at AS updatedAt FROM note_dead_letter WHERE status='dead_letter' ORDER BY keyword,note_id").all();
   await atomicWrite(path.join(outputDir,'note_dead_letters.jsonl'),deadLetters.map(JSON.stringify).join('\n')+(deadLetters.length?'\n':''));
+  const scopeAudits=db.prepare('SELECT keyword,note_id AS noteId,assessment_json,checked_at AS checkedAt FROM scope_audit ORDER BY keyword,note_id').all()
+    .map(({assessment_json,...row})=>({...row,assessment:JSON.parse(assessment_json)}));
+  await atomicWrite(path.join(outputDir,'scope_audit.jsonl'),scopeAudits.map(JSON.stringify).join('\n')+(scopeAudits.length?'\n':''));
+  const excluded=db.prepare("SELECT keyword,note_id AS noteId,result_json FROM candidate WHERE status='skipped_irrelevant' ORDER BY keyword,note_id").all()
+    .map(({result_json,...row})=>({...row,result:JSON.parse(result_json||'null')}));
+  await atomicWrite(path.join(outputDir,'excluded_scope_records.jsonl'),excluded.map(JSON.stringify).join('\n')+(excluded.length?'\n':''));
   const summary = { posts: posts.length, commentThreads: comments.length, checkpointedNotes: results.length, exportedAt: now(), ...extra,
     deadLetterNotes:deadLetters.length,collectionCompleteness:deadLetters.length?'has_dead_letters':'no_dead_letters' };
   await atomicWrite(path.join(outputDir, "run_summary.json"), JSON.stringify(summary, null, 2));

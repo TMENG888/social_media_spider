@@ -4,10 +4,10 @@ import crypto from "node:crypto";
 
 const root = process.cwd();
 const outputRoot = path.join(root, "分布式部署包");
-const nodeSource = "C:/Users/YS-Insight/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe";
+const nodeSource = process.env.NODE_RUNTIME_SOURCE || process.execPath;
 const browserSource = path.join(root, ".portable-build/browsers");
 const taskRoot = path.join(root, "检索词任务");
-const topic2TaskRoot = "C:/Users/YS-Insight/Desktop/爬虫任务/专题二/Playwright百度资讯RPA/检索词任务/01_百度资讯全量任务_5台";
+const topic2TaskRoot = process.env.TOPIC2_TASK_ROOT || path.join(root, "检索词任务", "topic2");
 const version = `portable-1.0.0-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}Z`;
 const launchBat = [
   "@echo off", "chcp 65001 >nul", "setlocal", "set \"SCRIPT_DIR=%~dp0\"",

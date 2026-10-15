@@ -20,6 +20,10 @@
   "batchSize": 8,
   "batchCooldownMs": [45000, 90000],
   "maxConsecutiveFailures": 3,
+  "rateLimitCooldown": {
+    "group": "shared",
+    "delaysMs": [7200000, 14400000]
+  },
   "asrEnabled": true,
   "asrAutoInstall": true,
   "asrInstallTimeoutMs": 1800000,

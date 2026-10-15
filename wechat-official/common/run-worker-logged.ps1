@@ -61,7 +61,7 @@ if ($Mode -ne 'check') {
 # Obtain credentials before transcription starts. The password is therefore
 # never written to the daily diagnostic log, even on older PowerShell hosts.
 if ($Mode -ne 'check' -and $env:MYSQL_ENABLED -ne '0') {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = 'mysql.example.com' }
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
   if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
   if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { enqueueAsrJob, claimAsrJob, markAsrRunning, completeAsrJob, failAsrJob, deferAsrJob, asrJobStats } from "./checkpoint.mjs";
+import { cleanupCompletedAsrMedia } from "./asr-media-cleanup.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const runtimeUnavailable = error => /mkl_malloc|failed to allocate memory|cannot allocate memory|not enough memory|paging file|std::bad_alloc|ASR模型初始化超时/i.test(String(error?.message || error));
@@ -87,7 +88,7 @@ export class AsrJobProcessor {
         try { await this.onCompleted(job, output, updated); }
         catch (error) { console.warn(`[ASR入库] ${job.noteId}：本地回填成功，MySQL增量回填稍后由全量收尾兜底：${String(error.message || error).split("\n")[0]}`); }
       }
-      if (!this.keepMedia) await fs.rm(mediaPath, { force: true }).catch(() => {});
+      await this.cleanupMedia(job);
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => {});
       if (runtimeUnavailable(error)) {
@@ -103,7 +104,20 @@ export class AsrJobProcessor {
     return true;
   }
 
+  async cleanupMedia(job = null) {
+    // Cleanup failures must never demote a successfully committed ASR job.
+    try {
+      const stats = await cleanupCompletedAsrMedia({ db: this.db, mediaDir: this.mediaDir, keepMedia: this.keepMedia, job });
+      if (stats.deleted) console.log(`[ASR媒体清理] 已删除${stats.deleted}个完成媒体，释放${(stats.bytes / 1048576).toFixed(1)} MB；字幕和识别记录保留`);
+      return stats;
+    } catch (error) {
+      console.warn(`[ASR媒体清理] 本轮跳过，下次启动重试：${String(error.message || error).split("\n")[0]}`);
+      return null;
+    }
+  }
+
   async loop() {
+    await this.cleanupMedia();
     while (!this.stopping) {
       if (await this.shouldStop()) {
         this.stopping = true;

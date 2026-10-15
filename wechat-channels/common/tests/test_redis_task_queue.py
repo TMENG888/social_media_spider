@@ -247,7 +247,7 @@ class RedisCompletionGuardTests(unittest.TestCase):
         pending = json.dumps({"status": "retry_pending"})
         with patch.object(
             queue, "redis_command",
-            side_effect=[["one", completed, "two", pending], 1],
+            side_effect=[["one", completed, "two", pending], json.dumps({"status":"completed_with_deferred_retries","scanCompleted":True}), 1],
         ):
             result = queue.refresh_parent_keyword_status(self.args, item)
         self.assertEqual(result["status"], "completed_with_deferred_retries")
@@ -262,11 +262,20 @@ class RedisCompletionGuardTests(unittest.TestCase):
         }
         dead = json.dumps({"status": "dead_letter"})
         with patch.object(
-            queue, "redis_command", side_effect=[["one", dead], 1],
+            queue, "redis_command", side_effect=[["one", dead], json.dumps({"status":"completed_with_deferred_retries","scanCompleted":True}), 1],
         ):
             result = queue.refresh_parent_keyword_status(self.args, item)
         self.assertEqual(result["status"], "completed_with_dead_letters")
         self.assertEqual(result["deadLetterCount"], 1)
+
+    def test_child_completion_cannot_complete_unfinished_annual_scan(self):
+        item={"task_id":"topic2:abc","topic":"topic2","keyword":"unfinished"}
+        with patch.object(queue,"redis_command",side_effect=[
+            ["one",json.dumps({"status":"completed"})],
+            json.dumps({"status":"retry_pending","scanCompleted":False}),1]):
+            result=queue.refresh_parent_keyword_status(self.args,item)
+        self.assertEqual(result["status"],"retry_pending")
+        self.assertFalse(result["scanCompleted"])
 
     def test_video_retry_passes_original_result_index_to_collector(self):
         source = SOURCE.read_text(encoding="utf-8")
@@ -371,7 +380,7 @@ class RedisCompletionGuardTests(unittest.TestCase):
                 stop_file.write_text("stop", encoding="utf-8")
                 return 4
 
-            with patch.object(queue, "ensure_group"), patch.object(
+            with patch("redis_worker_control.WorkerControl") as control_class, patch.object(queue, "ensure_group"), patch.object(
                 queue, "seed_tasks", return_value=0,
             ), patch.object(
                 queue, "read_new", return_value=("1-0", item),
@@ -384,6 +393,7 @@ class RedisCompletionGuardTests(unittest.TestCase):
             ) as update_status, patch.object(
                 queue, "redis_command",
             ) as redis_command:
+                control_class.return_value.poll.return_value = False
                 result = queue.run_worker(args)
 
             self.assertEqual(result, 130)

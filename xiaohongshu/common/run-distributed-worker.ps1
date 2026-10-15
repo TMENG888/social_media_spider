@@ -25,9 +25,11 @@ $WorkerState=Join-Path $Worker '.state'
 $SupervisorStop=Join-Path $WorkerState 'supervisor.stop'
 $OldLocation=Get-Location
 $SavedEnv=@{}
-foreach($Name in @('XHS_WORKER_ROOT','XHS_DISPATCH','XHS_SKIP_IMPORT','XHS_SUPERVISOR_STOP_FILE','REDIS_URL','REDIS_USERNAME','REDIS_PASSWORD','MYSQL_USER','MYSQL_PASSWORD')){
+foreach($Name in @('XHS_WORKER_ROOT','XHS_DISPATCH','XHS_SKIP_IMPORT','XHS_SUPERVISOR_STOP_FILE','REDIS_URL','REDIS_USERNAME','REDIS_PASSWORD','MYSQL_USER','MYSQL_PASSWORD','MONITOR_WORKER_ROOT')){
   $SavedEnv[$Name]=[Environment]::GetEnvironmentVariable($Name,'Process')
 }
+. (Join-Path $Common 'monitor-supervisor.ps1')
+$RemoteFinalState='exit_unconfirmed'
 function Read-HiddenValue([string]$Label){
   $Secure=Read-Host $Label -AsSecureString
   $Pointer=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
@@ -107,23 +109,44 @@ try {
     if(-not $env:MYSQL_PASSWORD){$env:MYSQL_PASSWORD=Read-HiddenValue 'MySQL password (hidden)'}
     if(-not $env:MYSQL_USER -or -not $env:MYSQL_PASSWORD){throw 'MySQL credentials are required.'}
   }
+  if($Dispatch -eq 'redis' -and -not $ExportOnly){
+    & $Node (Join-Path $Common 'src\remote-stop-control.mjs') --action gate --root $Common --worker-root $Worker
+    if($LASTEXITCODE -ne 0){throw 'Remote stop hold or control unavailable. Collection not started.'}
+    Start-MonitorSupervisor
+  }
   $CycleEnabled=$Mode -eq 'run' -and $Dispatch -eq 'redis' -and -not $ExportOnly -and -not $SingleCycle -and $MaxRuntimeMinutes -eq 0
-  if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Safe stop] Manual stop requested during startup; collection will not start.';exit 0}
+  if(Test-Path -LiteralPath $SupervisorStop){$RemoteFinalState='stopped';Write-Host '[Safe stop] Stop requested during startup; collection will not start.';exit 0}
   if(-not $CycleEnabled){
+    if($Dispatch -eq 'redis' -and -not $ExportOnly){
+      Set-MonitorSupervisorState 'cooldown'
+      & $Node 'src\cooldown-control.mjs' '--root' $Common '--worker-root' $Worker '--action' 'wait'
+      if($LASTEXITCODE -eq 20){$RemoteFinalState='stopped';exit 0}
+      if($LASTEXITCODE -ne 0){throw 'Shared cooldown requires manual action or cannot be verified. Collection not started.'}
+    }
+    Set-MonitorSupervisorState 'collecting'
     & $Node 'src\run-worker.mjs' '--mode' $Mode '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $MaxRuntimeMinutes
     $RunExitCode=$LASTEXITCODE
   } else {
     $RunExitCode=0
     $CycleNumber=0
     while($true){
+      Assert-RemoteControlAvailable
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Manual stop requested; no new cycle will start.';break}
+      Set-MonitorSupervisorState 'cooldown'
+      & $Node 'src\cooldown-control.mjs' '--root' $Common '--worker-root' $Worker '--action' 'wait'
+      $CooldownExitCode=$LASTEXITCODE
+      if($CooldownExitCode -eq 20){$RunExitCode=0;break}
+      if($CooldownExitCode -ne 0){Write-Warning '[Cycle supervisor] Shared cooldown requires manual review or cannot be verified; no restart.';$RunExitCode=1;break}
       $CycleNumber+=1
       $CycleRuntime=Get-Random -Minimum $CycleRunMinMinutes -Maximum ($CycleRunMaxMinutes+1)
       Write-Host "[Cycle supervisor] Cycle ${CycleNumber} started; runtime=${CycleRuntime} minutes. Any unfinished task will be safely released."
+      Set-MonitorSupervisorState 'collecting'
       & $Node 'src\run-worker.mjs' '--mode' 'run' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $CycleRuntime
       $RunExitCode=$LASTEXITCODE
-      if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Current cycle closed safely; manual stop is active.';$RunExitCode=0;break}
+      if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Stop is active; no new cycle will start.';break}
       if($RunExitCode -eq 5){Write-Warning '[Cycle supervisor] Redis lease safety stop: local data is preserved and the unfinished task was not acknowledged. Restore Redis, then start this worker again.';break}
+      if($RunExitCode -eq 76){Write-Host '[Cycle supervisor] Rate limit recorded. Entering shared cooldown before any next cycle.';$RunExitCode=0;continue}
+      if($RunExitCode -eq 77){Write-Warning '[Cycle supervisor] Third rate limit or manual restriction: automatic resume disabled.';break}
       if($RunExitCode -ne 0){Write-Warning "[Cycle supervisor] Cycle exited abnormally (code $RunExitCode); automatic restart is disabled to prevent repeated access.";break}
 
       $WorkerStatusPath=Join-Path $Worker 'runs\worker_status.json'
@@ -145,16 +168,20 @@ try {
 
       $RestMinutes=Get-Random -Minimum $CycleRestMinMinutes -Maximum ($CycleRestMaxMinutes+1)
       $ResumeAt=(Get-Date).AddMinutes($RestMinutes).ToString('yyyy-MM-dd HH:mm:ss')
+      Set-MonitorSupervisorState 'resting' (Get-Date).AddMinutes($RestMinutes).ToUniversalTime().ToString('o')
       Write-Host "[Cycle supervisor] Cycle ${CycleNumber} completed; resting ${RestMinutes} minutes, scheduled to resume at ${ResumeAt}. Run the safe-stop BAT file to cancel later cycles."
       $RestSeconds=$RestMinutes*60
       for($Elapsed=0;$Elapsed -lt $RestSeconds;$Elapsed+=5){
+        Assert-RemoteControlAvailable
         if(Test-Path -LiteralPath $SupervisorStop){break}
         Start-Sleep -Seconds ([Math]::Min(5,$RestSeconds-$Elapsed))
       }
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Manual stop received during rest; no new cycle will start.';break}
     }
   }
+  if($RunExitCode -eq 0){$RemoteFinalState='stopped'}
 } finally {
+  Close-MonitorSupervisor $RemoteFinalState
   foreach($Name in $SavedEnv.Keys){[Environment]::SetEnvironmentVariable($Name,$SavedEnv[$Name],'Process')}
   Set-Location -LiteralPath $OldLocation.Path
 }

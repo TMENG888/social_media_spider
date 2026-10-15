@@ -43,14 +43,16 @@ if (-not $env:REDIS_RUN_ID) { $env:REDIS_RUN_ID = '20260926-prod-01' }
 if (-not $env:REDIS_WORKER_ROLE) {
   # Every physical node owns an independent WeChat UI.  Let all three nodes
   # claim annual keyword scans as well as exact-video retries; Redis leases keep
-  # one keyword on one node, while primary-burst keeps retries from starving.
+  # one keyword on one node. Task priority below gates new keywords until
+  # the retry backlog is resolved; primary-burst applies to balanced only.
   $env:REDIS_WORKER_ROLE = 'mixed'
 }
 if (-not $env:REDIS_PRIMARY_BURST) { $env:REDIS_PRIMARY_BURST = '1' }
+if (-not $env:REDIS_TASK_PRIORITY) { $env:REDIS_TASK_PRIORITY = 'retry_first' }
 
 if (-not $env:MYSQL_ENABLED) { $env:MYSQL_ENABLED = '1' }
 if ($env:MYSQL_ENABLED -ne '0') {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = 'mysql.example.com' }
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
   if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
   if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }
@@ -84,6 +86,7 @@ try {
   Write-Host "Computer: $env:COMPUTERNAME"
   Write-Host "RunId: $env:REDIS_RUN_ID"
   Write-Host "WorkerRole: $env:REDIS_WORKER_ROLE (primary burst: $env:REDIS_PRIMARY_BURST)"
+  Write-Host "TaskPriority: $env:REDIS_TASK_PRIORITY"
   Write-Host "Redis: $env:REDIS_URL"
   Write-Host "DisplayProfile: $env:WECHAT_DISPLAY_PROFILE"
   Write-Host "DatabaseEnabled: $($env:MYSQL_ENABLED -ne '0')"
@@ -95,7 +98,8 @@ try {
     '--worker-root', $WorkerRoot, '--redis-url', $env:REDIS_URL,
     '--run-id', $env:REDIS_RUN_ID,
     '--worker-role', $env:REDIS_WORKER_ROLE,
-    '--primary-burst', $env:REDIS_PRIMARY_BURST
+    '--primary-burst', $env:REDIS_PRIMARY_BURST,
+    '--task-priority', $env:REDIS_TASK_PRIORITY
   )
   if ($Once) { $arguments += '--once' }
   & $Python @arguments

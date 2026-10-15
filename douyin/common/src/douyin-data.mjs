@@ -115,30 +115,54 @@ export async function boundedResponseText(response,timeoutMs=15000) {
  try{return await Promise.race([response.text(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DOUYIN_RESPONSE_BODY_TIMEOUT')),timeoutMs);})]);}
  finally{clearTimeout(timer);}
 }
+export function searchPaginationMetadata(frames){
+ const values=[];
+ const visit=(value,depth=0)=>{
+  if(depth>8||!value||typeof value!=='object'||Array.isArray(value)||value.aweme_id||value.cid)return;
+  for(const key of ['has_more','hasMore'])if(Object.hasOwn(value,key)){
+   const raw=value[key];
+   if(raw===0||raw==='0'||raw===false)values.push(false);
+   else if(raw===1||raw==='1'||raw===true)values.push(true);
+  }
+  // Pagination is a response envelope, never nested per-post/comment data.
+  for(const [key,child]of Object.entries(value))if(!['aweme_info','aweme','comments','user','author','video','images','music'].includes(key))visit(child,depth+1);
+ };
+ for(const frame of frames)visit(frame);
+ return values.length&&values.every(v=>v===values[0])?values[0]:null;
+}
 /** Observe only responses requested by ordinary browser interactions. No direct
  * API calls, signatures, private session exports or CAPTCHA workarounds. */
 export class DouyinResponseObserver {
  constructor(page) {
-  this.page=page;this.awemes=new Map();this.comments=new Map();this.commentPages=[];this.embeddedReplyCoverage=new Map();this.profiles=new Map();this.searchRequests=[];this.pending=new Set();this.failures=[];
+  this.page=page;this.awemes=new Map();this.comments=new Map();this.commentPages=[];this.embeddedReplyCoverage=new Map();this.profiles=new Map();this.searchRequests=[];this.searchPages=[];this.searchFailures=[];this.pending=new Set();this.failures=[];
   this.listener=response=>{const job=this.consume(response).catch(e=>this.failures.push(String(e.message))).finally(()=>this.pending.delete(job));this.pending.add(job);};
   page.on('response',this.listener);
  }
  async flush(){await Promise.all([...this.pending]);}
  async consume(response){
   const u=new URL(response.url());
-  if(!/(^|\.)douyin\.com$/.test(u.hostname)||!/(?:general\/search|aweme\/detail|comment\/list|user\/profile\/other)/.test(u.pathname)||!response.ok())return;
-  if(!/json/.test(response.headers()['content-type']||''))return;
-  const payload=decodeBrowserPayload(await boundedResponseText(response));
-  if(!payload.length)throw new Error('DOUYIN_BROWSER_RESPONSE_UNPARSEABLE');
+  if(!/(^|\.)douyin\.com$/.test(u.hostname)||!/(?:general\/search|aweme\/detail|comment\/list|user\/profile\/other)/.test(u.pathname))return;
+  const isSearch=/general\/search/.test(u.pathname);
+  const searchInfo=isSearch?{at:Date.now(),keyword:u.searchParams.get('keyword'),latest:latestRequest(response.url(),response.request().postData()||''),path:u.pathname,offset:u.searchParams.get('offset')||u.searchParams.get('cursor')||null}:null;
+  if(!response.ok()){if(isSearch)this.searchFailures.push({...searchInfo,http:response.status()});return;}
+  if(!/json/.test(response.headers()['content-type']||'')){if(isSearch)this.searchFailures.push({...searchInfo,error:'unexpected_content_type'});return;}
+  let text;
+  try{text=await boundedResponseText(response);}catch(error){if(isSearch)this.searchFailures.push({...searchInfo,error:String(error.message)});throw error;}
+  const payload=decodeBrowserPayload(text);
+  if(!payload.length){if(isSearch)this.searchFailures.push({...searchInfo,error:'unparseable'});throw new Error('DOUYIN_BROWSER_RESPONSE_UNPARSEABLE');}
+  const searchIds=new Set(),validFrames=[];
   for(const data of payload){
-  if(data.status_code!=null&&Number(data.status_code)!==0)continue;
+  if(data.status_code!=null&&Number(data.status_code)!==0){if(isSearch)this.searchFailures.push({...searchInfo,statusCode:data.status_code});continue;}
+  validFrames.push(data);
   const rootId=u.searchParams.get('comment_id')||null;
   const rootComment=rootId?[...this.comments.values()].find(c=>String(c.cid)===rootId):null;
   const responseAwemeId=String(u.searchParams.get('aweme_id')||u.searchParams.get('item_id')||rootComment?.aweme_id||data.comments?.[0]?.aweme_id||'');
   if(/search/.test(u.pathname))this.searchRequests.push({at:Date.now(),keyword:u.searchParams.get('keyword'),latest:latestRequest(response.url(),response.request().postData()||''),path:u.pathname});
   const visit=(v,depth=0,inheritedRoot=null)=>{
    if(depth>12||v==null||typeof v!=='object')return;
-   if(v.aweme_id&&v.create_time&&v.author?.sec_uid&&(v.video||v.images||v.image_post_info)){this.awemes.set(String(v.aweme_id),v);return;}
+   // Incomplete post shapes still represent a known gap, not an empty result.
+   if(isSearch&&v.aweme_id&&!v.cid&&(v.author||v.video||v.images||v.image_post_info))searchIds.add(String(v.aweme_id));
+   if(v.aweme_id&&v.create_time&&v.author?.sec_uid&&(v.video||v.images||v.image_post_info)){this.awemes.set(String(v.aweme_id),v);if(isSearch)searchIds.add(String(v.aweme_id));return;}
    if(v.cid&&v.user&&v.text!=null){
     const aid=String(v.aweme_id||responseAwemeId);if(aid)this.comments.set(`${aid}/${v.cid}`,{...v,aweme_id:aid,reply_id:inheritedRoot||rootId||v.reply_id});
     const embedded=Array.isArray(v.reply_comment)?v.reply_comment:[];
@@ -152,6 +176,7 @@ export class DouyinResponseObserver {
   };visit(data);
   if(Array.isArray(data.comments))this.commentPages.push({at:Date.now(),awemeId:responseAwemeId,rootId,hasMore:data.has_more,cursor:data.cursor,count:data.comments.length});
   }
+  if(isSearch&&validFrames.length)this.searchPages.push({...searchInfo,hasMore:searchPaginationMetadata(validFrames),noteIds:[...searchIds]});
  }
  detach(){this.page.off('response',this.listener);}
 }

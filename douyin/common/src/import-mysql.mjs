@@ -5,6 +5,8 @@ import { POST_FIELDS, COMMENT_FIELDS, canonicalDouyinPostUrl } from "./schema.mj
 import { pathToFileURL } from "node:url";
 import { assertLocalLease, withImportLease } from "./lease-guard.mjs";
 import {normaliseDouyinPostFields,normaliseDouyinCommentFields} from './douyin-data.mjs';
+import {transientImportError} from './recovery-policy.mjs';
+import {recordCommittedPosts,subtitleWriteCount} from './monitor-telemetry.mjs';
 
 function argsOf(argv) {
   const out = {};
@@ -21,7 +23,7 @@ export function mysqlConnectionOptions() {
   const user = process.env.MYSQL_USER, password = process.env.MYSQL_PASSWORD;
   if (!user || !password) throw new Error("请通过当前进程环境变量 MYSQL_USER 和 MYSQL_PASSWORD 提供数据库凭据，不要写入配置文件");
   return {
-    host: String(process.env.MYSQL_HOST || "mysql.example.com"),
+    host: String(process.env.MYSQL_HOST || "127.0.0.1"),
     port: Number(process.env.MYSQL_PORT || 3306),
     database: String(process.env.MYSQL_DATABASE || "social"),
     user, password, charset: "utf8mb4", supportBigNumbers: true, bigNumberStrings: true, connectTimeout: 15000
@@ -126,7 +128,7 @@ export async function existingBusinessRows(connection,table,rows){
  for(const group of groups.values()){
   const ids=[...group.ids];for(let offset=0;offset<ids.length;offset+=250){
    await assertLocalLease();const batch=ids.slice(offset,offset+250);
-   const[existing]=await connection.execute(`SELECT \`id\`,${fields.map(f=>`\`${f}\``).join(',')} FROM \`${table}\` WHERE \`平台\`=? AND \`项目\`=? AND \`${fields[0]}\` IN (${batch.map(()=>'?').join(',')})`,[group.platform,group.project,...batch]);
+   const[existing]=await connection.execute(`SELECT \`id\`,${fields.map(f=>`\`${f}\``).join(',')}${table==='ods_social_media_post'?',`文章视频内容`':''} FROM \`${table}\` WHERE \`平台\`=? AND \`项目\`=? AND \`${fields[0]}\` IN (${batch.map(()=>'?').join(',')})`,[group.platform,group.project,...batch]);
    for(const row of existing){const key=businessRowKey(table,row);if(found.has(key))throw new Error('MYSQL_DUPLICATE_BUSINESS_KEY：拒绝任意覆盖重复业务行');found.set(key,row);}
   }
  }
@@ -135,7 +137,7 @@ export async function existingBusinessRows(connection,table,rows){
 async function upsertRows(connection, table, fields, rows) {
   if(!rows.length)return {inserted:0,updated:0};
   const existingRows=await existingBusinessRows(connection,table,rows);
-  let id = await nextId(connection, table), inserted = 0, updated = 0;
+  let id = await nextId(connection, table), inserted = 0, updated = 0, videoContentWrites = 0;
   const dataFields = fields.filter((f) => f !== "id");
   const insertSql = `INSERT INTO \`${table}\` (${fields.map((f) => `\`${f}\``).join(",")}) VALUES (${fields.map(() => "?").join(",")})`;
   // Phase-one exports (including old checkpoints and ASR callbacks) must never
@@ -147,23 +149,26 @@ async function upsertRows(connection, table, fields, rows) {
     if (existing) {
       row.id = String(existing.id);
       await connection.execute(updateSql, [...dataFields.map((f) => row[f]), row.id]);
+      if(table==='ods_social_media_post')videoContentWrites+=subtitleWriteCount(existing['文章视频内容'],row['文章视频内容']);
       updated += 1;
     } else {
       id += 1n; row.id = id.toString();
       await connection.execute(insertSql, fields.map((f) => row[f]));
+      if(table==='ods_social_media_post')videoContentWrites+=subtitleWriteCount(null,row['文章视频内容']);
       existingRows.set(key,{...row,id:row.id});
       inserted += 1;
     }
   }
-  return { inserted, updated };
+  return { inserted, updated, videoContentWrites };
 }
-export async function retryMysqlDeadlock(operation,{attempts=3,delayMs=300}={}){
+export async function retryMysqlDeadlock(operation,{attempts=3,delayMs=300,shouldStop=null}={}){
   for(let attempt=1;;attempt++){
     await assertLocalLease();
+    if(await shouldStop?.())throw new Error('STOP_REQUESTED：数据库重试前安全停止，数据保留在本地');
     try{return await operation();}
     catch(error){
-      if(attempt>=attempts||!(error.code==='ER_LOCK_DEADLOCK'||Number(error.errno)===1213))throw error;
-      console.warn(`[数据库事务重试] 已回滚死锁事务；第${attempt}/${attempts}次，不重复访问平台`);
+      if(attempt>=attempts||!transientImportError(error)||error.code==='MYSQL_IMPORT_LOCK_WAIT_TIMEOUT')throw error;
+      console.warn(`[数据库事务重试] 已回滚锁冲突事务；第${attempt}/${attempts}次，不重复访问平台`);
       await new Promise(resolve=>setTimeout(resolve,delayMs*attempt));
     }
   }
@@ -214,6 +219,7 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
     const commentResult = await upsertRows(connection, "ods_social_media_comment", COMMENT_FIELDS, comments);
     await verifyLease();
     await connection.commit();
+    await recordCommittedPosts(connection,posts,postResult,new Date().toISOString());
     return { postResult, commentResult, charsetCompatibility: compatibility };
   } catch (error) {
     await connection.rollback().catch(() => {});
@@ -222,7 +228,7 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
     if (importLockAcquired) await connection.query("SELECT RELEASE_LOCK('social_xhs_distributed_import')").catch(() => {});
     await connection.end();
   }
-  }));
+  }),{shouldStop});
 }
 
 const isMain = process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;

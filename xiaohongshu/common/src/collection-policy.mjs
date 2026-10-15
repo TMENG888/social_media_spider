@@ -1,4 +1,7 @@
+// Queue identity is deliberately stable. Acceptance rules are versioned
+// separately so a collector upgrade cannot recreate/reset production tasks.
 export const POLICY_VERSION = "20260928-streaming-year-window-v1";
+export const ACCEPTANCE_VERSION = "20261014-scoped-verified-search-end-v2";
 export const PROJECTS = Object.freeze({
   专题一: "全国地产设计产品力监测",
   专题二: "北京臻澐项目口碑"

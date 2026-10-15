@@ -3,9 +3,11 @@
  "collectionPhases":"posts_then_authors","visitAuthorProfile":false,"collectAllCurrentYear":true,
  "maxSearchScrolls":0,"maxNotesPerKeyword":0,"searchStopWindow":8,"maxStagnantRounds":15,
  "navigationTimeoutMs":45000,"maxCommentScrolls":0,
- "detailDelayMs":[5000,10000],"batchSize":8,"batchCooldownMs":[45000,90000],
- "authorDelayMs":[10000,15000],"authorBatchSize":8,"authorBatchCooldownMs":[45000,90000],
+ "detailDelayMs":[12000,25000],"batchSize":8,"batchCooldownMs":[120000,240000],
+ "keywordDelayMs":[45000,90000],
+ "commentDelayMs":[2000,4000],"commentBatchSize":20,"commentBatchCooldownMs":[30000,60000],
+ "authorDelayMs":[15000,30000],"authorBatchSize":6,"authorBatchCooldownMs":[120000,240000],
  "asrEnabled":true,"asrModel":"small","asrModelPath":"runtime/asr-models/faster-whisper-small",
  "asrLocalFilesOnly":true,"asrDevice":"cpu","asrComputeType":"int8_float32",
- "asrCpuThreads":1,"asrBeamSize":1,"asrMaxAttempts":3,"asrKeepMedia":true
+ "asrCpuThreads":1,"asrBeamSize":1,"asrMaxAttempts":3,"asrKeepMedia":false
 }

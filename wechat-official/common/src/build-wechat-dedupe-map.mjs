@@ -43,7 +43,7 @@ if (inputJsonl) {
 } else if (inputCsv) {
   rows = readCsv(inputCsv);
 } else {
-  const host = process.env.MYSQL_HOST || 'mysql.example.com';
+  const host = process.env.MYSQL_HOST || '127.0.0.1';
   const port = Number(process.env.MYSQL_PORT || 3306);
   const database = process.env.MYSQL_DATABASE || 'social';
   const user = process.env.MYSQL_USER;

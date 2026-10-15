@@ -3,7 +3,7 @@ function redisHandled(item) {
 }
 
 function isFailure(item) {
-  return Boolean(item.status && item.status !== "completed" && !item.skipped);
+  return Boolean(item.status && !['completed','completed_with_skips','skipped_unresolved'].includes(item.status) && !item.skipped);
 }
 
 export function summarizeWorkerTasks(tasks) {
@@ -14,6 +14,8 @@ export function summarizeWorkerTasks(tasks) {
   ])).values()];
   return {
     completedCount: latestTasks.filter(item => item.status === "completed" || item.skipped).length,
+    noChangeCompletedCount:latestTasks.filter(item=>item.disposition==='no_change').length,
+    disposedCount:latestTasks.filter(item=>['completed','completed_with_skips','skipped_unresolved'].includes(item.status)||item.skipped).length,
     failedCount: latestTasks.filter(item => isFailure(item) && !redisHandled(item)).length,
     releasedCount: latestTasks.filter(item => item.redisReleased).length,
     retryQueuedCount: latestTasks.filter(item => item.redisFailedHandled).length,

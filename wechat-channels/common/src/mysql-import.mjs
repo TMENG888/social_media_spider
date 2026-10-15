@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
 import { atomicWriteFileSync } from './atomic-file.mjs';
+import {ProductionOutputRecorder,meaningfulHint,finishOutput,recoverCommittedOutputs} from './production-output.mjs';
 
 const args = {};
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -10,7 +11,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 const postsFile = path.resolve(String(args.posts || ''));
 const commentsFile = args.comments && args.comments !== true ? path.resolve(String(args.comments)) : null;
 const statusFile = path.resolve(String(args.status || path.join(path.dirname(postsFile), 'mysql_import_status.json')));
-const host = process.env.MYSQL_HOST || 'mysql.example.com';
+const host = process.env.MYSQL_HOST || '127.0.0.1';
 const port = Number(process.env.MYSQL_PORT || 3306);
 const database = process.env.MYSQL_DATABASE || 'social';
 const user = process.env.MYSQL_USER;
@@ -45,10 +46,12 @@ const conn = await mysql.createConnection({host, port, user, password, database,
 let insertedPosts=0, updatedPosts=0, insertedComments=0, updatedComments=0, duplicatePostsSkipped=0, duplicateCommentsSkipped=0;
 let compatibilitySanitizedValues=0;
 const subtitleBackups = [];
+const outputRecorder=new ProductionOutputRecorder();
 const subtitleBackupPath = path.join(path.dirname(statusFile), `subtitle-backup-${Date.now()}-${process.pid}.json`);
 try {
   const [lockRows] = await conn.query("SELECT GET_LOCK('wechat_ods_import', 60) AS acquired");
   if (Number(lockRows[0]?.acquired) !== 1) throw new Error('MySQL import lock unavailable; no writes performed');
+  try {await recoverCommittedOutputs(conn,outputRecorder.root);} catch {}
   await conn.beginTransaction();
   // Existing production ODS tables were originally created with a mixture of
   // utf8mb3 and utf8mb4 columns.  Keep the connection at utf8mb4, inspect the
@@ -74,7 +77,7 @@ try {
     return sanitized === '' ? null : sanitized;
   };
   const upsert = async (table, fields, row, keySql, keyValues, fallbackKey) => {
-    const selectFields = table === 'ods_social_media_post' ? 'id,`文章视频内容`' : 'id';
+    const selectFields = '*';
     const [existing] = await conn.execute(`SELECT ${selectFields} FROM \`${table}\` WHERE ${keySql} LIMIT 1 FOR UPDATE`, keyValues);
     let id = existing[0]?.id ? String(existing[0].id) : makeId(fallbackKey);
     const data = fields.filter((f) => f !== 'id');
@@ -89,10 +92,15 @@ try {
         // recoverable preimage. No schema change or deletion is required.
         atomicWriteFileSync(subtitleBackupPath, JSON.stringify(subtitleBackups, null, 2), 'utf8');
       }
+      const incoming=Object.fromEntries(data.map(f=>[f,databaseValue(table,row,f)]));
       await conn.execute(
         `UPDATE \`${table}\` SET ${data.map((f) => `\`${f}\`=COALESCE(?,\`${f}\`)`).join(',')} WHERE id=?`,
-        [...data.map((f) => databaseValue(table, row, f)), id],
+        [...data.map((f) => incoming[f]), id],
       );
+      if (meaningfulHint(existing[0],incoming)) {
+        const [after]=await conn.execute(`SELECT * FROM \`${table}\` WHERE id=?`,[id]);
+        outputRecorder.track(table,existing[0],after[0]);
+      }
       return {id, updated:true};
     }
     // The table uses a caller-assigned BIGINT primary key. In the unlikely
@@ -106,6 +114,8 @@ try {
     }
     const payload = {...row, id};
     await conn.execute(`INSERT INTO \`${table}\` (${fields.map((f) => `\`${f}\``).join(',')}) VALUES (${fields.map(() => '?').join(',')})`, fields.map((f) => databaseValue(table, payload, f)));
+    const [after]=await conn.execute(`SELECT * FROM \`${table}\` WHERE id=?`,[id]);
+    outputRecorder.track(table,null,after[0]);
     return {id, updated:false};
   };
   const videoPoolCache = new Map();
@@ -166,12 +176,16 @@ try {
     const result = await upsert('ods_social_media_comment', commentFields, row, keySql, keyValues, `${platform}|${project}|${row['文章id']}|${row['评论id'] || row['评论内容']}|${row['评论时间']}`);
     result.updated ? updatedComments++ : insertedComments++;
   }
+  outputRecorder.prepare();
+  outputRecorder.commitAttempted=true;
   await conn.commit();
-  const status = {status:'success',host,database,posts:posts.length,comments:comments.length,insertedPosts,updatedPosts,duplicatePostsSkipped,insertedComments,updatedComments,duplicateCommentsSkipped,compatibilitySanitizedValues,subtitleBackupCount:subtitleBackups.length,subtitleBackupPath:subtitleBackups.length ? subtitleBackupPath : null,completedAt:new Date().toISOString()};
+  const outputTelemetry=await finishOutput(outputRecorder,conn);
+  const status = {status:'success',host,database,posts:posts.length,comments:comments.length,insertedPosts,updatedPosts,duplicatePostsSkipped,insertedComments,updatedComments,duplicateCommentsSkipped,compatibilitySanitizedValues,subtitleBackupCount:subtitleBackups.length,subtitleBackupPath:subtitleBackups.length ? subtitleBackupPath : null,completedAt:new Date().toISOString(),outputTelemetry};
   atomicWriteFileSync(statusFile, JSON.stringify(status,null,2), 'utf8');
   console.log(JSON.stringify(status,null,2));
 } catch (error) {
   await conn.rollback().catch(() => {});
+  try {outputRecorder.abort();} catch {}
   const status = {status:'failed',host,database,error:String(error?.message || error),failedAt:new Date().toISOString()};
   atomicWriteFileSync(statusFile, JSON.stringify(status,null,2), 'utf8');
   console.error(JSON.stringify(status,null,2));

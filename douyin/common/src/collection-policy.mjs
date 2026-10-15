@@ -49,3 +49,28 @@ export class YearBoundary {
 export function scrollBudget(collectAll, configured) {
   return collectAll ? Infinity : Math.max(1, Number(configured) || 20);
 }
+
+// Exhaustion is separate from the eight-older-post heuristic. A short result
+// set (including zero current-year posts) can be complete, but stagnation alone
+// can never establish that fact.
+export function searchExhaustionEvidence({keyword,after,sortConfirmed,pages=[],failures=[],uiEnd,candidates=[]}={}){
+ const reject=reason=>({confirmed:false,reason});
+ if(!sortConfirmed)return reject('latest_sort_not_confirmed');
+ if(!uiEnd?.visible)return reject('no_visible_search_end');
+ const relevant=pages.filter(p=>p.keyword===keyword&&p.at>=after);
+ if(!relevant.length)return reject('no_current_search_response');
+ const last=relevant.at(-1);
+ if(!last.latest)return reject('sort_changed');
+ if(last.hasMore!==false)return reject('pagination_not_exhausted');
+ if(failures.some(p=>p.keyword===keyword&&p.at>=after))return reject('search_response_failure');
+ const latest=relevant.filter(p=>p.latest),returned=[...new Set(latest.flatMap(p=>p.noteIds||[]))];
+ if(String(latest[0].offset??'0')!=='0')return reject('missing_initial_page');
+ const indexed=new Map(candidates.map(c=>[c.noteId,c]));
+ const gaps=[];
+ for(const id of new Set([...returned,...indexed.keys()])){
+  const c=indexed.get(id);
+  if(!c||!['completed','skipped_old'].includes(c.status)||!validDate(c.publishedAt)||(c.status==='completed'&&c.result?.audit?.commentsComplete===false))gaps.push(id);
+ }
+ if(gaps.length)return {confirmed:false,reason:'known_candidates_incomplete',gaps};
+ return {confirmed:true,reason:'search_exhausted',keyword,sortConfirmed:true,hasMore:false,returnedCount:returned.length,checkpointCount:candidates.length,lastResponseAt:last.at,offset:last.offset??null,uiText:uiEnd.text};
+}

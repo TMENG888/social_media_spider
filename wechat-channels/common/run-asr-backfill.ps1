@@ -42,7 +42,7 @@ New-Item -ItemType Directory -Force -Path $stateRoot,$runsRoot | Out-Null
 if ($redisStateScope) { Write-Host "Redis ASR state scope: $redisStateScope" }
 
 if ($dbEnabled) {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = 'mysql.example.com' }
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
   if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
   if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }
@@ -54,11 +54,13 @@ if ($dbEnabled) {
   }
 }
 
-$status = [ordered]@{workerId=(Split-Path $WorkerRoot -Leaf);phase='asr-backfill';startedAt=(Get-Date).ToString('o');keywords=@()}
+$status = [ordered]@{workerId=(Split-Path $WorkerRoot -Leaf);phase='asr-backfill';retryRunId=$env:WECHAT_RETRY_OBSERVATION_RUN_ID;startedAt=(Get-Date).ToString('o');keywords=@()}
 $failedKeywords = 0
+$stopFile = Join-Path $WorkerRoot '.state\stop.requested'
 $exactFingerprint = [string]$env:WECHAT_REDIS_VIDEO_FINGERPRINT
 $exactArticleKey = [string]$env:WECHAT_REDIS_VIDEO_ARTICLE_KEY
 foreach ($task in @($queue.tasks)) {
+  if (Test-Path -LiteralPath $stopFile) { break }
   $stateDb = Join-Path $stateRoot ($task.id + '.sqlite')
   # A Redis video-retry may be claimed by a different machine from the one
   # that performed the metadata scan.  In that case the local SQLite file is
@@ -71,11 +73,12 @@ foreach ($task in @($queue.tasks)) {
   }
   $taskFile = Join-Path $Root $task.keywordsFile
   foreach ($keyword in @($task.keywordAllowList)) {
+    if (Test-Path -LiteralPath $stopFile) { break }
     $safe = ($keyword -replace '[^\p{L}\p{N}_-]+','_').Trim('_')
     $outDir = Join-Path $runsRoot ($task.id + '\' + $safe)
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     Write-Host "[$($task.id)] ASR phase starting: $keyword"
-    $keywordState = [ordered]@{topic=$task.id;keyword=$keyword;status='running';startedAt=(Get-Date).ToString('o')}
+    $keywordState = [ordered]@{topic=$task.id;keyword=$keyword;exactFingerprint=$exactFingerprint;databaseImported=$false;status='running';startedAt=(Get-Date).ToString('o')}
     try {
       $raw = Join-Path $outDir 'ods_social_media_post_channels.jsonl'
       $directEnrichment = Join-Path $outDir 'browser_enrichment_direct_asr.jsonl'
@@ -130,7 +133,7 @@ foreach ($task in @($queue.tasks)) {
       if ($directResolved) {
         Write-Host "[$($task.id)] Direct subtitle/media ASR completed the exact video; client playback skipped." -ForegroundColor Green
       } else {
-        $collectArgs = @('collect-live','--input',$taskFile,'--config',$config,'--cutoff',$queue.cutoff,'--max-results','0','--state-db',$stateDb,'--screenshots',(Join-Path $WorkerRoot ('.state\screenshots\' + $task.id)),'--keyword',$keyword,'--asr-backfill')
+        $collectArgs = @('collect-live','--input',$taskFile,'--config',$config,'--cutoff',$queue.cutoff,'--max-results','0','--state-db',$stateDb,'--screenshots',(Join-Path $WorkerRoot ('.state\screenshots\' + $task.id)),'--keyword',$keyword,'--asr-backfill','--stop-file',$stopFile)
         if ($exactFingerprint) { $collectArgs += @('--retry-fingerprint',$exactFingerprint) }
         & $python $collector @collectArgs
         $collectorExit = $LASTEXITCODE
@@ -156,6 +159,7 @@ foreach ($task in @($queue.tasks)) {
         if ($task.collectComments -and (Test-Path $commentFile)) { $importArgs += @('--comments',$commentFile) }
         & $node @importArgs
         if ($LASTEXITCODE -ne 0) { throw "ASR MySQL import failed: $keyword" }
+        $keywordState.databaseImported=$true
       }
       if ($collectorExit -eq 0) {
         $keywordState.status='completed'

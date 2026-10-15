@@ -11,6 +11,11 @@ import {mysqlConnectionOptions,verifyTable} from './import-mysql.mjs';
 import {POST_FIELDS,COMMENT_FIELDS,stableId} from './schema.mjs';
 import {writeJsonAtomic} from './checkpoint.mjs';
 import {authorPhase} from './author-phase.mjs';
+import {keywordPause,waitForPacing} from './collection-pacing.mjs';
+import {collectionFailureAction} from './recovery-policy.mjs';
+import {RemoteStopControl} from './remote-stop-control.mjs';
+import {maySkipExhausted} from './retry-disposition.mjs';
+import {cleanupWorkerAsrMedia} from './cleanup-worker-asr-media.mjs';
 const common=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const args={};for(let i=2;i<process.argv.length;i++){if(!process.argv[i].startsWith('--'))continue;const k=process.argv[i].slice(2),v=process.argv[i+1];args[k]=v&&!v.startsWith('--')?process.argv[++i]:true;}
 const worker=path.resolve(String(args['worker-root']||path.join(common,'../worker-01')));
@@ -38,7 +43,8 @@ const verificationSample=args['verification-sample']?Number(args['verification-s
 if(args['verification-sample']&&(!Number.isInteger(verificationSample)||verificationSample<1||verificationSample>100||test||!selectedTasks||phase!=='posts'))throw new Error('VERIFICATION_SAMPLE_REQUIRES_SELECTED_POST_TASKS_AND_LIMIT_1_TO_100');
 if(!['auto','posts','authors'].includes(phase))throw new Error('phase must be auto/posts/authors');
 const deadline=Date.now()+Number(args['max-runtime-minutes']||60)*60000;
-let requested=false,dispatcher=null,context=null,fatal=null;
+let requested=false,dispatcher=null,context=null,fatal=null,retryAfterRest=false;
+let remoteControl=null;
 const shouldStop=async()=>requested||Date.now()>=deadline||await exists(stopFile);
 process.on('SIGINT',()=>{requested=true;});process.on('SIGTERM',()=>{requested=true;});
 const lockFile=path.join(stateRoot,'worker.lock');let lock;
@@ -47,11 +53,14 @@ catch(e){if(e.code!=='EEXIST')throw e;let old;try{old=await readJson(lockFile);}
  if(alive)throw new Error('WORKER_ALREADY_RUNNING：同一节点禁止重复启动');await fs.rm(lockFile,{force:true});lock=await fs.open(lockFile,'wx');await lock.writeFile(JSON.stringify({pid:process.pid}));}
 const status={workerId,startedAt:new Date().toISOString(),phase,tasks:[],completed:0,failed:0,status:'running',fatalError:null};
 try{
+ if(!test&&commit){remoteControl=await RemoteStopControl.open(common,worker);await remoteControl.gate();remoteControl.watch();}
+ try{await cleanupWorkerAsrMedia({stateRoot,mediaName:'media',keepMedia:config.asrKeepMedia===true,dryRun:false});}
+ catch(e){console.warn(`[ASR媒体清理] 跳过本轮清理，不影响采集：${e.message}`);}
  if(commit){
   const db=await mysql.createConnection(mysqlConnectionOptions());
   try{await verifyTable(db,'ods_social_media_post',POST_FIELDS);await verifyTable(db,'ods_social_media_comment',COMMENT_FIELDS);console.log('[数据库预检] 连接与两张目标表结构通过');}finally{await db.end();}
  }
- if(!test)dispatcher=await RedisDispatcher.open({root:common,stateRoot,workerId,skipImport:!commit,stopFile});
+ if(!test)dispatcher=await RedisDispatcher.open({root:common,stateRoot,workerId,skipImport:!commit,stopFile,selectedTaskIds:selectedTasks?.map(t=>t.redisTaskId||t.id)||null});
  context=await chromium.launchPersistentContext(path.join(stateRoot,'browser-profile'),{executablePath:chrome,headless:false,viewport:null,timeout:45000});
  const page=context.pages()[0]||await context.newPage();
  // Reject accidental popup navigation during the posts phase instead of
@@ -69,20 +78,37 @@ try{
    try{
     const result=await collectKeyword({page,task,config,commonRoot:common,stateDir,outputDir,shouldStop,sampleLimit:test?Number(args.limit||10):verificationSample,commit,allowManualLogin:test});
     status.tasks.push(result);
-    if(verificationSample)status.sampleVerified=(status.sampleVerified||0)+1;else status.completed++;
+    if(verificationSample)status.sampleVerified=(status.sampleVerified||0)+1;
+    else if(result.disposition==='no_change')status.noChangeCompleted=(status.noChangeCompleted||0)+1;
+    else if(result.status==='completed_with_skips')status.completedWithSkips=(status.completedWithSkips||0)+1;
+    else status.completed++;
     // A verified sample is not an annual keyword completion. Keep all saved
     // rows/checkpoints, return the real lease, and leave production pending.
     if(dispatcher)await dispatcher.finish(verificationSample?'release':'complete',result);
    }catch(e){
-    const stopped=/STOP_REQUESTED/.test(String(e.message));status.tasks.push(e.collectionSummary||{keyword:task.keyword,error:e.message});
-    if(dispatcher&&!dispatcher.lost)await dispatcher.finish(stopped?'release':'fail',{error:e.message});
-    if(stopped){requested=true;break;}
+    let action=collectionFailureAction(e,{test:test||Boolean(verificationSample)});status.tasks.push(e.collectionSummary||{keyword:task.keyword,error:e.message});
+    const boundedContentRetry=!test&&!verificationSample&&maySkipExhausted(e.collectionSummary);
+    if(boundedContentRetry)action='content_retry';
+    if(dispatcher&&!dispatcher.lost)await dispatcher.finish(e.reviewRequired?'review':action==='stop'?'release':action==='rest_retry'?'defer':'fail',e.collectionSummary||{error:e.message});
+    if(action==='stop'){requested=true;break;}
+    if(action==='rest_retry'||action==='content_retry'){
+     retryAfterRest=true;status.recoveryReason=e.message;
+     console.warn(action==='content_retry'
+      ? '[内容重试休息] 本地断点已保全，内容失败按共享上限处理；耗尽后留证跳过，不计成功'
+      : '[入库恢复休息] 本地数据已保全，暂缓次数有共享上限；耗尽后保留故障，不计完成');break;
+    }
     status.failed++;throw e; // First restriction or context error stops this node.
+   }
+   if(!test&&!verificationSample&&!await shouldStop()){
+    const delay=keywordPause(config);
+    console.log(`[关键词休息] 当前任务已入库并归还租约，休息${Math.round(delay.ms/1000)}秒再领取后续任务`);
+    try{await waitForPacing(delay.ms,{shouldStop});}
+    catch(e){if(/STOP_REQUESTED/.test(e.message)){requested=true;break;}throw e;}
    }
   }
  }
- if(dispatcher&&commit&&phase!=='posts'&&!await shouldStop())status.authors=await authorPhase({page,root:common,stateRoot,workerId,stopFile,postDispatcher:dispatcher,config,shouldStop});
- status.status=await shouldStop()?'partial_stopped':verificationSample?'sample_completed':'completed';
+ if(dispatcher&&commit&&phase!=='posts'&&!retryAfterRest&&!await shouldStop())status.authors=await authorPhase({page,root:common,stateRoot,workerId,stopFile,postDispatcher:dispatcher,config,shouldStop});
+ status.status=await shouldStop()?'partial_stopped':retryAfterRest?'retry_after_rest':verificationSample?'sample_completed':'completed';
  if(test&&commit&&!await shouldStop()){
   const results=[];const db=await mysql.createConnection(mysqlConnectionOptions());
   try{for(const task of status.tasks){const id=stableId(`${task.topic}/${task.keyword}`),posts=(await fs.readFile(path.join(runsRoot,id,'ods_social_media_post.jsonl'),'utf8')).split(/\r?\n/).filter(Boolean).map(JSON.parse);
@@ -96,7 +122,8 @@ try{
  }
 }catch(e){fatal=e;status.status='failed';status.fatalError=String(e.message||e);console.error(`[节点停止] ${status.fatalError}`);}
 finally{
- await context?.close().catch(()=>{});await dispatcher?.close({stopped:await shouldStop()}).catch(e=>console.error(`[Redis收尾] ${e.code||'ERROR'}`));
+ await context?.close().catch(e=>{fatal ||= e;});await dispatcher?.close({stopped:await shouldStop()}).catch(e=>{fatal ||= e;console.error(`[Redis收尾] ${e.code||'ERROR'}`);});
+ await remoteControl?.close(fatal?'exit_unconfirmed':'collector_stopped').catch(()=>{fatal ||= new Error('REMOTE_CONTROL_FINAL_ACK_UNAVAILABLE');});
  status.finishedAt=new Date().toISOString();await writeJsonAtomic(path.join(runsRoot,'worker_status.json'),status);await lock.close();await fs.rm(lockFile,{force:true});
 }
 console.log(JSON.stringify(status,null,2));process.exitCode=fatal?1:0;

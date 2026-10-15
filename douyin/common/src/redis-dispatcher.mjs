@@ -9,7 +9,7 @@ import { writeJsonAtomic } from './checkpoint.mjs';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export class RedisDispatcher {
-  static async open({ root, stateRoot, workerId, skipImport, stopFile, manifestOverride = null, campaignOverride = null }) {
+  static async open({ root, stateRoot, workerId, skipImport, stopFile, manifestOverride = null, campaignOverride = null, selectedTaskIds = null }) {
     const settings = await redisSettings(root);
     const manifest = manifestOverride || await loadTaskManifest(path.join(root, 'tasks', 'redis-tasks.json'));
     const client = await connectRedis(settings);
@@ -18,7 +18,10 @@ export class RedisDispatcher {
     try {
       const dispatcher = new RedisDispatcher({ settings, manifest, client, campaign, stateRoot, workerId, stopFile });
       await client.ping();
-      const published = await dispatcher.queue.publish(manifest.tasks);
+      const chosen=selectedTaskIds ? manifest.tasks.filter(t=>selectedTaskIds.includes(t.redisTaskId||t.id)) : null;
+      if(chosen && chosen.length!==selectedTaskIds.length)throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
+      const published=chosen ? (await Promise.all(chosen.map(task=>dispatcher.queue.verifyExisting(task)))).at(-1)
+        : await dispatcher.queue.publish(manifest.tasks);
       console.log(`[Redis预检] 通过；任务池=${campaign}，清单${manifest.taskCount}项，新增${published.added}项、已存在${published.existing}项`);
       await dispatcher.report();
       return dispatcher;
@@ -43,8 +46,8 @@ export class RedisDispatcher {
 
   async report() {
     this.lastStats = await this.queue.stats();
-    const { pending, leased, completed, failed, total } = this.lastStats.counts;
-    console.log(`[全局任务进度] ${completed}/${total}已完成；待领取${pending}，执行中${leased}，重试耗尽${failed}`);
+    const { pending, leased, completed, completed_with_skips=0, skipped_unresolved=0, failed, total } = this.lastStats.counts;
+    console.log(`[全局任务进度] ${completed}/${total}成功完成，含跳过完成${completed_with_skips}，整词跳过${skipped_unresolved}；待领取${pending}，执行中${leased}，故障保留${failed}`);
     await writeJsonAtomic(path.join(this.stateRoot, 'redis_queue_status.json'), {
       campaign: this.campaign, checkedAt: new Date().toISOString(), ...this.lastStats });
     return this.lastStats;
@@ -60,7 +63,7 @@ export class RedisDispatcher {
       if (this.current) throw new Error('上一个Redis任务尚未确认，禁止领取新任务');
       const started = Date.now();
       const targetId=taskIds?.[targetIndex]||null;
-      if(targetId){const target=await this.queue.inspect(targetId);if(target.status==='completed'){targetIndex++;continue;}if(target.status==='failed'||target.status==='missing')throw new Error(`SELECTED_TASK_UNAVAILABLE：${targetId}状态=${target.status}`);}
+      if(targetId){const target=await this.queue.inspect(targetId);if(['completed','completed_with_skips','skipped_unresolved'].includes(target.status)){targetIndex++;continue;}if(target.status==='failed'||target.status==='missing')throw new Error(`SELECTED_TASK_UNAVAILABLE：${targetId}状态=${target.status}`);}
       const lease = await this.queue.claim(this.owner,targetId);
       if (!lease) {
         const stats = await this.queue.stats();
@@ -76,7 +79,7 @@ export class RedisDispatcher {
       this.scheduleHeartbeat();
       console.log(`[任务领取] ${this.workerId}：${lease.task.topic} / ${lease.task.keyword}，尝试${lease.attempt}/${this.settings.maxAttempts}`);
       yield [index++, lease.task];
-      if(targetId){const target=await this.queue.inspect(targetId);if(target.status==='completed')targetIndex++;else return;} // A partial first task must not advance to topic two.
+      if(targetId){const target=await this.queue.inspect(targetId);if(['completed','completed_with_skips','skipped_unresolved'].includes(target.status))targetIndex++;else return;} // A partial first task must not advance to topic two.
     }
   }
 
@@ -160,8 +163,10 @@ export class RedisDispatcher {
     await this.verify();
     let confirmation;
     if (kind === 'complete') confirmation = await this.queue.complete(taskId, token, result);
+    else if (kind === 'review') confirmation = await this.queue.park(taskId, token, result);
     else if (kind === 'release') confirmation = await this.queue.release(taskId, token);
-    else confirmation = await this.queue.fail(taskId, token, result?.error || result?.status || 'Worker interrupted');
+    else if (kind === 'defer') confirmation = await this.queue.defer(taskId, token, result);
+    else confirmation = await this.queue.fail(taskId, token, result?.error || result?.status || 'Worker interrupted', result);
     this.current = null;
     try { await this.writeLease({ active: false, validUntil: 0 }); }
     catch (error) {

@@ -9,7 +9,7 @@ import {writeJsonAtomic} from './checkpoint.mjs';
 import {postsReady,buildAuthorTasks,validAuthorUrl,collectAuthor,AuthorCheckpoint,updateAuthorMetrics} from './author-tasks.mjs';
 import {itemPause,waitForPacing} from './collection-pacing.mjs';
 
-export async function runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher,cdpUrl,
+export async function runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher,cdpUrl,cooldown=null,
   createConnection=()=>mysql.createConnection(mysqlConnectionOptions()),openDispatcher=options=>RedisDispatcher.open(options),
   connectBrowser=url=>chromium.connectOverCDP(url,{timeout:15000}),fencedImport=withImportLease}){
   const report={phase:'authors',status:'running',completed:0,startedAt:new Date().toISOString(),tasks:[]};
@@ -19,6 +19,7 @@ export async function runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,
   let connection,dispatcher,browser,store;
   const stopped=()=>fs.access(stopFile).then(()=>true).catch(()=>false);
   try{
+    await cooldown?.assertReady();
     const stats=await postDispatcher.queue.stats();
     if(!postsReady(stats.counts,postDispatcher.manifest.taskCount)){
       report.status='waiting_for_posts';report.postCounts=stats.counts;
@@ -36,6 +37,8 @@ export async function runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,
     report.campaign=campaign;
     dispatcher=await openDispatcher({root,stateRoot:authorState,workerId,skipImport:false,stopFile,
       campaignOverride:campaign,manifestOverride:{taskCount:tasks.length,tasks,manifestHash:'authors-v1'}});
+    // Author pool uses a different cluster hash tag; check shared guard directly.
+    dispatcher.cooldown=cooldown;
     store=new AuthorCheckpoint(path.join(authorState,'authors.sqlite'));
     browser=await connectBrowser(cdpUrl);
     const page=browser.contexts()[0].pages().find(p=>p.url().includes('xiaohongshu.com'))||browser.contexts()[0].pages()[0];
@@ -45,12 +48,13 @@ export async function runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,
       if(await stopped()){report.status='partial_stopped';break;}
       if(!postsReady((await postDispatcher.queue.stats()).counts,postDispatcher.manifest.taskCount))throw new Error('STOP_POST_PHASE_REOPENED：帖子任务重新开放，停止作者阶段');
       try{
+        await cooldown?.assertReady();
         let snapshot=store.get(task.authorId);
         if(!snapshot){
           const [links]=await connection.execute('SELECT `作者主页链接` FROM `ods_social_media_post` WHERE `平台`=? AND `作者id`=? ORDER BY `文章获取时间` DESC LIMIT 100',['小红书',task.authorId]);
           const url=links.map(r=>validAuthorUrl(r['作者主页链接'],task.authorId)).find(Boolean);
           if(!url)throw new Error('AUTHOR_SOURCE_LINK_MISSING：数据表无有效作者主页链接');
-          snapshot=await collectAuthor(page,task,url,{verify:()=>dispatcher.verify(),shouldStop:stopped,timeout:config.navigationTimeoutMs||45000});
+          snapshot=await collectAuthor(page,task,url,{verify:async()=>{await cooldown?.assertReady();await dispatcher.verify();},shouldStop:stopped,timeout:config.navigationTimeoutMs||45000});
           store.save(snapshot);
         }
         // Persist first, then fenced idempotent SQL update, then Redis ack.
@@ -60,8 +64,9 @@ export async function runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,
         report.completed++;report.tasks.push({authorId:task.authorId,status:'completed',...updated});
         console.log(`[作者回填] ${task.authorId}：粉丝${snapshot.followerCount}，获赞与收藏${snapshot.likeCount}，关联${updated.matchedPosts}篇帖子`);
       }catch(error){
+        await cooldown?.record(error,`author:${postDispatcher.owner}:${task.authorId}`);
         if(!dispatcher.lost){
-          const release=/^STOP_(?:REQUESTED|SECURITY_CHALLENGE|LOGIN_REQUIRED|POST_PHASE_REOPENED)/.test(String(error.message));
+          const release=/^STOP_(?:REQUESTED|SECURITY_CHALLENGE|LOGIN_REQUIRED|POST_PHASE_REOPENED)|^(?:RATE_LIMIT_COOLDOWN_ACTIVE|COOLDOWN_MANUAL_REQUIRED)/.test(String(error.message));
           await dispatcher.finish(release?'release':'fail',{error:String(error.message)});
         }
         throw error; // First author-page restriction stops the node, not subsequent authors.

@@ -1,0 +1,27 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {retrySnapshot,unchangedRetry,contentDigest} from './retry-no-change.mjs';
+const fixture=()=>{const db=new DatabaseSync(':memory:');db.exec("CREATE TABLE candidate(keyword TEXT,note_id TEXT,url TEXT,result_json TEXT,attempts INTEGER,status TEXT DEFAULT 'completed');CREATE TABLE asr_job(keyword TEXT,note_id TEXT,article_id TEXT,transcript TEXT,attempts INTEGER,status TEXT DEFAULT 'retry_pending')");
+ const result={post:{文章id:'n1',内容类型:'视频',文章标题:'title',文章内容:'body',文章视频内容:null,文章获取时间:'old'},comments:[{评论id:'c1',评论内容:'retained',评论获取时间:'old'}]};
+ db.prepare('INSERT INTO candidate(keyword,note_id,url,result_json,attempts) VALUES(?,?,?,?,?)').run('kw','n1','url',JSON.stringify(result),1);
+ db.prepare('INSERT INTO asr_job(keyword,note_id,article_id,transcript,attempts) VALUES(?,?,?,?,?)').run('kw','n1','n1',null,1);return {db,result};};
+const proof={freshSearch:true,importOk:true,status:'asr_review_required',error:'ASR_QUALITY_REVIEW_REQUIRED'};
+test('same empty subtitle after actual retry ends; attempts retained',()=>{const {db}=fixture();try{
+ const before=retrySnapshot(db,'kw');db.exec('UPDATE asr_job SET attempts=2');const after=retrySnapshot(db,'kw');
+ const evidence=unchangedRetry(before,after,proof);assert.equal(evidence.disposition,'no_change');assert.equal(evidence.accepted,false);assert.equal(evidence.emptySubtitles,1);
+ assert.equal(db.prepare('SELECT attempts FROM asr_job').get().attempts,2);
+}finally{db.close();}});
+test('cached export does not end',()=>{const {db}=fixture();try{const before=retrySnapshot(db,'kw');assert.equal(unchangedRetry(before,before,proof),null);}finally{db.close();}});
+test('new subtitle is improvement, not no-change',()=>{const {db,result}=fixture();try{const before=retrySnapshot(db,'kw');result.post.文章视频内容='new transcript';db.prepare('UPDATE candidate SET result_json=?').run(JSON.stringify(result));db.exec('UPDATE asr_job SET attempts=2');assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),proof),null);}finally{db.close();}});
+test('new comment not no-change',()=>{const {db,result}=fixture();try{const before=retrySnapshot(db,'kw');result.comments.push({评论id:'c2',评论内容:'new'});db.prepare('UPDATE candidate SET result_json=?,attempts=2').run(JSON.stringify(result));assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),proof),null);}finally{db.close();}});
+test('new candidate not no-change',()=>{const {db}=fixture();try{const before=retrySnapshot(db,'kw');db.exec("INSERT INTO candidate(keyword,note_id,url,result_json,attempts) VALUES('kw','new','url',null,1);UPDATE asr_job SET attempts=2");assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),proof),null);}finally{db.close();}});
+test('capture time / attempt counters do not change content',()=>{assert.equal(contentDigest({文章获取时间:'old',评论获取时间:'old',text:'same'}),contentDigest({文章获取时间:'new',评论获取时间:'new',text:'same'}));});
+for(const failure of ['LOGIN_REQUIRED','MYSQL_IMPORT_FAILED','RESOURCE_MEMORY','STOP_REQUESTED','SORT_NOT_CONFIRMED','LEASE_LOST']){
+ test(failure+' cannot masquerade as stable empty result',()=>{const {db}=fixture();try{const before=retrySnapshot(db,'kw');db.exec('UPDATE asr_job SET attempts=2');assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),{...proof,error:'ASR_QUALITY_REVIEW_REQUIRED | '+failure}),null);}finally{db.close();}});
+}
+test('stop, missing import, pending audio and unhealthy runtime fail closed',()=>{const {db}=fixture();try{const before=retrySnapshot(db,'kw');db.exec('UPDATE asr_job SET attempts=2');const after=retrySnapshot(db,'kw');for(const override of [{stopped:true},{importOk:false},{runtimeUnavailable:true},{pendingAsr:1},{freshSearch:false}])assert.equal(unchangedRetry(before,after,{...proof,...override}),null);}finally{db.close();}});
+test('verified finite search for old target can close stable missing content',()=>{const {db}=fixture();try{db.exec("UPDATE asr_job SET status='dead_letter';UPDATE candidate SET status='failed'");const before=retrySnapshot(db,'kw');assert.ok(unchangedRetry(before,before,{...proof,status:'incomplete',error:'KNOWN_CANDIDATES_INCOMPLETE',boundedRecoverySearch:true}));}finally{db.close();}});
+test('first empty attempt cannot close',()=>{const {db}=fixture();try{db.exec('UPDATE candidate SET result_json=null,attempts=0;UPDATE asr_job SET attempts=0');const before=retrySnapshot(db,'kw');db.exec('UPDATE candidate SET attempts=1');assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),{...proof,boundedRecoverySearch:true}),null);}finally{db.close();}});
+test('untouched pending detail prevents whole-keyword closure',()=>{const {db}=fixture();try{db.exec("INSERT INTO candidate VALUES('kw','missing','url',null,1,'failed')");const before=retrySnapshot(db,'kw');db.exec('UPDATE asr_job SET attempts=2');assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),proof),null);}finally{db.close();}});
+test('comment completeness improvement is not unchanged',()=>{const {db,result}=fixture();try{result.audit={commentsComplete:false};db.prepare('UPDATE candidate SET result_json=?').run(JSON.stringify(result));const before=retrySnapshot(db,'kw');result.audit.commentsComplete=true;db.prepare('UPDATE candidate SET result_json=?,attempts=2').run(JSON.stringify(result));db.exec('UPDATE asr_job SET attempts=2');assert.equal(unchangedRetry(before,retrySnapshot(db,'kw'),proof),null);}finally{db.close();}});

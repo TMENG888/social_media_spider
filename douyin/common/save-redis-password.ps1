@@ -2,7 +2,8 @@
 param(
   [Parameter(Mandatory=$true)][string]$WorkerRoot,
   [switch]$Clear,
-  [switch]$CheckPath
+  [switch]$CheckPath,
+  [string]$ImportSavedCredential
 )
 $ErrorActionPreference='Stop'
 $Worker=(Resolve-Path -LiteralPath $WorkerRoot).Path
@@ -18,7 +19,18 @@ if($Clear){
   exit 0
 }
 if(-not(Test-Path -LiteralPath $State)){New-Item -ItemType Directory -Path $State -Force|Out-Null}
-$Secure=Read-Host 'Redis password (hidden)' -AsSecureString
+if($ImportSavedCredential){
+  # DPAPI import works only for the same Windows user on this machine.
+  # Verification below must succeed before replacing the worker credential.
+  try {
+    $Source=(Resolve-Path -LiteralPath $ImportSavedCredential -ErrorAction Stop).Path
+    $Secure=ConvertTo-SecureString -String ([IO.File]::ReadAllText($Source).Trim()) -ErrorAction Stop
+  } catch {
+    throw 'Saved credential could not be imported. Use a DPAPI credential owned by this Windows user on this machine.'
+  }
+} else {
+  $Secure=Read-Host 'Redis password (hidden)' -AsSecureString
+}
 $Pointer=[IntPtr]::Zero
 $Common=Split-Path -Parent $MyInvocation.MyCommand.Path
 $Node=Join-Path $Common 'runtime\node\node.exe'

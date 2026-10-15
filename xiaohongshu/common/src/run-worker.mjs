@@ -5,7 +5,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import mysql from "mysql2/promise";
 import { writeJsonAtomic } from "./checkpoint.mjs";
-import { POLICY_VERSION, projectForTopic } from "./collection-policy.mjs";
+import { POLICY_VERSION, ACCEPTANCE_VERSION, projectForTopic } from "./collection-policy.mjs";
 import { RedisDispatcher } from "./redis-dispatcher.mjs";
 import { loadTaskManifest } from "./redis-task-manifest.mjs";
 import { repairCategoryNull } from "./category-repair.mjs";
@@ -16,6 +16,9 @@ import { runAuthorPhase } from "./run-author-phase.mjs";
 import { verifyTable } from "./import-mysql.mjs";
 import { POST_FIELDS, COMMENT_FIELDS } from "./schema.mjs";
 import { IMPORT_PENDING_EXIT_CODE, importTaskState } from "./import-recovery.mjs";
+import { RateLimitCooldown, restrictionKind, cooldownWorkerExit } from "./rate-limit-cooldown.mjs";
+import { cleanupWorkerAsrMedia } from "./cleanup-worker-asr-media.mjs";
+import {unchangedRetry} from './retry-no-change.mjs';
 
 const root = path.resolve(process.env.XHS_WORKER_ROOT || ".");
 const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, index, all) => {
@@ -27,7 +30,14 @@ const phase = String(args.phase || 'auto');
 if(!['auto','posts','authors'].includes(phase))throw new Error('phase只允许auto/posts/authors');
 const dispatchMode = String(args.dispatch || process.env.XHS_DISPATCH || "local");
 if (!["local", "redis"].includes(dispatchMode)) throw new Error("dispatch只允许local或redis");
+const onlyTaskId=args['only-task-id']?String(args['only-task-id']):null;
+if(onlyTaskId){
+  if(dispatchMode!=='redis')throw new Error('SELECTED_TASK_REQUIRES_REDIS');
+  const selectedManifest=await loadTaskManifest(path.join(root,'tasks','redis-tasks.json'));
+  if(!selectedManifest.tasks.some(t=>(t.redisTaskId||t.id)===onlyTaskId))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
+}
 const skipImport = args["skip-import"] === true || args["skip-import"] === "true" || process.env.XHS_SKIP_IMPORT === "true";
+if(onlyTaskId&&(skipImport||phase!=='posts'))throw new Error('SELECTED_TASK_REQUIRES_PRODUCTION_POSTS_PHASE');
 if(phase==='authors' && (dispatchMode!=='redis'||skipImport))throw new Error('作者阶段只支持Redis生产模式，回填数据表需要MySQL；不会回退到本地分片');
 const queueFile = path.resolve(String(args.queue || path.join(root, "tasks", "task-queue.json")));
 const maxRuntimeMinutes = Number(args["max-runtime-minutes"] || 0);
@@ -87,7 +97,7 @@ async function environmentCheck() {
   const configuredModel = process.env.XHS_ASR_MODEL_PATH || config.asrModelPath || path.join(root, "runtime", "asr-models", "faster-whisper-small");
   const asrModelPath = path.isAbsolute(configuredModel) ? configuredModel : path.resolve(root, configuredModel);
   const asrRequirements = path.join(root, "requirements-asr.txt");
-  const asrThreads = String(Math.max(1, Number(config.asrCpuThreads || 1)));
+  const asrThreads = String(Math.max(1, Number(process.env.XHS_ASR_CPU_THREADS || config.asrCpuThreads || 1)));
   const asrEnv = { ...process.env, PYTHONUTF8: "1", PYTHONPATH: withPythonPath(asrPythonSite),
     OMP_NUM_THREADS: asrThreads, MKL_NUM_THREADS: asrThreads,
     OPENBLAS_NUM_THREADS: asrThreads, NUMEXPR_NUM_THREADS: asrThreads };
@@ -198,6 +208,7 @@ async function acquireLock() {
 await acquireLock();
 
 const stopFile = path.join(stateRoot, "stop.requested");
+const {RemoteStopControl}=await import('./remote-stop-control.mjs');
 const supervisorStopFile = process.env.XHS_SUPERVISOR_STOP_FILE ? path.resolve(process.env.XHS_SUPERVISOR_STOP_FILE) : null;
 // 人工停止可能恰好发生在周期监督器启动下一轮的瞬间；此时不能删除其已写入的stop.requested。
 if (!supervisorStopFile || !await exists(supervisorStopFile)) await fs.unlink(stopFile).catch(() => {});
@@ -225,7 +236,7 @@ async function promptCredentials() {
 }
 
 async function verifyDatabaseConnection() {
-  const host = String(process.env.MYSQL_HOST || "mysql.example.com");
+  const host = String(process.env.MYSQL_HOST || "127.0.0.1");
   const port = Number(process.env.MYSQL_PORT || 3306);
   const database = String(process.env.MYSQL_DATABASE || "social");
   const statusPath = path.join(stateRoot, "mysql_connection_check.json");
@@ -269,30 +280,57 @@ let browserProcess = null;
 let dispatcher = null;
 let runtimeTimer = null;
 let fatalError = null;
+let remoteControl=null;
+let cooldown=null, stopCooldownMonitor=null, cooldownMonitorError=null;
 const statusFile = path.join(runsRoot, "worker_status.json");
 let status = { workerId, mode, dispatchMode, startedAt: now(), finishedAt: null, tasks: [] };
 try {
+  if(dispatchMode==='redis' && !skipImport){
+    remoteControl=await RemoteStopControl.open(root,path.dirname(stateRoot));
+    await remoteControl.gate();remoteControl.watch();
+  }
+  try {
+    const cleanupConfig = JSON.parse((await fs.readFile(path.join(root, "config.json"), "utf8")).replace(/^\uFEFF/, ""));
+    await cleanupWorkerAsrMedia({ stateRoot, mediaName: "asr-media", keepMedia: cleanupConfig.asrKeepMedia === true, dryRun: false });
+  } catch (error) { console.warn(`[ASR媒体清理] 跳过本轮清理，不影响采集：${error.message}`); }
+  if(dispatchMode==='redis' && !skipImport){
+    cooldown=await RateLimitCooldown.open({root,stateRoot,workerId});
+    // Direct Node invocations also honor persisted cooldown before browser/SQL.
+    await cooldown.assertReady();
+    stopCooldownMonitor=cooldown.monitor(stopFile,{onStop:error=>{
+      cooldownMonitorError=error;
+      console.warn('[共享冷却] 同组节点已暂停或状态不可确认；当前数据收尾后停止');
+    }});
+  }
   if (dispatchMode === "redis") {
-    dispatcher = await RedisDispatcher.open({ root, stateRoot, workerId, skipImport, stopFile });
+    dispatcher = await RedisDispatcher.open({ root, stateRoot, workerId, skipImport, stopFile, selectedTaskId:onlyTaskId });
     status.campaign = dispatcher.campaign;
+    if(cooldown){
+      dispatcher.cooldown=cooldown;
+      dispatcher.queue.cooldownKey=cooldown.key;
+    }
   }
   if (!skipImport) {
     await promptCredentials();
     await verifyDatabaseConnection();
+    if(!onlyTaskId){
     const categoryRepair = await repairCategoryNull({ runsRoot, stateRoot });
     console.log(`[分类修复] 本地${categoryRepair.localRowsNormalized}条，数据库文章${categoryRepair.postsUpdated}条、评论${categoryRepair.commentsUpdated}条已统一为NULL${categoryRepair.localFileErrors.length ? `；${categoryRepair.localFileErrors.length}个占用中的本地文件稍后重试` : ""}`);
     const linkRepair = await repairInvalidArticleLinks({ stateRoot });
     console.log(`[链接修复] 数据库文章${linkRepair.postsUpdated}条、评论${linkRepair.commentsUpdated}条已恢复为对应文章详情链接`);
+    }
   }
   const workerNumber = Number(String(workerId).match(/(\d+)$/)?.[1] || 1);
   const cdpPort = Number(process.env.XHS_CDP_PORT || (9221 + workerNumber));
   const browserExecutable = process.env.XHS_BROWSER_EXECUTABLE || path.join(root, "runtime", "browsers", "chrome-win64", "chrome.exe");
+  await cooldown?.assertReady();
+  if(await exists(stopFile))throw new Error('STOP_REQUESTED：启动期间收到安全停止请求');
   if (!process.env.XHS_CDP_URL) {
     browserProcess = spawn(browserExecutable, [`--remote-debugging-port=${cdpPort}`, "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${path.join(stateRoot, "browser-profile")}`], { stdio: "ignore", windowsHide: false });
     await sleep(2500);
   }
   const asrThreads = String(Math.max(1, Number((await fs.readFile(path.join(root, "config.json"), "utf8").then(JSON.parse).catch(() => ({}))).asrCpuThreads || 1)));
-  const childEnv = { XHS_DISPATCH: dispatchMode, XHS_ASR_PYTHON: checks.asrPython, XHS_ASR_MODEL_PATH: checks.asrModelPath, PYTHONUTF8: "1", PYTHONPATH: withPythonPath(checks.asrPythonSite), XHS_SKIP_IMPORT: String(skipImport), PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || path.join(root, "runtime", "browsers"), XHS_CDP_URL: process.env.XHS_CDP_URL || `http://127.0.0.1:${cdpPort}`, XHS_BROWSER_EXECUTABLE: browserExecutable,
+  const childEnv = { XHS_COOLDOWN_CAMPAIGN:cooldown?.campaign || '', XHS_COOLDOWN_WORKER_ID:workerId, XHS_DISPATCH: dispatchMode, XHS_ASR_PYTHON: checks.asrPython, XHS_ASR_MODEL_PATH: checks.asrModelPath, PYTHONUTF8: "1", PYTHONPATH: withPythonPath(checks.asrPythonSite), XHS_SKIP_IMPORT: String(skipImport), PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || path.join(root, "runtime", "browsers"), XHS_CDP_URL: process.env.XHS_CDP_URL || `http://127.0.0.1:${cdpPort}`, XHS_BROWSER_EXECUTABLE: browserExecutable,
     OMP_NUM_THREADS: asrThreads, MKL_NUM_THREADS: asrThreads,
     OPENBLAS_NUM_THREADS: asrThreads, NUMEXPR_NUM_THREADS: asrThreads };
   try {
@@ -312,7 +350,7 @@ try {
     }, Math.max(1, deadline - Date.now()));
   }
 
-  for await (const [taskIndex, task] of (phase==='authors' ? [] : dispatcher ? dispatcher.tasks() : tasks.entries())) {
+  for await (const [taskIndex, task] of (phase==='authors' ? [] : dispatcher ? dispatcher.tasks({taskId:onlyTaskId}) : tasks.entries())) {
     if (await exists(stopFile)) break;
     console.log(`[工作节点进度] ${workerId}：本机第${taskIndex + 1}词${dispatcher ? `（全局任务池${dispatcher.manifest.taskCount}词）` : `/${tasks.length}`}，开始关键词“${task.keyword}”，专题=${task.topic || ""}，评论=${task.collectComments !== false ? "采集" : "不采集"}`);
     const taskSubdir = dispatcher ? path.join("redis", dispatcher.campaign, task.topic || "default", `${slug(task.keyword)}-${task.redisTaskId.slice(-12)}`) : path.join(task.topic || "default", slug(task.keyword));
@@ -327,7 +365,7 @@ try {
     try { previous = JSON.parse(await fs.readFile(taskStatusPath, "utf8")); } catch {}
     let importedAlready = false;
     try { importedAlready = JSON.parse(await fs.readFile(path.join(taskDir, "mysql_import_status.json"), "utf8")).status === "success"; } catch {}
-    if (!dispatcher && mode === "run" && previous?.policyVersion === POLICY_VERSION && previous?.status === "completed" && (skipImport || importedAlready)) {
+    if (!dispatcher && mode === "run" && previous?.policyVersion === POLICY_VERSION && previous?.scopeAcceptance?.acceptanceVersion===ACCEPTANCE_VERSION && previous?.searchAcceptance?.ok===true && previous?.status === "completed" && (skipImport || importedAlready)) {
       console.log(`[工作节点进度] ${workerId}：${taskIndex + 1}/${tasks.length}，已完成，跳过“${task.keyword}”`);
       status.tasks.push({ ...previous, skipped: true });
       continue;
@@ -340,7 +378,7 @@ try {
 
     if (previous && await exists(checkpointDb)) {
       console.log(`[中断恢复] ${task.keyword}：先从断点库恢复已完成数据`);
-      const recovery = await runChild([path.join(root, "src", "checkpoint-tool.mjs"), "--db", checkpointDb, "--output-dir", taskDir, "--project-name", task.projectName, "--cutoff", cutoff, "--collect-comments", String(task.collectComments)]);
+      const recovery = await runChild([path.join(root, "src", "checkpoint-tool.mjs"), "--db", checkpointDb, "--output-dir", taskDir, "--keyword", task.keyword, "--project-name", task.projectName, "--cutoff", cutoff, "--collect-comments", String(task.collectComments)]);
       if (recovery.code !== 0) throw new Error(`${task.keyword}断点导出失败，退出码${recovery.code}`);
       if (!skipImport && await exists(path.join(taskDir, "ods_social_media_post.jsonl"))) {
         await dispatcher?.verify();
@@ -353,8 +391,10 @@ try {
             posts: previous.posts ?? null, commentThreads: previous.commentThreads ?? null,
             error: '入库仍繁忙；本轮仅恢复本地数据，未访问平台，等待下轮补库' };
           if (dispatcher) {
-            const confirmation = await dispatcher.finish('release', pendingRecord);
-            pendingRecord.redisReleased = true;
+            const disposition=await exists(stopFile)?'release':'defer';
+            const confirmation = await dispatcher.finish(disposition, pendingRecord);
+            pendingRecord.redisReleased = disposition==='release';
+            pendingRecord.redisFailedHandled = disposition==='defer';
             pendingRecord.redisDisposition = String(confirmation?.status || 'pending');
           }
           await writeJsonAtomic(taskStatusPath, pendingRecord);
@@ -374,6 +414,7 @@ try {
       await writeJsonAtomic(taskConfig, task.collectorConfig);
       configArgs.push("--config", taskConfig);
     }
+    await cooldown?.assertReady();
     const result = await runChild([
       path.join(root, "src", "index.mjs"), "--query", task.keyword,
       ...configArgs,
@@ -397,6 +438,15 @@ try {
       if (reported.runId === runId) collector = reported;
     } catch {}
     if (result.code !== 0 && collector.status === "completed") collector.status = "partial_error";
+    // Same event ID as collector: fallback publication cannot count a second incident.
+    if(cooldown && restrictionKind(collector.error)){
+      try{await cooldown.record(collector.error,'post:'+runId);}
+      catch(error){
+        // Keep preserving/importing the collected data, but fail closed on restart.
+        fatalError ||= error;
+        await fs.writeFile(stopFile,'COOLDOWN_STATE_UNAVAILABLE','utf8');
+      }
+    }
     let importResult = null;
     if (!skipImport && !dispatcher?.lost && await exists(path.join(taskDir, "ods_social_media_post.jsonl"))) {
       await dispatcher?.verify();
@@ -407,17 +457,31 @@ try {
     let taskState = collector.status || (result.code === 0 ? "completed" : "partial_error");
     if (!skipImport) taskState = importTaskState(taskState, importResult?.code, collectionFailurePolicy(collector.error));
     if (dispatcher?.lost) taskState = "lease_lost";
-    const completed = taskState === "completed" && (skipImport || importResult?.code === 0);
+    const stopping = stopSignalCount > 0 || await exists(stopFile);
+    const observation=collector.retryObservation;
+    const noChange=observation && unchangedRetry(observation.before,observation.after,{...observation,
+      status:taskState,error:collector.error||'',stopped:stopping,importOk:!skipImport&&importResult?.code===0,
+      runtimeUnavailable:collector.asrJobs?.runtimeUnavailable||observation.asrDrainConfirmed===false,
+      pendingAsr:collector.asrJobs?.pendingTotal||0});
+    const acceptanceVerified=collector.searchAcceptance?.ok===true&&collector.scopeAcceptance?.ok===true&&collector.scopeAcceptance.acceptanceVersion===ACCEPTANCE_VERSION;
+    if(noChange&&acceptanceVerified)taskState='completed_with_skips';
+    if(["completed","completed_with_skips"].includes(taskState)&&!acceptanceVerified){
+      taskState='incomplete';collector.error=!collector.scopeAcceptance?.ok?'SCOPE_UNVERIFIED':'SEARCH_END_UNVERIFIED';
+    }
+    const completed = ["completed","completed_with_skips"].includes(taskState) && (skipImport || importResult?.code === 0);
     const record = { workerId, runId, policyVersion: POLICY_VERSION, searchSummaries: collector.searchSummaries || [], taskId: task.id || null, topic: task.topic || null, keyword: task.keyword, projectName: task.projectName || null, collectComments: task.collectComments !== false, startedAt, finishedAt: now(), status: completed ? "completed" : taskState, exitCode: result.code, importExitCode: importResult?.code ?? null, outputDir: taskDir, stateDir, checkpointDb, posts: collector.posts ?? null, commentThreads: collector.commentThreads ?? null, error: collector.error || null };
-    Object.assign(record,{deadLetterNotes:collector.deadLetterNotes||0,collectionCompleteness:collector.collectionCompleteness||null});
+    Object.assign(record,{deadLetterNotes:collector.deadLetterNotes||0,collectionCompleteness:collector.collectionCompleteness||null,asrJobs:collector.asrJobs||null,
+      searchAcceptance:collector.searchAcceptance||null,scopeAcceptance:collector.scopeAcceptance||null});
+    if(completed && taskState==='completed_with_skips')record.status=taskState;
+    if(noChange&&acceptanceVerified)Object.assign(record,{disposition:'no_change',accepted:false,noChangeEvidence:noChange,originalError:record.error,completionReason:'真实重采结果与原断点相同；结束异常任务，不代表内容完整'});
     if (dispatcher) {
-      const stopping = stopSignalCount > 0 || await exists(stopFile);
-      const finishKind = completed ? "complete" : stopping || ["login_required", "risk_controlled", "web_unavailable", "asr_deferred", "import_pending"].includes(taskState) ? "release" : "fail";
+      const finishKind = completed ? "complete" : stopping ? "release" : taskState==="asr_review_required" ? "review" : ["login_required", "risk_controlled", "web_unavailable", "asr_deferred", "import_pending"].includes(taskState) ? "defer" : "fail";
       try {
         const confirmation = await dispatcher.finish(finishKind, record);
         record.redisConfirmed = finishKind === "complete";
         record.redisReleased = finishKind === "release";
-        record.redisFailedHandled = finishKind === "fail";
+        record.redisFailedHandled = ["fail","review","defer"].includes(finishKind);
+        record.requiresHumanReview = finishKind === "review";
         record.redisDisposition = String(confirmation?.status || finishKind);
       } catch (error) {
         record.status = dispatcher.lost || error.code === "LEASE_LOST" ? "lease_lost" : "confirmation_failed";
@@ -442,22 +506,34 @@ try {
       if (failure.stopNode && !failure.release) {
         throw Object.assign(new Error(`NODE_STOP_AFTER_COLLECTION_FAILURE：${record.error || record.status}；已停止领取后续任务`), {code:'COLLECTION_CONTEXT_FAILURE'});
       }
-      if (!dispatcher || ["login_required", "risk_controlled", "web_unavailable", "import_failed", "import_pending", "asr_deferred"].includes(taskState)) break;
+      if (!dispatcher || ["login_required", "risk_controlled", "web_unavailable", "import_failed", "import_pending", "asr_deferred","asr_review_required"].includes(taskState)) break;
     }
     if (task.transitionDelaySeconds) await sleep(Number(task.transitionDelaySeconds) * 1000);
   }
-  if(dispatcher && !skipImport && phase!=='posts' && !await exists(stopFile) && !status.tasks.some(task => ['import_pending', 'import_failed'].includes(task.status))){
-    status.authorPhase=await runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher:dispatcher,cdpUrl:childEnv.XHS_CDP_URL});
+  if(dispatcher && !skipImport && phase!=='posts' && !await exists(stopFile) && !status.tasks.some(task => ['import_pending','import_failed','risk_controlled','login_required','web_unavailable','lease_lost','confirmation_failed'].includes(task.status))){
+    await cooldown?.assertReady();
+    status.authorPhase=await runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher:dispatcher,cdpUrl:childEnv.XHS_CDP_URL,cooldown});
     console.log(`[采集阶段] 作者阶段=${status.authorPhase.status}，本机回填${status.authorPhase.completed}位作者`);
   }
 } catch (error) {
   fatalError = error;
+  if(['RATE_LIMIT_COOLDOWN_ACTIVE','COOLDOWN_MANUAL_REQUIRED'].includes(error.code))
+    await fs.writeFile(stopFile,error.code,'utf8').catch(()=>{});
   console.warn(`[工作节点停止] ${error.code || "ERROR"}：${String(error.message || error).split("\n")[0]}`);
 } finally {
+  await stopCooldownMonitor?.();
+  if(cooldown){
+    try{status.cooldown=await cooldown.read();}
+    catch(error){fatalError ||= error;}
+  }
+  if(cooldownMonitorError?.code==='COOLDOWN_STATE_UNAVAILABLE')fatalError ||= cooldownMonitorError;
   clearTimeout(runtimeTimer);
   await dispatcher?.close({ stopped: stopSignalCount > 0 || await exists(stopFile) }).catch(error => {
+    // A failed release/confirmation must take precedence over a benign cooldown.
+    fatalError = error;
     console.warn(`[Redis收尾] ${error.code || "CONNECTION_ERROR"}；未确认的任务由租约到期回收`);
   });
+  await remoteControl?.close(fatalError?'exit_unconfirmed':'collector_stopped').catch(()=>{fatalError ||= new Error('REMOTE_CONTROL_FINAL_ACK_UNAVAILABLE');});
   status.finishedAt = now();
   Object.assign(status, summarizeWorkerTasks(status.tasks));
   if (dispatcher?.lastStats) status.globalQueue = dispatcher.lastStats.counts;
@@ -466,10 +542,10 @@ try {
   await fs.unlink(stopFile).catch(() => {});
   await lockHandle?.close().catch(() => {});
   await fs.unlink(lockFile).catch(() => {});
+  await cooldown?.close().catch(()=>{});
 }
 console.log(JSON.stringify({ workerId, mode, completed: status.completedCount, failed: status.failedCount, fatalError: fatalError ? String(fatalError.message || fatalError) : null, statusFile }, null, 2));
 // Exit 5 is a deliberate lease-safety stop, not a collector/ASR crash.  The
 // cycle supervisor must not reopen the browser until Redis has been restored.
-const exitCode = fatalError?.code === "LEASE_LOST" ? 5
-  : fatalError || status.failedCount || status.globalQueue?.failed ? 1 : 0;
+const exitCode = cooldownWorkerExit({fatalError,lost:dispatcher?.lost,status});
 process.exit(exitCode);

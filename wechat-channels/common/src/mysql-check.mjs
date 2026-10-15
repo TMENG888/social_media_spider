@@ -7,7 +7,7 @@ const args = {};
 for (let i = 2; i < process.argv.length; i += 1) {
   if (process.argv[i].startsWith('--')) args[process.argv[i].slice(2)] = process.argv[++i];
 }
-const host = process.env.MYSQL_HOST || 'mysql.example.com';
+const host = process.env.MYSQL_HOST || '127.0.0.1';
 const port = Number(process.env.MYSQL_PORT || 3306);
 const database = process.env.MYSQL_DATABASE || 'social';
 const user = process.env.MYSQL_USER;

@@ -11,7 +11,9 @@ New-Item -ItemType Directory -Path $State -Force | Out-Null
 $Stop=Join-Path $State 'stop.requested'
 $SupervisorStop=Join-Path $State 'supervisor.stop'
 $SavedEnv=@{}
-foreach($Name in @('MYSQL_USER','MYSQL_PASSWORD','REDIS_PASSWORD','REDIS_URL','REDIS_USERNAME','DY_WORKER_ROOT','DY_DISPATCH','DY_LEASE_FILE','DY_LEASE_TASK_ID','DY_LEASE_TOKEN','DY_LEASE_CAMPAIGN')){$SavedEnv[$Name]=[Environment]::GetEnvironmentVariable($Name,'Process')}
+foreach($Name in @('MYSQL_USER','MYSQL_PASSWORD','REDIS_PASSWORD','REDIS_URL','REDIS_USERNAME','DY_WORKER_ROOT','DY_DISPATCH','DY_LEASE_FILE','DY_LEASE_TASK_ID','DY_LEASE_TOKEN','DY_LEASE_CAMPAIGN','MONITOR_WORKER_ROOT')){$SavedEnv[$Name]=[Environment]::GetEnvironmentVariable($Name,'Process')}
+. (Join-Path $Common 'monitor-supervisor.ps1')
+$RemoteFinalState='exit_unconfirmed'
 function HiddenValue([string]$Label){
   $Secure=Read-Host $Label -AsSecureString
   $Pointer=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
@@ -38,15 +40,22 @@ try {
   if(-not $env:MYSQL_USER){$env:MYSQL_USER='social_user'}
   if(-not $env:MYSQL_PASSWORD){$env:MYSQL_PASSWORD=HiddenValue 'MySQL password (hidden)'}
   if(-not $env:MYSQL_PASSWORD){throw 'MySQL password cannot be empty.'}
+  if(-not $Test){
+    & $Node (Join-Path $Common 'src\remote-stop-control.mjs') --action gate --root $Common --worker-root $Worker
+    if($LASTEXITCODE -ne 0){throw 'Remote stop hold or control unavailable. Collection not started.'}
+  }
   Remove-Item -LiteralPath $Stop,$SupervisorStop -Force -ErrorAction SilentlyContinue
+  if(-not $Test){Start-MonitorSupervisor}
   $Cycle=0
   while($true){
+    Assert-RemoteControlAvailable
     if(Test-Path -LiteralPath $SupervisorStop){break}
     $Cycle++
     $Minutes=Get-Random -Minimum 45 -Maximum 61
     Write-Host "[Cycle supervisor] Cycle $Cycle starts; runtime=$Minutes minutes."
     $WorkerArgs=@((Join-Path $Common 'src\run-worker.mjs'),'--worker-root',$Worker,'--phase',$Phase,'--max-runtime-minutes',[string]$Minutes)
     if($Test){$WorkerArgs+=@('--test','--limit',[string]$Limit,'--max-runtime-minutes','90')}
+    Set-MonitorSupervisorState 'collecting'
     & $Node @WorkerArgs
     if($LASTEXITCODE -ne 0){throw 'Worker exited abnormally. Automatic restart is disabled.'}
     if($SingleCycle -or $Test -or (Test-Path -LiteralPath $SupervisorStop)){break}
@@ -54,9 +63,11 @@ try {
     if($Status.status -eq 'completed' -and $Status.authors.status -eq 'completed'){Write-Host 'All post and author tasks completed.';break}
     $Rest=Get-Random -Minimum 30 -Maximum 61
     $Resume=(Get-Date).AddMinutes($Rest)
+    Set-MonitorSupervisorState 'resting' $Resume.ToUniversalTime().ToString('o')
     Write-Host "[Cycle supervisor] Resting $Rest minutes. Resume at $Resume."
-    while((Get-Date) -lt $Resume){if(Test-Path -LiteralPath $SupervisorStop){break};Start-Sleep -Milliseconds 500}
+    while((Get-Date) -lt $Resume){Assert-RemoteControlAvailable;if(Test-Path -LiteralPath $SupervisorStop){break};Start-Sleep -Milliseconds 500}
     if(Test-Path -LiteralPath $SupervisorStop){break}
     Remove-Item -LiteralPath $Stop -Force -ErrorAction SilentlyContinue
   }
-} finally {foreach($Name in $SavedEnv.Keys){[Environment]::SetEnvironmentVariable($Name,$SavedEnv[$Name],'Process')}}
+  $RemoteFinalState='stopped'
+} finally {Close-MonitorSupervisor $RemoteFinalState;foreach($Name in $SavedEnv.Keys){[Environment]::SetEnvironmentVariable($Name,$SavedEnv[$Name],'Process')}}

@@ -126,5 +126,66 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(expanded[0])
         edit.click_input.assert_called_once()
 
+    def url_adapter(self):
+        edit = Mock()
+        edit.rectangle.return_value = SimpleNamespace(left=10, top=10, right=400, bottom=40)
+        web = Mock()
+        web.rectangle.return_value = SimpleNamespace(left=0, top=0, right=800, bottom=600)
+        web.descendants.return_value = [edit]
+        adapter = SimpleNamespace(
+            is_valid_channels_share_url=lambda _: True,
+            SearchWindowUnavailableError=c.SearchWindowUnavailableError,
+            get_search_window=Mock(return_value=web), search_in_web=Mock(),
+            wait_for=lambda predicate, **kwargs: predicate(),
+            has_video_detail_window=lambda: True,
+            get_video_detail_window=Mock(return_value=object()),
+            pause_active_video_if_running=Mock(), set_clipboard=Mock(),
+            keyboard=SimpleNamespace(send_keys=Mock()))
+        return adapter, web, edit
+
+    def test_missing_search_bootstraps_then_reacquires_before_url_input(self):
+        adapter, web, edit = self.url_adapter()
+        adapter.get_search_window.side_effect = [c.SearchWindowUnavailableError('missing'), web]
+        config = {'search_window_recovery_attempts': 5, 'wait_page': 3}
+        open_saved_video(adapter, 'https://weixin.qq.com/sph/Test', config,
+                         locator_query='stored exact title')
+        adapter.search_in_web.assert_called_once_with('stored exact title',
+            {'search_window_recovery_attempts': 2, 'wait_page': 3})
+        self.assertEqual(adapter.get_search_window.call_count, 2)
+        self.assertEqual(config['search_window_recovery_attempts'], 5)
+        edit.click_input.assert_called_once()
+        adapter.set_clipboard.assert_called_once_with('https://weixin.qq.com/sph/Test')
+
+    def test_existing_search_does_not_submit_bootstrap_query(self):
+        adapter, _, _ = self.url_adapter()
+        open_saved_video(adapter, 'https://weixin.qq.com/sph/Test', {}, locator_query='title')
+        adapter.search_in_web.assert_not_called()
+
+    def test_bootstrap_failure_never_pastes_or_clicks_url(self):
+        adapter, _, edit = self.url_adapter()
+        adapter.get_search_window.side_effect = c.SearchWindowUnavailableError('missing')
+        adapter.search_in_web.side_effect = c.SearchWindowUnavailableError('login/stop blocked')
+        with self.assertRaises(c.SearchWindowUnavailableError):
+            open_saved_video(adapter, 'https://weixin.qq.com/sph/Test', {}, locator_query='title')
+        adapter.set_clipboard.assert_not_called()
+        edit.click_input.assert_not_called()
+
+    def test_invalid_url_never_bootstraps(self):
+        adapter, _, _ = self.url_adapter()
+        adapter.is_valid_channels_share_url = lambda _: False
+        with self.assertRaises(ValueError):
+            open_saved_video(adapter, 'https://example.invalid/', {}, locator_query='title')
+        adapter.get_search_window.assert_not_called()
+        adapter.search_in_web.assert_not_called()
+
+    def test_ambiguous_url_edit_never_pastes(self):
+        adapter, web, edit = self.url_adapter()
+        second_edit = Mock()
+        second_edit.rectangle.return_value = edit.rectangle.return_value
+        web.descendants.return_value = [edit, second_edit]
+        with self.assertRaisesRegex(RuntimeError, 'uniquely locate'):
+            open_saved_video(adapter, 'https://weixin.qq.com/sph/Test', {})
+        adapter.set_clipboard.assert_not_called()
+
 if __name__ == '__main__':
     unittest.main()

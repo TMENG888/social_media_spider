@@ -215,6 +215,7 @@ def safe_token(value: str) -> str:
 
 TERMINAL_VIDEO_CHECKPOINT_STATUSES = {
     "completed", "dead_letter", "no_content", "not_applicable",
+    "skipped_unresolved",
 }
 DEFERRED_VIDEO_CHECKPOINT_STATUSES = {
     "completed_metadata", "retry_pending", "pending", "running", "partial_review",
@@ -344,9 +345,19 @@ def video_retry_completion_guard(args, item: dict[str, Any]) -> dict[str, Any]:
     status = str(payload.get("status") or "unknown")
     contaminated = has_internal_prompt((payload.get('row') or {}).get('video_content'))
     return {
-        "ok": status in TERMINAL_VIDEO_CHECKPOINT_STATUSES and not contaminated,
+        # A dead letter is evidence of failure, not a disposition. It must
+        # pass the shared finite-budget/evidence gate before acknowledgment.
+        "ok": status == "skipped_unresolved" or (
+            status in TERMINAL_VIDEO_CHECKPOINT_STATUSES and status != "dead_letter" and not contaminated
+        ),
         "status": status,
         "retryCount": int(payload.get("retry_count") or 0),
+        "asrStatus": payload.get("asr_status"),
+        "reason": payload.get("last_error"),
+        "checkpointUpdatedAt": payload.get("updated_at"),
+        "accepted": status=="completed" and not contaminated,
+        "skipped": status in {"dead_letter","skipped_unresolved"},
+        "disposition": payload.get("disposition"),
     }
 
 
@@ -377,8 +388,20 @@ def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
         if status not in TERMINAL_VIDEO_CHECKPOINT_STATUSES
     )
     dead_letters = int(statuses.get("dead_letter", 0))
-    if unresolved:
+    parent_raw=redis_command(args.redis_url,args.redis_password,"HGET",
+        getattr(args,"status_key",args.prefix+":status"),item.get("source_task_id") or item["task_id"])
+    try:
+        prior=json.loads(parent_raw) if parent_raw else {}
+    except (TypeError,ValueError):
+        prior={}
+    # Legacy aggregate status is not proof that the annual scan finished.
+    scan_complete=prior.get("scanCompleted") is True
+    if not scan_complete:
+        parent_status="retry_pending"
+    elif unresolved:
         parent_status = "completed_with_deferred_retries"
+    elif statuses.get("skipped_unresolved"):
+        parent_status = "completed_with_skips"
     elif dead_letters:
         parent_status = "completed_with_dead_letters"
     else:
@@ -388,6 +411,8 @@ def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
         "videoCheckpointStatuses": dict(statuses),
         "unresolvedVideoCount": int(unresolved),
         "deadLetterCount": dead_letters,
+        "skippedVideoCount": int(statuses.get("skipped_unresolved",0)),
+        "scanCompleted": scan_complete,
     }
     update_remote_status(args, item, parent_status, detail)
     return {"status": parent_status, **detail}
@@ -443,8 +468,15 @@ def group_lag(url: str, password: str | None, stream: str, group: str) -> int:
         if values.get("name") != group:
             continue
         lag = values.get("lag")
-        if lag is None:
-            return 1
+        if lag in (None, 'None', 'null'):
+            # Redis can lose entries-read/lag after historical group changes.
+            # Probe actual entries after the last delivered ID, read-only.
+            # Do not let unknown lag permanently block a drained retry queue.
+            last_id = values.get('last-delivered-id')
+            if not last_id:
+                return 1
+            unread = redis_command(url, password, 'XRANGE', stream, '(' + str(last_id), '+', 'COUNT', 1)
+            return 1 if unread else 0
         return max(0, int(lag))
     return 1
 
@@ -824,6 +856,9 @@ def run_task(
         "keyword": item["keyword"],
         "consumer": args.consumer,
         "startedAt": datetime.now().astimezone().isoformat(),
+        "taskKind": task_kind,
+        "leaseStream": lease_stream or args.stream,
+        "leaseGroup": lease_group or args.group,
     })
     env = os.environ.copy()
     env["WECHAT_QUEUE_FILE"] = str(task_queue_path)
@@ -832,6 +867,9 @@ def run_task(
     env["WECHAT_REDIS_TOPIC"] = str(item["topic"])
     env["WECHAT_REDIS_KEYWORD"] = str(item["keyword"])
     env["WECHAT_REDIS_RUN_ID"] = str(args.run_id)
+    env["WECHAT_REDIS_CONSUMER"] = str(args.consumer)
+    env["WECHAT_WORKER_ID"] = str(args.worker_root.name)
+    env["WECHAT_REDIS_GENERATION"] = str(args.run_generation)
     # The scheduler accepts Redis connectivity through command-line options,
     # while the collector/checkpoint store reads environment variables.  Always
     # bridge the resolved values into the child so dedicated ASR nodes can
@@ -850,6 +888,7 @@ def run_task(
     env["WECHAT_REDIS_STATE_SCOPE"] = f"{safe_token(args.run_id)}-{safe_token(args.run_generation)}"
     if task_kind == "video_retry":
         env['WECHAT_FORCE_ASR'] = '1'
+        env['WECHAT_RETRY_OBSERVATION_RUN_ID'] = str(item.get('retryObservationRunId') or '')
         env["WECHAT_REDIS_VIDEO_FINGERPRINT"] = str(item.get("fingerprint") or "")
         checkpoint = item.get("checkpoint") or {}
         env["WECHAT_REDIS_VIDEO_ARTICLE_KEY"] = str(
@@ -899,6 +938,8 @@ def run_task(
     publisher_thread: threading.Thread | None = None
     exit_code = 1
     try:
+        if (args.worker_root / ".state" / "stop.requested").exists():
+            return 130
         if task_kind in {"primary", "video_retry"} and asr_service is not None:
             try:
                 service_environment = asr_service.ensure_started()
@@ -923,6 +964,8 @@ def run_task(
                     "taskId": item["task_id"],
                     "error": str(service_error),
                 }, ensure_ascii=False), flush=True)
+        if (args.worker_root / ".state" / "stop.requested").exists():
+            return 130
         process = subprocess.Popen(
             command,
             env=env,
@@ -1040,6 +1083,40 @@ def claim_primary_message(args, *, recover_stale_pending: bool):
 
 
 def run_worker(args) -> int:
+    from redis_worker_control import WorkerControl
+    stop_requested = threading.Event()
+    stop_file = args.worker_root / ".state" / "stop.requested"
+    # Clear only the consumed local marker; persistent Redis holds are checked
+    # immediately afterwards, before seeding/claiming any task.
+    stop_file.parent.mkdir(parents=True, exist_ok=True)
+    stop_file.unlink(missing_ok=True)
+    control = WorkerControl(args, stop_requested)
+    orderly = False
+    try:
+        control.start()
+        if stop_requested.is_set():
+            write_json(args.worker_root / ".state" / "redis_worker_status.json", {
+                "status": "stopped", "consumer": args.consumer,
+                "reason": "redis_remote_stop_hold", "stoppedAt": datetime.now().astimezone().isoformat(),
+            })
+            orderly = True
+            return 130
+        result = _run_worker(args, stop_requested, control)
+        orderly = True
+        return result
+    finally:
+        control.close(orderly=orderly)
+
+
+def _run_worker(args, stop_requested, control) -> int:
+    # Replay verified telemetry from previous runs, without claiming tasks.
+    try:
+        from production_output_publisher import flush as flush_output
+        output_replay=flush_output(args.worker_root / '.state' / 'production-output', args.redis_url, args.redis_password)
+        if output_replay.get('sent') or output_replay.get('deferred'):
+            print(json.dumps(output_replay,ensure_ascii=False),flush=True)
+    except Exception as output_error:
+        print(json.dumps({'event':'production_output_upload_deferred','errorType':type(output_error).__name__},ensure_ascii=False),flush=True)
     queue = json.loads(args.queue.read_text(encoding="utf-8-sig"))
     tasks = flatten_queue(queue)
     ensure_group(args.redis_url, args.redis_password, args.stream, args.group)
@@ -1060,8 +1137,6 @@ def run_worker(args) -> int:
         extra={"planned": len(tasks), "newlySeeded": inserted},
     )
 
-    stop_requested = threading.Event()
-
     def request_stop(signum, frame):
         stop_requested.set()
         stop_file = args.worker_root / ".state" / "stop.requested"
@@ -1073,16 +1148,10 @@ def run_worker(args) -> int:
     signal.signal(signal.SIGTERM, request_stop)
     state_path = args.worker_root / ".state" / "redis_worker_status.json"
     stop_file = args.worker_root / ".state" / "stop.requested"
-    # A fresh worker launch explicitly clears an old, already-consumed stop
-    # request.  From this point on the Redis scheduler owns the marker as well
-    # as the per-keyword PowerShell child.  Previously only the child observed
-    # it, so a safe stop salvaged the current keyword and the outer loop then
-    # immediately claimed another Redis task.
+    # The outer wrapper has cleared a consumed local marker and checked the
+    # persistent remote hold. Never clear it again here: the control watcher
+    # may already have written a new request while the queue was initializing.
     stop_file.parent.mkdir(parents=True, exist_ok=True)
-    stop_file.unlink(missing_ok=True)
-    completed = 0
-    failed = 0
-    primary_since_retry = 0
     # Keep programmatic callers/tests created before the role options backward
     # compatible; command-line invocations always receive these from argparse.
     worker_role = getattr(args, "worker_role", "mixed")
@@ -1091,6 +1160,19 @@ def run_worker(args) -> int:
         0, int(getattr(args, "startup_primary_recovery_count", 1))
     )
     asr_service = PersistentAsrService(args)
+    # Also release the model if an unexpected scheduler exception occurs.
+    try:
+        return _worker_loop(args, stop_requested, control, stop_file, state_path,
+                            asr_service, worker_role, primary_burst,
+                            startup_primary_recovery_remaining)
+    finally:
+        asr_service.stop()
+
+
+def _worker_loop(args, stop_requested, control, stop_file, state_path,
+                 asr_service, worker_role, primary_burst,
+                 startup_primary_recovery_remaining):
+    completed = failed = primary_since_retry = skipped = 0
 
     while not stop_requested.is_set():
         if stop_file.exists():
@@ -1110,6 +1192,9 @@ def run_worker(args) -> int:
         round_active = False
         retry_stream_in_use, retry_group_in_use = args.retry_stream, args.retry_group
         try:
+            # Recheck the durable hold immediately before attempting a claim.
+            if control.poll():
+                break
             message = None
             from retry_round import claim_round
             round_active, message, round_stream, round_group = claim_round(SimpleNamespace(**globals()), args)
@@ -1119,6 +1204,27 @@ def run_worker(args) -> int:
                 if not message:
                     print(json.dumps({'event':'retry_round_waiting_for_other_workers'}, ensure_ascii=False), flush=True)
                     stop_requested.wait(args.block_seconds)
+                    continue
+            if (not round_active and worker_role == 'mixed'
+                    and getattr(args, 'task_priority', 'balanced') == 'retry_first'):
+                from retry_priority import claim_retry_first
+                message, hold_primary, priority_detail = claim_retry_first(SimpleNamespace(**globals()), args)
+                if message:
+                    task_kind = 'video_retry'
+                elif hold_primary:
+                    write_json(state_path, {
+                        'status': 'waiting_retry_backlog', 'consumer': args.consumer,
+                        'taskPriority': 'retry_first', 'detail': priority_detail,
+                        'updatedAt': datetime.now().astimezone().isoformat(),
+                    })
+                    # Human-actionable failure, not a fake successful keyword.
+                    if getattr(args, '_last_priority_detail', None) != priority_detail:
+                        print(json.dumps({'event': 'redis_retry_priority_holding_new_keywords',
+                                          **priority_detail}, ensure_ascii=False), flush=True)
+                        publish_remote_log(args, 'redis_retry_priority_holding_new_keywords',
+                                           extra=priority_detail)
+                        args._last_priority_detail = priority_detail
+                    stop_requested.wait(max(1, args.block_seconds))
                     continue
             prefer_retry = (
                 worker_role == "asr"
@@ -1131,7 +1237,7 @@ def run_worker(args) -> int:
             # stream.  The previous strict primary-first policy starved every
             # ASR task while any unread annual keyword remained.  An operator
             # may also dedicate a machine with REDIS_WORKER_ROLE=asr.
-            if prefer_retry and not round_active:
+            if prefer_retry and not round_active and not message:
                 task_kind = "video_retry"
                 message = read_new(
                     args.redis_url, args.redis_password,
@@ -1232,6 +1338,19 @@ def run_worker(args) -> int:
             continue
 
         message_id, item = message
+        # A command may arrive while XREADGROUP blocks. Preserve ownership as
+        # pending; do not launch GUI work or ACK an unfinished claimed message.
+        try:
+            if control.poll() or stop_file.exists():
+                stop_requested.set()
+                print(json.dumps({"event": "redis_remote_stop_claim_left_pending",
+                                  "messageId": message_id, "taskId": item["task_id"]}), flush=True)
+                break
+        except Exception as error:
+            print(json.dumps({"event": "redis_control_prelaunch_unavailable_left_pending",
+                              "errorType": type(error).__name__, "messageId": message_id}), flush=True)
+            stop_requested.wait(args.block_seconds)
+            continue
         if task_kind == 'video_retry' and not item.get('force_asr'):
             try:
                 current_guard = video_retry_completion_guard(args, item)
@@ -1245,17 +1364,78 @@ def run_worker(args) -> int:
                     finish_attempt(SimpleNamespace(**globals()), args, message_id, item,
                                    current_guard, retry_stream_in_use, retry_group_in_use)
                 else:
-                    redis_command(args.redis_url, args.redis_password, 'XACK',
-                                  args.retry_stream, args.retry_group, message_id)
+                    from video_retry_budget import acknowledge_terminal
+                    acknowledge_terminal(SimpleNamespace(**globals()),args,
+                        args.retry_stream,args.retry_group,message_id,item)
                 print(json.dumps({'event':'retry_terminal_checkpoint_skipped',
                     'taskId':item['task_id'], 'fingerprint':item.get('fingerprint'),
                     'checkpointGuard':current_guard}, ensure_ascii=False), flush=True)
+                if current_guard.get("skipped"):
+                    skipped+=1
+                else:
+                    completed+=1
                 if args.once:
                     asr_service.stop()
                     return 0
                 continue
         if task_kind == "video_retry":
             primary_since_retry = 0
+            # Budget is independent of checkpoint retry_count and shared by
+            # all nodes. A quality failure remains pending for explicit review,
+            # never acknowledged merely to make the queue look empty.
+            from video_retry_budget import begin as begin_video_attempt, restore_retry_identity
+            try:
+                restore_retry_identity(SimpleNamespace(**globals()),args,
+                    retry_stream_in_use,retry_group_in_use,message_id,item)
+                budget_before_guard=video_retry_completion_guard(args,item)
+                from video_no_change import read_checkpoint
+                no_change_before=read_checkpoint(SimpleNamespace(**globals()),args,item)
+                item['retryObservationRunId']=str(time.time_ns())+'-'+message_id
+                video_attempt=begin_video_attempt(SimpleNamespace(**globals()),args,
+                    retry_stream_in_use,retry_group_in_use,message_id,item)
+            except Exception as error:
+                print(json.dumps({"event":"retry_budget_unavailable_left_pending",
+                                  "errorType":type(error).__name__}),flush=True)
+                asr_service.stop()
+                return 4
+            if not video_attempt.get("allowed"):
+                if video_attempt.get("state")=="blocked":
+                    print(json.dumps({"event":"retry_no_progress_blocked_requires_action",
+                        "taskId":item["task_id"],"fingerprint":item.get("fingerprint"),
+                        "budget":video_attempt},ensure_ascii=False),flush=True)
+                    asr_service.stop()
+                    return 4
+                disposed=False
+                try:
+                    from video_retry_budget import skip_exhausted
+                    skip_exhausted(SimpleNamespace(**globals()),args,retry_stream_in_use,
+                        retry_group_in_use,message_id,item)
+                    current_guard=video_retry_completion_guard(args,item)
+                    if current_guard["ok"]:
+                        if round_active:
+                            from retry_round import finish_attempt
+                            finish_attempt(SimpleNamespace(**globals()),args,message_id,item,
+                                current_guard,retry_stream_in_use,retry_group_in_use)
+                        else:
+                            from video_retry_budget import acknowledge_terminal
+                            acknowledge_terminal(SimpleNamespace(**globals()),args,
+                                retry_stream_in_use,retry_group_in_use,message_id,item)
+                        refresh_parent_keyword_status(args,item)
+                        disposed=True
+                        skipped+=int(current_guard.get("skipped",False))
+                except Exception as error:
+                    print(json.dumps({"event":"retry_skip_blocked_left_pending","errorType":type(error).__name__}),flush=True)
+                print(json.dumps({"event":"retry_budget_terminal_disposition" if disposed else "retry_skip_blocked_not_completed",
+                    "taskId":item["task_id"],"fingerprint":item.get("fingerprint"),
+                    "budget":video_attempt},ensure_ascii=False),flush=True)
+                if args.once:
+                    asr_service.stop()
+                    return 0 if disposed else 4
+                if not disposed:
+                    asr_service.stop()
+                    return 4
+                stop_requested.wait(args.block_seconds)
+                continue
         else:
             primary_since_retry += 1
         print(json.dumps({
@@ -1306,6 +1486,45 @@ def run_worker(args) -> int:
                 retry_guard = video_retry_completion_guard(args, item)
             except Exception as error:
                 retry_guard = {"ok": False, "status": "guard_error", "error": str(error)}
+            from video_retry_budget import finish as finish_video_attempt
+            try:
+                from video_no_change import seal_no_change, import_confirmed
+                no_change=seal_no_change(SimpleNamespace(**globals()),args,
+                    retry_stream_in_use,retry_group_in_use,message_id,item,video_attempt,no_change_before,
+                    import_ok=import_confirmed(args.worker_root,item),
+                    stopped=bool(safe_stop_observed or stop_requested.is_set()))
+                if no_change:
+                    retry_guard=video_retry_completion_guard(args,item)
+                    print(json.dumps({'event':'retry_completed_no_change','taskId':item['task_id'],
+                        'fingerprint':item['fingerprint'],'accepted':False},ensure_ascii=False),flush=True)
+                if not retry_guard.get("ok") and (
+                    safe_stop_observed or stop_requested.is_set()
+                    or retry_guard.get("status") in {"guard_error","missing_checkpoint","invalid_json","missing_fingerprint"}
+                    or retry_guard.get("checkpointUpdatedAt")==budget_before_guard.get("checkpointUpdatedAt")
+                ):
+                    retry_guard.update(deferred=True,deferReason="STOP_OR_NO_FRESH_CONTENT_EVIDENCE",
+                        cooperativeStop=bool(safe_stop_observed or stop_requested.is_set()))
+                retry_budget=finish_video_attempt(SimpleNamespace(**globals()),args,
+                    retry_stream_in_use,retry_group_in_use,message_id,item,video_attempt,retry_guard)
+                if retry_budget.get("state")=="blocked":
+                    print(json.dumps({"event":"retry_no_progress_blocked_requires_action",
+                        "taskId":item["task_id"],"fingerprint":item.get("fingerprint"),
+                        "budget":retry_budget},ensure_ascii=False),flush=True)
+                    asr_service.stop()
+                    return 4
+                if retry_budget.get("state")=="exhausted":
+                    from video_retry_budget import skip_exhausted
+                    disposition=skip_exhausted(SimpleNamespace(**globals()),args,
+                        retry_stream_in_use,retry_group_in_use,message_id,item)
+                    retry_guard=video_retry_completion_guard(args,item)
+                    print(json.dumps({"event":"retry_exhausted_skipped_not_success",
+                        "taskId":item["task_id"],"fingerprint":item.get("fingerprint"),
+                        "disposition":disposition},ensure_ascii=False),flush=True)
+            except Exception as error:
+                # Fail closed even if the child reports success: replacement
+                # ownership must not ACK another node's pending message.
+                retry_guard={"ok":False,"status":"budget_finalize_failed","errorType":type(error).__name__}
+                retry_budget=None
             if round_active and not safe_stop_observed and not stop_requested.is_set():
                 from retry_round import finish_attempt
                 finish_attempt(SimpleNamespace(**globals()), args, message_id, item,
@@ -1313,11 +1532,13 @@ def run_worker(args) -> int:
             if retry_guard["ok"]:
                 try:
                     if not round_active:
-                        redis_command(
-                            args.redis_url, args.redis_password,
-                            "XACK", args.retry_stream, args.retry_group, message_id,
-                        )
-                    completed += 1
+                        from video_retry_budget import acknowledge_terminal
+                        acknowledge_terminal(SimpleNamespace(**globals()),args,
+                            args.retry_stream,args.retry_group,message_id,item)
+                    if retry_guard.get("skipped"):
+                        skipped+=1
+                    else:
+                        completed += 1
                     try:
                         parent_status = refresh_parent_keyword_status(args, item)
                     except Exception as status_error:
@@ -1362,7 +1583,8 @@ def run_worker(args) -> int:
             if args.once:
                 once_exit = 0 if retry_guard["ok"] else (exit_code or 4)
                 write_json(state_path, {
-                    "status": "completed_once" if retry_guard["ok"] else "retry_pending",
+                    "status": "disposed_with_skip_once" if retry_guard.get("skipped") else "completed_once" if retry_guard["ok"] else "retry_pending",
+                    "skipped": skipped,
                     "consumer": args.consumer,
                     "completed": completed,
                     "failedAttempts": failed,
@@ -1421,11 +1643,17 @@ def run_worker(args) -> int:
                 completion_status = (
                     "completed_with_deferred_retries" if deferred_count else "completed"
                 )
+                if not deferred_count and any((checkpoint_guard or {}).get("statuses",{}).get(s) for s in ("dead_letter","skipped_unresolved")):
+                    completion_status="completed_with_skips"
                 update_remote_status(args, item, completion_status, {
+                    "scanCompleted": True,
                     "messageId": message_id,
                     "checkpointGuard": checkpoint_guard,
                 })
-                completed += 1
+                if completion_status=="completed_with_skips":
+                    skipped+=1
+                else:
+                    completed += 1
                 print(json.dumps({
                     "event": "redis_task_acked",
                     "taskId": item["task_id"],
@@ -1442,6 +1670,7 @@ def run_worker(args) -> int:
             failed += 1
             try:
                 update_remote_status(args, item, "retry_pending", {
+                    "scanCompleted": False,
                     "messageId": message_id,
                     "exitCode": exit_code,
                     "checkpointGuard": checkpoint_guard,
@@ -1475,6 +1704,7 @@ def run_worker(args) -> int:
         "status": "stopped",
         "consumer": args.consumer,
         "completed": completed,
+        "skipped": skipped,
         "failedAttempts": failed,
         "stoppedAt": datetime.now().astimezone().isoformat(),
     })
@@ -1503,9 +1733,13 @@ def build_parser():
     run.add_argument("--group", default=os.environ.get("REDIS_GROUP", "channels-workers"))
     run.add_argument("--consumer", default=os.environ.get("REDIS_CONSUMER", ""))
     run.add_argument("--reclaim-idle-seconds", type=int, default=int(os.environ.get("REDIS_RECLAIM_IDLE_SECONDS", "300")))
+    run.add_argument("--video-retry-max-attempts",type=int,default=3)
     run.add_argument("--heartbeat-seconds", type=int, default=int(os.environ.get("REDIS_HEARTBEAT_SECONDS", "30")))
     run.add_argument("--heartbeat-failure-limit", type=int, default=int(os.environ.get("REDIS_HEARTBEAT_FAILURE_LIMIT", "3")))
     run.add_argument("--block-seconds", type=int, default=5)
+    run.add_argument('--task-priority', choices=('retry_first', 'balanced'),
+                     default=os.environ.get('REDIS_TASK_PRIORITY', 'retry_first'),
+                     help='mixed: retry_first blocks new keywords while retries/checkpoint exceptions remain')
     run.add_argument(
         "--worker-role", choices=("mixed", "primary", "asr"),
         default=os.environ.get("REDIS_WORKER_ROLE", "mixed"),
@@ -1546,6 +1780,8 @@ def main() -> int:
 
     if not args.redis_url:
         raise SystemExit("REDIS_URL is required, for example redis://127.0.0.1:6379/0")
+    if args.video_retry_max_attempts < 1:
+        raise SystemExit("--video-retry-max-attempts must be positive")
     args.redis_password = os.environ.get("REDIS_PASSWORD") or None
     args.common = args.common.resolve()
     args.worker_root = args.worker_root.resolve()
