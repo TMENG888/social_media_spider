@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import queue
 import random
@@ -36,9 +37,12 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 from wechat_media_cache import discover_cache_dirs, snapshot_cache, wait_for_unique_media
-from channels_resilience import RedisVideoCheckpointStore, atomic_write_text
+from channels_resilience import RedisVideoCheckpointStore, RedisCheckpointUnavailable, atomic_write_text
 from asr_model_loader import load_asr_model
-from subtitle_review import init_review_tables, stage_candidate, has_internal_prompt, force_retranscribe
+from subtitle_review import init_review_tables, stage_candidate, has_internal_prompt, has_untrusted_transcript, force_retranscribe, checkpoint_repair_reason
+from transcript_quality import transcript_artifact
+from search_scan_proof import POLICY as SEARCH_SCAN_POLICY, TERMINAL_TEXTS, SearchEndTracker, valid_origin
+from operational_gate import report_from_environment, classify_restriction
 
 # Windows consoles often default to GBK; force UTF-8 so real WeChat titles
 # containing Japanese punctuation/emoji cannot terminate a long collection.
@@ -436,6 +440,15 @@ def assess_asr_text_quality(
     fallback_without_vad: bool = False,
 ) -> tuple[str | None, dict]:
     """Reject obvious Whisper hallucinations before they reach business data."""
+    if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1':
+        return (str(value).strip() or None) if value is not None else None, {
+            'accepted':None,'qualityChecked':False,
+            'reason':'quality_check_disabled_by_volume_policy'}
+    artifact = transcript_artifact(value)
+    if artifact:
+        return None, {"accepted": False, "reason": "known_whisper_hallucination",
+                      "artifact_marker": artifact, "known_hallucination": True,
+                      "repeat_ngram_ratio": 0.0}
     text = clean_asr_text(value)
     prompt_text = str(prompt_context or "")
     # Project names are often rare characters and Whisper returns a common
@@ -511,6 +524,8 @@ def assess_asr_text_quality(
 
 def require_trustworthy_asr_result(text, audits):
     """Rejected nonempty decoding is not evidence that the source is silent."""
+    if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1':
+        return
     def evidence(values):
         for value in values:
             if not isinstance(value,dict):
@@ -531,6 +546,8 @@ def asr_output_needs_review(
     config: dict | None = None,
 ) -> bool:
     """Flag implausibly short transcripts without discarding partial text."""
+    if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1':
+        return False
     text = asr_speech_compare_key(clean_asr_text(value) or "")
     capture = float(capture_seconds or 0)
     review_from = float((config or {}).get("client_asr_review_min_duration_seconds", 10.0))
@@ -1827,6 +1844,46 @@ def capture_client_audio_asr(
         raise ClientAudioCaptureError(str(exc)) from exc
 
 
+def volume_export_local_target(local_posts, sql_posts, threshold):
+    """An export trigger, never acceptance: add the SQL deficit to local rows.
+
+    Hydrated/local counts can differ from MySQL. Reusing the absolute SQL P80
+    as a local cap either exports without progress or needlessly overcollects.
+    The parent must still read MySQL after import to confirm completion.
+    """
+    if (any(type(n) is not int or n < 0 for n in (local_posts, sql_posts, threshold))
+            or threshold < 1):
+        raise ValueError('VOLUME_EXPORT_COUNTS_INVALID')
+    return local_posts + max(0, threshold-sql_posts)
+
+
+def capture_primary_audio_optional(*args, stop_file=None, **kwargs):
+    """Quantity mode must not discard verified metadata on a recorder failure.
+
+    This waives audio only, not identity, access controls, lease/stop failures,
+    or the caller's subsequent fresh detail-field validation.
+    """
+    try:
+        text, duration = capture_client_audio_asr(*args, **kwargs)
+        return text, duration, None
+    except ClientAudioCaptureError as error:
+        if (os.environ.get('SOCIAL_VOLUME_ENABLED') != '1' or STOP_REQUESTED
+                or (stop_file is not None and stop_file.exists())):
+            raise
+        cause = error
+        seen = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if (isinstance(cause, (VideoDetailIdentityMismatchError, SearchWindowUnavailableError))
+                    or re.search(r'LEASE_LOST|STOP_REQUESTED|STOP_SECURITY|STOP_LOGIN|验证码|安全验证|扫码|登录|访问频繁', str(cause), re.I)):
+                raise
+            cause = cause.__cause__ or cause.__context__
+        print(json.dumps({'event':'volume_optional_audio_failed_metadata_retained',
+            'error':str(error), 'qualityVerified':False,
+            'audioCaptured':False, 'notEvidenceOfSilence':True},ensure_ascii=False),flush=True)
+        return None, kwargs.get('duration_seconds'), str(error)
+
+
 def run_detail_collection_during_recording(callback, recorder_process) -> dict:
     """Run lightweight metadata/comment parsing while loopback capture lives."""
     started = time.monotonic()
@@ -2137,7 +2194,7 @@ class BackgroundAsrQueue:
                     )
                     connection.commit()
                     text = transcribe_pending_client_audio(job, self.config, raise_errors=True)
-                    needs_review = has_internal_prompt(text) or asr_output_needs_review(
+                    needs_review = has_untrusted_transcript(text) or asr_output_needs_review(
                         text, job.capture_seconds, config=self.config,
                     )
                     asr_status = (
@@ -2380,6 +2437,7 @@ def wake_wechat_main_window() -> bool:
     # prompts. Stop before any launch and let the operator finish login.
     login_windows = _wechat_login_windows()
     if login_windows:
+        report_from_environment('STOP_LOGIN_REQUIRED：请人工登录微信')
         print(json.dumps({
             "event": "wechat_window_login_required",
             "login_windows": len(login_windows),
@@ -3609,6 +3667,119 @@ def retry_checkpoint_has_identity(checkpoint: dict | None) -> bool:
     )
 
 
+def reusable_cross_keyword_checkpoint(checkpoint, *, project, article_key, url,
+                                      author, duration, cutoff, collect_comments=False):
+    """Only an exact, usable source can replace a second audio/detail visit.
+
+    Local row existence, metadata completion and dead letters are NOT success.
+    This is a reuse gate, not database acceptance: the final MySQL readback is
+    still required for the receiving keyword.
+    """
+    if not isinstance(checkpoint, dict) or checkpoint.get('status') not in {'completed', 'no_content', 'not_applicable'}:
+        return False
+    if checkpoint.get('subtitle_review_required'):
+        return False
+    data = checkpoint.get('row')
+    if not isinstance(data, dict) or checkpoint.get('article_key') != article_key or data.get('project') != project:
+        return False
+    if not data.get('keyword') or (checkpoint.get('keyword') and checkpoint['keyword'] != data['keyword']):
+        return False
+    if not data.get('title') or not is_valid_channels_share_url(data.get('url')) or not is_valid_channels_share_url(url):
+        return False
+    if not extract_finder_id(data['url']) or extract_finder_id(data['url']) != extract_finder_id(url):
+        return False
+    if not normalize_video_identity_text(author) or normalize_video_identity_text(data.get('author_name')) != normalize_video_identity_text(author):
+        return False
+    try:
+        expected_duration, source_duration = float(duration or 0), float(data.get('video_duration') or 0)
+        if not all(math.isfinite(value) and value > 0 for value in (expected_duration, source_duration)) or abs(source_duration - expected_duration) > 2:
+            return False
+        published = datetime.fromisoformat(str(data.get('published_at') or ''))
+        if published < cutoff or published.year != cutoff.year:
+            return False
+        row = ResultRow(**{key: value for key, value in data.items() if key in ResultRow.__dataclass_fields__})
+        if article_key_for_row(row) != article_key:
+            return False
+    except (TypeError, ValueError):
+        return False
+    text = data.get('video_content')
+    asr_status = checkpoint.get('asr_status')
+    if has_untrusted_transcript(text) or asr_status != checkpoint['status']:
+        return False
+    if checkpoint['status'] == 'completed' and (not str(text or '').strip() or asr_output_needs_review(text, duration)):
+        return False
+    if checkpoint['status'] != 'completed' and str(text or '').strip():
+        return False
+    if not isinstance(checkpoint.get('comments', []), list) or any(not isinstance(item, dict) for item in checkpoint.get('comments', [])):
+        return False
+    if not isinstance(checkpoint.get('field_completeness') or {}, dict):
+        return False
+    completeness = video_field_completeness(row, checkpoint.get('comments'), asr_status=asr_status)
+    if any(value is not True for field, value in completeness.items() if field != 'comments' or collect_comments):
+        return False
+    # A stored explicit failure is not superseded by recalculating a flag.
+    if any(value is not True for field, value in (checkpoint.get('field_completeness') or {}).items()
+           if field != 'comments' or collect_comments):
+        return False
+    return True
+
+
+def persist_cross_keyword_reuse(connection, *, checkpoint, keyword, project,
+                                fingerprint, result_index, cutoff, collect_comments=False,
+                                remote_store=None):
+    """Bind retained source data to this keyword without erasing either history."""
+    current = load_video_checkpoints(connection, keyword).get(fingerprint) or {}
+    if current.get('status') == 'skipped_unresolved':
+        raise RuntimeError('CROSS_KEYWORD_REUSE_EXPLICIT_SKIP')
+    source = dict(checkpoint['row'])
+    source_key = checkpoint['article_key']
+    if not reusable_cross_keyword_checkpoint(checkpoint, project=project, article_key=source_key,
+            url=source.get('url'), author=source.get('author_name'), duration=source.get('video_duration'),
+            cutoff=cutoff, collect_comments=collect_comments):
+        raise RuntimeError('CROSS_KEYWORD_REUSE_SOURCE_NOT_USABLE')
+    if current.get('article_key') and current['article_key'] != source_key:
+        raise RuntimeError('CROSS_KEYWORD_REUSE_IDENTITY_CONFLICT')
+    if (current.get('row') or {}).get('url') and extract_finder_id(current['row']['url']) != extract_finder_id(source['url']):
+        raise RuntimeError('CROSS_KEYWORD_REUSE_IDENTITY_CONFLICT')
+    row = ResultRow(**{key: value for key, value in source.items() if key in ResultRow.__dataclass_fields__})
+    if row.project != project or row.keyword == keyword or article_key_for_row(row) != source_key:
+        raise RuntimeError('CROSS_KEYWORD_REUSE_SCOPE_CONFLICT')
+    row.keyword = keyword
+    comments = checkpoint.get('comments') or []
+    previous_cursor = connection.execute('SELECT * FROM video_checkpoint WHERE keyword=? AND fingerprint=?',
+                                         (keyword, fingerprint))
+    previous_row = previous_cursor.fetchone()
+    previous_record = dict(zip((item[0] for item in previous_cursor.description), previous_row)) if previous_row else None
+    article_cursor = connection.execute('SELECT * FROM captured_article WHERE keyword=? AND article_key=?',
+                                        (keyword, source_key))
+    article_row = article_cursor.fetchone()
+    previous_article = dict(zip((item[0] for item in article_cursor.description), article_row)) if article_row else None
+    comment_cursor = connection.execute('SELECT * FROM captured_comment WHERE keyword=? AND article_key=? ORDER BY comment_key',
+                                        (keyword, source_key))
+    comment_columns = [item[0] for item in comment_cursor.description]
+    previous_comments = [dict(zip(comment_columns, item)) for item in comment_cursor.fetchall()]
+    # Append the full source and old receiving checkpoint before any update.
+    connection.execute('''CREATE TABLE IF NOT EXISTS cross_keyword_reuse_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT NOT NULL,
+        fingerprint TEXT NOT NULL, source_keyword TEXT NOT NULL,
+        source_checkpoint TEXT NOT NULL, previous_checkpoint TEXT NOT NULL,
+        previous_article TEXT NOT NULL, previous_comments TEXT NOT NULL,
+        created_at TEXT NOT NULL)''')
+    connection.execute('''INSERT INTO cross_keyword_reuse_audit
+        (keyword,fingerprint,source_keyword,source_checkpoint,previous_checkpoint,previous_article,previous_comments,created_at)
+        VALUES (?,?,?,?,?,?,?,?)''', (keyword, fingerprint, source['keyword'],
+        json.dumps(checkpoint, ensure_ascii=False), json.dumps(previous_record, ensure_ascii=False),
+        json.dumps(previous_article, ensure_ascii=False), json.dumps(previous_comments, ensure_ascii=False),
+        datetime.now().isoformat(timespec='seconds')))
+    connection.commit()
+    save_row(connection, row)
+    save_comments(connection, row, comments)
+    return upsert_video_checkpoint(connection, keyword=keyword, project=project,
+        fingerprint=fingerprint, result_index=result_index, status=checkpoint['status'],
+        retry_count=int(current.get('retry_count') or 0), row=row, comments=comments,
+        asr_status=checkpoint['asr_status'], remote_store=remote_store)
+
+
 def should_age_missing_retry(
     fingerprint: str,
     checkpoint: dict,
@@ -3692,8 +3863,16 @@ def upsert_video_checkpoint(
 ) -> dict:
     prior_status=connection.execute("SELECT status FROM video_checkpoint WHERE keyword=? AND fingerprint=?",(keyword,fingerprint)).fetchone()
     if prior_status and prior_status[0]=="skipped_unresolved":
-        # A replay/rescan is not authorization to reopen an exhausted video.
-        return load_video_checkpoints(connection,keyword)[fingerprint]
+        previous=load_video_checkpoints(connection,keyword)[fingerprint]
+        if os.environ.get('SOCIAL_VOLUME_ENABLED')!='1':
+            return previous
+        # An original-keyword reset may revisit a naturally encountered note.
+        # Preserve the entire old checkpoint before replacing its metadata;
+        # do not create a child retry or erase cumulative failure counts.
+        connection.execute('CREATE TABLE IF NOT EXISTS keyword_replay_history (keyword TEXT,fingerprint TEXT,evidence_hash TEXT,payload TEXT,created_at TEXT,PRIMARY KEY(keyword,fingerprint,evidence_hash))')
+        encoded=json.dumps(previous,ensure_ascii=False,sort_keys=True)
+        connection.execute('INSERT OR IGNORE INTO keyword_replay_history VALUES (?,?,?,?,?)',
+            (keyword,fingerprint,hashlib.sha256(encoded.encode('utf-8')).hexdigest(),encoded,datetime.now().isoformat()))
     now = datetime.now().isoformat(timespec="seconds")
     row_value = asdict(row) if row is not None else None
     comments_value = comments if comments is not None else []
@@ -3932,6 +4111,21 @@ def record_video_failure(
     return status, retry_count
 
 
+def legacy_annual_rescan_required(status: str, *, asr_backfill=False, recheck_exhausted=True) -> bool:
+    """A date streak is not a search endpoint; preserve item history on replay."""
+    if asr_backfill:
+        return False
+    return (status.startswith('complete_cutoff')
+            or status.startswith('complete_explicit_empty')
+            or (recheck_exhausted and status.startswith('complete_exhausted')))
+
+
+def observe_old_date_window(config: dict, old_streak: int) -> bool:
+    """Diagnostic only. Interleaved target-year cards must still be searched."""
+    threshold = max(0, int(config.get('cutoff_old_streak', 0)))
+    return threshold > 0 and old_streak >= threshold
+
+
 def status_with_deferred_video_retries(status: str, retry_pending_count: int) -> str:
     """Keep a finished annual scan terminal while child retries stay durable."""
     if retry_pending_count <= 0 or status == "partial_stopped":
@@ -3953,7 +4147,9 @@ def record_precise_search_miss(connection, *, keyword, project, retry_fingerprin
     if not cp or cp.get('status') in {'completed','no_content','not_applicable','skipped_unresolved'}:
         return None
     row=cp.get('row') or {}
-    if not str(row.get('url') or '').strip() or not str(row.get('title') or cp.get('title') or '').strip():
+    if not str(row.get('title') or cp.get('title') or '').strip() or not (
+        cp.get('article_key') or row.get('url') or row.get('author_name') or cp.get('author_name')
+    ):
         return None
     return record_video_failure(connection,keyword=keyword,project=project,
         fingerprint=retry_fingerprint,result_index=cp.get('result_index'),
@@ -4375,6 +4571,81 @@ def search_page_titles(surface) -> list[str]:
         except Exception:
             continue
     return titles
+
+
+def search_scan_surface_snapshot(surface, keyword, *, scanned_count=0, surface_generation=0):
+    """Read the exact search document; never infer scroll bottom from count."""
+    expected = f'{keyword} - 视频 - 搜一搜'
+    snapshot = {'keyword': keyword, 'pageTitle': None, 'contextValid': False,
+                'loading': False, 'loadFailed': False, 'cardCount': 0,
+                'cardDigest': hashlib.sha256(b'[]').hexdigest(),
+                'scannedCount': scanned_count, 'surfaceGeneration': surface_generation,
+                'scrollPercent': None, 'verticallyScrollable': None,
+                'capturedAt': datetime.now().astimezone().isoformat(),
+                'terminalText': None, 'terminalOutsideCards': False,
+                'terminalBelowCards': False, 'lastCardInViewport': False}
+    try:
+        documents = [doc for doc in surface.descendants(control_type='Document')
+                     if (doc.window_text() or '').strip() == expected and doc.is_visible()]
+        if len(documents) != 1:
+            return snapshot
+        document = documents[0]
+        viewport = document.rectangle()
+        cards = search_result_buttons(document)
+        names = [re.sub(r'\s+', ' ', (card.window_text() or '').strip()) for card in cards]
+        snapshot.update(pageTitle=expected, contextValid=bool(cards and all(names)), cardCount=len(cards),
+                        cardDigest=hashlib.sha256(json.dumps(names, ensure_ascii=False).encode()).hexdigest())
+        try:
+            snapshot['verticallyScrollable'] = bool(document.iface_scroll.CurrentVerticallyScrollable)
+            snapshot['scrollPercent'] = float(document.iface_scroll.CurrentVerticalScrollPercent) if snapshot['verticallyScrollable'] else 0.
+        except Exception:
+            pass
+        last_rect = cards[-1].rectangle() if cards else None
+        snapshot['lastCardInViewport'] = bool(last_rect and last_rect.width() > 0
+            and last_rect.height() > 0 and last_rect.top >= viewport.top
+            and last_rect.bottom <= viewport.bottom)
+        for control in document.descendants():
+            try:
+                control_kind = control.element_info.control_type
+                if control_kind not in {'Text', 'Button', 'Pane', 'ProgressBar'}:
+                    continue
+                if not control.is_visible():
+                    continue
+                name = re.sub(r'\s+', '', (control.window_text() or '').strip())
+                if not name and control_kind != 'ProgressBar':
+                    continue
+                # A result title saying "没有更多了" is content, not page EOF.
+                parent, outside = control.parent(), False
+                for _ in range(12):
+                    kind = parent.element_info.control_type
+                    class_name = (parent.element_info.class_name or '').lower()
+                    if kind == 'ListItem' or 'rich-media' in class_name:
+                        break
+                    if kind == 'Document':
+                        outside = (parent.window_text() or '').strip() == expected
+                        break
+                    parent = parent.parent()
+                if not outside:
+                    continue
+                rect = control.rectangle()
+                if rect.top < viewport.top or rect.bottom > viewport.bottom:
+                    continue
+                if control_kind == 'ProgressBar' or name in {'加载中', '正在加载', '加载中...'}:
+                    snapshot['loading'] = True
+                if any(token in name for token in ('加载失败', '网络异常', '访问频繁', '操作频繁', '验证码', '安全验证', '请先登录')):
+                    snapshot['loadFailed'] = True
+                    if classify_restriction(name):
+                        snapshot['restrictionReason'] = name
+                if name in TERMINAL_TEXTS and last_rect and rect.top >= last_rect.bottom - 2:
+                    snapshot.update(terminalText=name, terminalOutsideCards=True, terminalBelowCards=True)
+            except Exception:
+                continue
+    except Exception:
+        snapshot['contextValid'] = False
+    if snapshot.get('restrictionReason'):
+        report_from_environment(snapshot['restrictionReason'])
+        raise RuntimeError('STOP_PLATFORM_RESTRICTION：'+snapshot['restrictionReason'])
+    return snapshot
 
 
 def is_article_results_page(surface) -> bool:
@@ -5475,6 +5746,28 @@ def is_valid_channels_share_url(value: str | None) -> bool:
     return parsed.hostname == "weixin.qq.com" and parsed.path.startswith("/sph/")
 
 
+def wait_for_channels_clipboard(timeout: float = 3.0) -> str:
+    """Allow asynchronous copy/brief clipboard contention, never log contents."""
+    deadline = time.monotonic() + max(0.0, min(float(timeout), 5.0))
+    reads = 0
+    while True:
+        reads += 1
+        try:
+            value = get_clipboard().strip()
+        except Exception:
+            value = ""
+        if is_valid_channels_share_url(value):
+            if reads > 1:
+                print(json.dumps({"event": "video_link_clipboard_delayed_ready", "reads": reads}), flush=True)
+            return value
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Clipboard can hold passwords or other unrelated user material.
+            # Never include it in task logs or remote monitoring.
+            raise RuntimeError("复制链接超时或格式无效，将重新打开当前卡片；剪贴板内容不写入日志")
+        time.sleep(min(0.1, remaining))
+
+
 def copy_article_link_from_menu(web, config: dict) -> str:
     # 视频详情隐藏地址栏 URL，但第二个互动按钮会展开四项分享菜单；
     # 第四项固定为“复制链接”。使用物理点击规避该 React 菜单的空 UIA Invoke。
@@ -5533,11 +5826,7 @@ def copy_article_link_from_menu(web, config: dict) -> str:
         raise RuntimeError("视频详情分享菜单未出现或未识别到复制链接") from exc
     rect = item.rectangle()
     mouse.click(coords=(int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2)))
-    time.sleep(min(0.5, config.get("wait_short", 0.8)))
-    link = get_clipboard().strip()
-    if not is_valid_channels_share_url(link):
-        raise RuntimeError(f"复制到的不是视频号链接，将重新打开当前卡片：{link!r}")
-    return link
+    return wait_for_channels_clipboard()
 
 
 def parse_visible_comments(records: list[tuple[str, str, str]]) -> list[dict]:
@@ -6404,6 +6693,7 @@ def collect_live_keyword(
         search_in_web(keyword, config)
     screenshot_dir.mkdir(parents=True, exist_ok=True)
     save_window_screenshot(get_search_window(), screenshot_dir / f"{keyword}_results.png")
+    search_origin = search_scan_surface_snapshot(get_search_window(), keyword)
     result_index, old_streak, previous_status = load_task_state(connection, keyword, project)
     known_result_count = int(connection.execute(
         "SELECT COUNT(*) FROM captured_article WHERE keyword=?", (keyword,)
@@ -6430,7 +6720,8 @@ def collect_live_keyword(
     recheck_exhausted = bool(config.get("recheck_legacy_exhausted", True))
     # Legacy builds finalized the first explicit empty page. Always re-open
     # that checkpoint, even when this generation has no local article rows.
-    # Normal complete_cutoff/complete_exhausted keywords are still skipped.
+    # This changes only the checkpoint of the exact task already being run;
+    # it does not reopen Redis tasks or reset per-video attempts/history.
     legacy_explicit_empty_checkpoint = previous_status.startswith(
         "complete_explicit_empty"
     )
@@ -6441,10 +6732,19 @@ def collect_live_keyword(
             "known_result_count": known_result_count,
             "previous_status": previous_status,
         }, ensure_ascii=False), flush=True)
-    if previous_status.startswith("complete_") and not asr_backfill_mode and not (
-        (previous_status == "complete_exhausted" and recheck_exhausted)
-        or legacy_explicit_empty_checkpoint
-    ):
+    recheck_annual = legacy_annual_rescan_required(
+        previous_status, asr_backfill=asr_backfill_mode,
+        recheck_exhausted=recheck_exhausted,
+    ) or (bool(os.environ.get('WECHAT_SEARCH_SCAN_RUN_TOKEN')) and not asr_backfill_mode)
+    if recheck_annual:
+        print(json.dumps({
+            'event': 'legacy_annual_checkpoint_rescan_from_top',
+            'keyword': keyword, 'previous_status': previous_status,
+            'previous_next_result_index': result_index,
+        }, ensure_ascii=False), flush=True)
+        result_index = 0
+        old_streak = 0
+    if previous_status.startswith("complete_") and not asr_backfill_mode and not recheck_annual:
         return {
             "keyword": keyword,
             "saved": 0,
@@ -6517,6 +6817,7 @@ def collect_live_keyword(
             (keyword,),
         ).fetchall()
         if row[0] not in incomplete_asr_keys
+        and not has_untrusted_transcript(row[1])
         and not asr_output_needs_review(row[1], row[2], config=config)
     }
     if retry_fingerprint or config.get('force_asr'):
@@ -6537,10 +6838,32 @@ def collect_live_keyword(
     consecutive_position_skips = 0
     seen_fingerprints_this_run: set[str] = set()
     status = "running"
+    search_end_proof = None
+    scan_started_at_top = result_index == 0 and valid_origin(search_origin, keyword)
     last_published_at: datetime | None = None
     update_task_state(connection, keyword, project, result_index, old_streak, status)
 
+    volume_local_target = None
+    if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1':
+        baseline = connection.execute(
+            'SELECT COUNT(DISTINCT article_key) FROM captured_article WHERE keyword=? AND project=?',
+            (keyword, project)).fetchone()[0]
+        volume_local_target = volume_export_local_target(baseline,
+            int(os.environ['SOCIAL_VOLUME_INITIAL_POSTS']),
+            int(os.environ['SOCIAL_VOLUME_TARGET_POSTS']))
+
     while max_results <= 0 or processed_this_run < max_results:
+        if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1' and not os.environ.get('WECHAT_RECOLLECT_ONCE'):
+            target = int(os.environ['SOCIAL_VOLUME_TARGET_POSTS'])
+            local_posts = connection.execute(
+                "SELECT COUNT(DISTINCT article_key) FROM captured_article WHERE keyword=? AND project=?",
+                (keyword,project)).fetchone()[0]
+            if local_posts >= volume_local_target:
+                # Stop only for export/import. The scheduler MUST independently
+                # re-read SQL before quantity acceptance; this is not scan proof.
+                status = 'complete_volume_export_pending'
+                update_task_state(connection,keyword,project,result_index,old_streak,status)
+                break
         if STOP_REQUESTED or (stop_file and stop_file.exists()):
             status = "partial_stopped"
             update_task_state(
@@ -6615,7 +6938,8 @@ def collect_live_keyword(
         # single load attempt could grow 36 -> 56 and then still access [120].
         exhausted_before_index = False
         no_growth_cycles = 0
-        exhaustion_cycles = max(2, int(config.get("exhaustion_confirmation_cycles", 3)))
+        exhaustion_cycles = max(3, int(config.get("exhaustion_confirmation_cycles", 3)))
+        search_end_tracker = SearchEndTracker(keyword, search_origin, scan_started_at_top)
         while result_index >= len(results):
             if (
                 result_index == 0
@@ -6741,12 +7065,25 @@ def collect_live_keyword(
                     exhausted_before_index = True
                     break
                 if no_growth_cycles >= exhaustion_cycles:
-                    status = "complete_exhausted"
+                    endpoint = search_end_tracker.observe(search_scan_surface_snapshot(
+                        get_search_window(), keyword, scanned_count=result_index,
+                        surface_generation=no_growth_cycles))
+                    if endpoint.get('ok'):
+                        status = 'complete_exhausted'
+                        search_end_proof = search_end_tracker.proof
+                    else:
+                        status = 'partial_search_end_unverified'
                     update_task_state(
-                        connection, keyword, project, result_index, old_streak, status
+                        connection, keyword, project, result_index, old_streak, status,
+                        None if endpoint.get('ok') else endpoint.get('reason')
                     )
+                    print(json.dumps({'event': 'search_end_evidence_checked', 'keyword': keyword,
+                                      'status': status, 'evidence': endpoint}, ensure_ascii=False), flush=True)
                     exhausted_before_index = True
                     break
+                search_end_tracker.observe(search_scan_surface_snapshot(
+                    get_search_window(), keyword, scanned_count=result_index,
+                    surface_generation=no_growth_cycles))
                 # Rebuild the exact same keyword/video/latest page between
                 # exhaustion probes. This borrows the公众号 anti-stall pattern:
                 # a lazy-load failure in one Chromium surface is not accepted
@@ -6837,7 +7174,8 @@ def collect_live_keyword(
         checkpoint_asr = str((checkpoint or {}).get("asr_status") or "")
         checkpoint_row = (checkpoint or {}).get("row") or {}
         checkpoint_asr_is_reusable = (
-            checkpoint_asr in {"no_content", "not_applicable"}
+            os.environ.get('SOCIAL_VOLUME_ENABLED')=='1'
+            or checkpoint_asr in {"no_content", "not_applicable"}
             or (
                 checkpoint_asr == "completed"
                 and bool(str(checkpoint_row.get("video_content") or "").strip())
@@ -6859,7 +7197,9 @@ def collect_live_keyword(
                 and checkpoint_status in {"completed", "completed_metadata"}
             )
         )
-        if completed_for_phase and not (retry_fingerprint or force_retranscribe(config, checkpoint)):
+        repair_reason = checkpoint_repair_reason(
+            checkpoint, collect_comments=collect_comments)
+        if completed_for_phase and not (os.environ.get('WECHAT_RECOLLECT_ONCE') or retry_fingerprint or force_retranscribe(config, checkpoint) or repair_reason):
             failed_index = result_index
             result_index += 1
             processed_this_run += 1
@@ -6883,11 +7223,10 @@ def collect_live_keyword(
                 "checkpoint_status": checkpoint_status,
                 "asr_status": checkpoint_asr,
             }, ensure_ascii=False), flush=True)
-            cutoff_old_streak = int(config.get("cutoff_old_streak", 0))
-            if cutoff_old_streak > 0 and old_streak >= cutoff_old_streak:
-                status = "complete_cutoff"
-                update_task_state(connection, keyword, project, result_index, old_streak, status)
-                break
+            if observe_old_date_window(config, old_streak):
+                print(json.dumps({'event': 'old_date_window_observed_not_search_end',
+                                  'keyword': keyword, 'old_streak': old_streak},
+                                 ensure_ascii=False), flush=True)
             continue
         # 搜一搜“视频”流会混排正在进行的直播。直播卡没有普通视频
         # 详情页/分享链接，反复点击只会永久留下 partial_error，阻塞下一
@@ -7078,28 +7417,36 @@ def collect_live_keyword(
                 # avoiding false positives from authors who reuse the same
                 # title and duration.  This saves the expensive comments/ASR
                 # phase while preserving one row per business topic.
-                local_duplicate = connection.execute(
+                local_duplicates = connection.execute(
                     "SELECT keyword, url FROM captured_article "
-                    "WHERE article_key=? AND project=? AND keyword<>? LIMIT 1",
+                    "WHERE article_key=? AND project=? AND keyword<>? ORDER BY keyword",
                     (candidate_key, project, keyword),
-                ).fetchone()
+                ).fetchall()
                 remote_duplicate = remote_store.get_global(project, candidate_key) \
                     if remote_store.enabled else None
-                remote_duplicate_ready = remote_duplicate and str(
-                    remote_duplicate.get("status") or ""
-                ) in {
-                    "completed", "completed_metadata", "dead_letter",
-                    "no_content", "not_applicable",
-                }
+                reuse_sources = [cp for duplicate in local_duplicates
+                    for cp in load_video_checkpoints(connection, duplicate[0]).values()
+                    if cp.get('article_key') == candidate_key]
+                if remote_duplicate:
+                    reuse_sources.append(remote_duplicate)
+                reusable = next((cp for cp in reuse_sources if (cp.get('row') or {}).get('keyword') != keyword
+                    and reusable_cross_keyword_checkpoint(
+                    cp, project=project, article_key=candidate_key, url=link,
+                    author=card['author_name'] or details['author_name'],
+                    duration=detail_duration or card['duration_seconds'], cutoff=cutoff,
+                    collect_comments=collect_comments)), None)
                 if (
                     published_at is not None and published_at >= cutoff
-                    and (local_duplicate or remote_duplicate_ready)
+                    and reusable is not None
                     and not (asr_backfill_mode and retry_fingerprint)
                 ):
-                    duplicate_keyword = (
-                        str(local_duplicate[0]) if local_duplicate
-                        else str(remote_duplicate.get("keyword") or "")
-                    )
+                    duplicate_keyword = reusable['row']['keyword']
+                    reused = persist_cross_keyword_reuse(connection, checkpoint=reusable,
+                        keyword=keyword, project=project, fingerprint=card_fingerprint,
+                        result_index=result_index, cutoff=cutoff, collect_comments=collect_comments,
+                        remote_store=remote_store)
+                    video_checkpoints[card_fingerprint] = reused
+                    saved += 1
                     return_to_search_results(config)
                     result_index += 1
                     processed_this_run += 1
@@ -7109,7 +7456,7 @@ def collect_live_keyword(
                         f"结果索引 {result_index - 1} 与关键词 {duplicate_keyword} 命中同一视频，已跨关键词去重",
                     )
                     print(json.dumps({
-                        "event": "cross_keyword_duplicate_skipped",
+                        "event": "cross_keyword_verified_data_reused",
                         "keyword": keyword,
                         "index": result_index - 1,
                         "duplicate_keyword": duplicate_keyword,
@@ -7162,6 +7509,7 @@ def collect_live_keyword(
                 else:
                     old_streak = 0
                     pending_asr = None
+                    optional_audio_error = None
                     # Reuse the same canonical share URL/finder-id key used by
                     # phase one and direct-link ASR enrichment. A title-only
                     # fingerprint can miss an existing transcription and cause
@@ -7174,13 +7522,14 @@ def collect_live_keyword(
                             "text_length": len(video_content or ""),
                         }, ensure_ascii=False), flush=True)
                     else:
-                        video_content, video_duration = capture_client_audio_asr(
+                        video_content, video_duration, optional_audio_error = capture_primary_audio_optional(
                             raw_card_text, web, {**config, '_capture_identity':{
                                 'title':title, 'author_name':card.get('author_name') or details.get('author_name')}},
                             duration_seconds=detail_duration or card["duration_seconds"],
                             prompt_context=None,
                             media_cache_before=media_cache_before,
                             during_capture_callback=collect_detail_fields_while_recording,
+                            stop_file=stop_file,
                         )
                         if isinstance(video_content, PendingClientAsr):
                             pending_asr = video_content
@@ -7212,6 +7561,10 @@ def collect_live_keyword(
                         share_count=share_count,
                     )
                     save_row(connection, saved_row)
+                    if optional_audio_error:
+                        save_collection_issue(connection, keyword, result_index,
+                            'optional_audio_failed_volume_policy', title,
+                            optional_audio_error, card_fingerprint)
                     if collect_comments:
                         save_comments(connection, saved_row, comments)
                     if asr_backfill_mode:
@@ -7232,7 +7585,10 @@ def collect_live_keyword(
                             else "completed" if video_content
                             else "pending"
                         )
+                    if optional_audio_error:
+                        asr_status = 'skipped_volume_policy'
                     checkpoint_status = (
+                        'completed_metadata' if optional_audio_error else
                         "completed" if asr_status in {"completed", "no_content", "not_applicable"}
                         else "retry_pending" if asr_status == "partial_review"
                         else "completed_metadata"
@@ -7249,8 +7605,9 @@ def collect_live_keyword(
                         comments=comments,
                         asr_status=asr_status,
                         last_error=(
-                            "ASR transcript is implausibly short for captured duration"
-                            if asr_status == "partial_review" else None
+                            optional_audio_error or (
+                                "ASR transcript is implausibly short for captured duration"
+                                if asr_status == "partial_review" else None)
                         ),
                         remote_store=remote_store,
                     )
@@ -7540,14 +7897,12 @@ def collect_live_keyword(
                 "graceful stop requested after current article",
             )
             break
-        # The search page is required to select 最新 before this loop starts.
-        # With cutoff_old_streak=1, the first dated article older than cutoff is
-        # the time boundary and completes the current keyword immediately.
-        cutoff_old_streak = int(config.get("cutoff_old_streak", 0))
-        if cutoff_old_streak > 0 and old_streak >= cutoff_old_streak:
-            status = "complete_cutoff"
-            update_task_state(connection, keyword, project, result_index, old_streak, status)
-            break
+        # 最新 does not prove strictly monotonic dates: pinned/interleaved
+        # results may put another target-year video after an old one.
+        if observe_old_date_window(config, old_streak):
+            print(json.dumps({'event': 'old_date_window_observed_not_search_end',
+                              'keyword': keyword, 'old_streak': old_streak},
+                             ensure_ascii=False), flush=True)
 
     if status == "running" and max_results > 0 and processed_this_run >= max_results:
         status = "partial_limit"
@@ -7657,6 +8012,7 @@ def collect_live_keyword(
         "next_result_index": result_index,
         "status": status,
         "complete": complete,
+        "searchEndProof": search_end_proof,
         "retry_pending": int(retry_pending_count),
         "dead_letters": int(dead_letter_count),
     }
@@ -7745,7 +8101,7 @@ def export_ods_local(
          favorite_count, share_count, video_content, video_duration, captured_at) = row
         # Keep the historical value in SQLite/backup, but never re-export an
         # identified internal-label contamination as a valid new subtitle.
-        if has_internal_prompt(video_content):
+        if has_untrusted_transcript(video_content):
             video_content = None
         if url in seen_urls:
             continue
@@ -7993,7 +8349,7 @@ def ingest_asr_enrichment(
             if isinstance(item, dict) and item.get("duration")
         ]
         duration = round(max(durations)) if durations else None
-        needs_review = has_internal_prompt(text) or asr_output_needs_review(text, duration, config=config)
+        needs_review = has_untrusted_transcript(text) or asr_output_needs_review(text, duration, config=config)
         asr_status = "partial_review" if needs_review else "completed"
         checkpoint_status = "retry_pending" if needs_review else "completed"
         for key, word in connection.execute('SELECT article_key, keyword FROM captured_article WHERE url=?', (url,)).fetchall():
@@ -8221,6 +8577,7 @@ def main() -> None:
     elif args.command == "keywords":
         print(json.dumps(load_keywords(Path(args.input), args.limit), ensure_ascii=False, indent=2))
     elif args.command == "collect-live":
+        scan_started_at = datetime.now().astimezone().isoformat()
         signal.signal(signal.SIGINT, request_graceful_stop)
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, request_graceful_stop)
@@ -8260,6 +8617,21 @@ def main() -> None:
         summaries = collect_keyword_sequence(
             selected, collect_one, allow_sample_transition=args.sample_transition,
         )
+        proof_file = os.environ.get('WECHAT_SEARCH_SCAN_PROOF_FILE')
+        if proof_file:
+            # Unique parent-provided file/token: never reuse a prior completed
+            # keyword report to confirm this process's primary delivery.
+            atomic_write_text(Path(proof_file), json.dumps({
+                'policy': SEARCH_SCAN_POLICY,
+                'runToken': os.environ.get('WECHAT_SEARCH_SCAN_RUN_TOKEN'),
+                'taskId': os.environ.get('WECHAT_REDIS_TASK_ID'),
+                'topic': os.environ.get('WECHAT_REDIS_TOPIC'),
+                'keyword': os.environ.get('WECHAT_REDIS_KEYWORD'),
+                'runId': os.environ.get('WECHAT_REDIS_RUN_ID'),
+                'generation': os.environ.get('WECHAT_REDIS_GENERATION'),
+                'startedAt': scan_started_at, 'finishedAt': datetime.now().astimezone().isoformat(),
+                'summaries': summaries,
+            }, ensure_ascii=False, indent=2))
         print(json.dumps({"summaries": summaries}, ensure_ascii=False, indent=2))
         # A partial keyword is not considered complete. The worker wrapper
         # will still export/import the rows already committed to SQLite, then
@@ -8279,4 +8651,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RedisCheckpointUnavailable as error:
+        print(json.dumps({"event": "redis_checkpoint_unavailable",
+            "errorType": str(error), "localCheckpointRetained": True,
+            "remoteSyncConfirmed": False, "exitCode": 75}), flush=True)
+        raise SystemExit(75)

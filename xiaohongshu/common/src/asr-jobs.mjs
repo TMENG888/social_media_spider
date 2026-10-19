@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { enqueueAsrJob, claimAsrJob, markAsrRunning, completeAsrJob, failAsrJob, deferAsrJob, asrJobStats } from "./checkpoint.mjs";
 import { cleanupCompletedAsrMedia } from "./asr-media-cleanup.mjs";
+import {assertMediaProvenance} from './media-provenance.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const runtimeUnavailable = error => /mkl_malloc|failed to allocate memory|cannot allocate memory|not enough memory|paging file|std::bad_alloc|ASR模型初始化超时/i.test(String(error?.message || error));
@@ -61,6 +62,9 @@ export class AsrJobProcessor {
     const mediaPath = this.mediaPath(job);
     const temporary = `${mediaPath}.part`;
     try {
+      // Fail before download for legacy or unbound jobs. Duration is checked
+      // again against the decoded file before any transcript can be committed.
+      assertMediaProvenance(job.mediaBinding,{noteId:job.noteId,url:job.mediaUrl,duration:job.mediaBinding?.expectedDuration});
       let size = 0;
       try { size = (await fs.stat(mediaPath)).size; } catch {}
       if (!size) {
@@ -77,6 +81,7 @@ export class AsrJobProcessor {
       // The first pass uses the note context. A quality retry drops the prompt
       // so a bad title/tag hint cannot be echoed into the transcript again.
       const output = await this.service.transcribePath(mediaPath, job.articleId || job.noteId, job.attempts === 1 ? job.prompt : null);
+      assertMediaProvenance(job.mediaBinding,{noteId:job.noteId,url:job.mediaUrl,duration:output.audit?.duration});
       if (!output.text && output.audit?.status === "quality_rejected") {
         const qualityError = new Error(`ASR_QUALITY_REJECTED：${output.audit?.quality?.reason || "字幕完整性或幻觉检测未通过"}`);
         qualityError.audit = output.audit;
@@ -91,6 +96,11 @@ export class AsrJobProcessor {
       await this.cleanupMedia(job);
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => {});
+      if(String(error.message||error).startsWith('MEDIA_SOURCE_DURATION_MISMATCH')){
+        // Retain the rejected bytes for diagnosis, but do not keep retrying
+        // the same poisoned cache file without a fresh download.
+        await fs.rename(mediaPath,`${mediaPath}.source-rejected-${job.attempts}`).catch(()=>{});
+      }
       if (runtimeUnavailable(error)) {
         deferAsrJob(this.db, job, error);
         this.haltedReason = String(error.message || error).split("\n")[0];

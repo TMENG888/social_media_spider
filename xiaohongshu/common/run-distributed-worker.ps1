@@ -54,6 +54,10 @@ function Save-DpapiPassword([string]$Path,[string]$Password){
     Move-Item -LiteralPath $Temporary -Destination $Path -Force
   } finally {$Secure.Dispose()}
 }
+function Complete-OwnedRuntimeStop([string]$CycleId){
+  & $Node (Join-Path $Common 'src\runtime-stop.mjs') --queue $Queue --root $Common --supervisor-stop $SupervisorStop --cycle-id $CycleId | Out-Host
+  return $LASTEXITCODE
+}
 try {
   Set-Location -LiteralPath $Common
   if(-not(Test-Path -LiteralPath $WorkerState)){New-Item -ItemType Directory -Path $WorkerState -Force|Out-Null}
@@ -124,8 +128,14 @@ try {
       if($LASTEXITCODE -ne 0){throw 'Shared cooldown requires manual action or cannot be verified. Collection not started.'}
     }
     Set-MonitorSupervisorState 'collecting'
-    & $Node 'src\run-worker.mjs' '--mode' $Mode '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $MaxRuntimeMinutes
+    $CycleId=[Guid]::NewGuid().ToString('N')
+    & $Node 'src\run-worker.mjs' '--mode' $Mode '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $MaxRuntimeMinutes '--cycle-id' $CycleId
     $RunExitCode=$LASTEXITCODE
+    if($RunExitCode -eq 0){
+      $ResumeCheck=Complete-OwnedRuntimeStop $CycleId
+      if($ResumeCheck -eq 20){$RemoteFinalState='stopped'}
+      elseif($ResumeCheck -ne 0){$RunExitCode=1}
+    }
   } else {
     $RunExitCode=0
     $CycleNumber=0
@@ -141,12 +151,13 @@ try {
       $CycleRuntime=Get-Random -Minimum $CycleRunMinMinutes -Maximum ($CycleRunMaxMinutes+1)
       Write-Host "[Cycle supervisor] Cycle ${CycleNumber} started; runtime=${CycleRuntime} minutes. Any unfinished task will be safely released."
       Set-MonitorSupervisorState 'collecting'
-      & $Node 'src\run-worker.mjs' '--mode' 'run' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $CycleRuntime
+      $CycleId=[Guid]::NewGuid().ToString('N')
+      & $Node 'src\run-worker.mjs' '--mode' 'run' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $CycleRuntime '--cycle-id' $CycleId
       $RunExitCode=$LASTEXITCODE
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Stop is active; no new cycle will start.';break}
       if($RunExitCode -eq 5){Write-Warning '[Cycle supervisor] Redis lease safety stop: local data is preserved and the unfinished task was not acknowledged. Restore Redis, then start this worker again.';break}
       if($RunExitCode -eq 76){Write-Host '[Cycle supervisor] Rate limit recorded. Entering shared cooldown before any next cycle.';$RunExitCode=0;continue}
-      if($RunExitCode -eq 77){Write-Warning '[Cycle supervisor] Third rate limit or manual restriction: automatic resume disabled.';break}
+      if($RunExitCode -eq 77){Write-Warning '[Cycle supervisor] Login/CAPTCHA recorded; waiting for operator confirmation before another cycle.';$RunExitCode=0;continue}
       if($RunExitCode -ne 0){Write-Warning "[Cycle supervisor] Cycle exited abnormally (code $RunExitCode); automatic restart is disabled to prevent repeated access.";break}
 
       $WorkerStatusPath=Join-Path $Worker 'runs\worker_status.json'
@@ -164,6 +175,9 @@ try {
       if(-not(Test-Path -LiteralPath $QueueStatusPath)){Write-Warning '[Cycle supervisor] Redis progress file is missing; automatic restart is disabled to avoid looping in an unknown state.';$RunExitCode=1;break}
       try{$QueueStatus=Get-Content -LiteralPath $QueueStatusPath -Raw -Encoding UTF8|ConvertFrom-Json}catch{Write-Warning '[Cycle supervisor] Redis progress file cannot be read; automatic restart is disabled.';$RunExitCode=1;break}
       if([int]$QueueStatus.counts.failed -gt 0){Write-Warning "[Cycle supervisor] Redis has $($QueueStatus.counts.failed) exhausted task(s); manual action is required.";$RunExitCode=1;break}
+      $ResumeCheck=Complete-OwnedRuntimeStop $CycleId
+      if($ResumeCheck -eq 20){$RemoteFinalState='stopped';Write-Host '[Cycle supervisor] Stop request retained; no further cycle will start.';break}
+      if($ResumeCheck -ne 0){$RunExitCode=1;break}
       if([int]$QueueStatus.counts.pending -eq 0 -and [int]$QueueStatus.counts.leased -eq 0){Write-Host '[Cycle supervisor] All Redis tasks are complete; worker is stopping.';break}
 
       $RestMinutes=Get-Random -Minimum $CycleRestMinMinutes -Maximum ($CycleRestMaxMinutes+1)

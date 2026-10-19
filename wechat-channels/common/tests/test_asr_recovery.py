@@ -620,6 +620,25 @@ class AsrRecoveryTests(unittest.TestCase):
         self.assertEqual(text, "真实口播内容")
         self.assertTrue(audit["low_speech_density_warning"])
 
+    def test_raw_subtitle_artifacts_cannot_be_cleaned_into_success(self):
+        for raw in (
+            '人大附近中海住宅，中文字幕志愿者刘娅中文字幕组，近中海环宇城',
+            '真实口播，请不吝点赞订阅转发打赏支持明镜与点点栏目',
+            '真实口播，AMARA.ORG',
+            '真实口播，字幕 BY 索兰娅',
+        ):
+            with self.subTest(raw=raw):
+                text, audit = collector.assess_asr_text_quality(raw, capture_seconds=69, speech_seconds=40)
+                self.assertIsNone(text)
+                self.assertFalse(audit['accepted'])
+                self.assertEqual(audit['reason'], 'known_whisper_hallucination')
+                with self.assertRaises(collector.AsrQualityRejectedError):
+                    collector.require_trustworthy_asr_result(text, [{'quality': audit}])
+        for raw in ('字幕展示的是户型尺寸，客厅面宽六米', '欢迎观看样板间，感谢大家支持'):
+            text, audit = collector.assess_asr_text_quality(raw, capture_seconds=10, speech_seconds=5)
+            self.assertEqual(text, raw)
+            self.assertTrue(audit['accepted'])
+
     def test_spoken_caption_is_not_rejected_as_prompt_echo(self):
         text, audit = collector.assess_asr_text_quality(
             "华润臻澐值得买吗",

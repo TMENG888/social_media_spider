@@ -1,4 +1,7 @@
 import fs from "node:fs/promises";
+import {verifyCheckpointCoverage} from './coverage-gate.mjs';
+import {supportedCorrectionPolicy} from './correction-lease.mjs';
+import {keywordQueueConfirmed as volumeQueueConfirmed,reconcileVolumeCompletion} from './volume-confirmation.mjs';
 import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import readline from "node:readline/promises";
@@ -13,12 +16,14 @@ import { repairInvalidArticleLinks } from "./link-repair.mjs";
 import { summarizeWorkerTasks } from "./worker-status.mjs";
 import { collectionFailurePolicy } from "./collection-failure.mjs";
 import { runAuthorPhase } from "./run-author-phase.mjs";
-import { verifyTable } from "./import-mysql.mjs";
+import { verifyTable, mysqlConnectionOptions } from "./import-mysql.mjs";
 import { POST_FIELDS, COMMENT_FIELDS } from "./schema.mjs";
 import { IMPORT_PENDING_EXIT_CODE, importTaskState } from "./import-recovery.mjs";
 import { RateLimitCooldown, restrictionKind, cooldownWorkerExit } from "./rate-limit-cooldown.mjs";
 import { cleanupWorkerAsrMedia } from "./cleanup-worker-asr-media.mjs";
 import {unchangedRetry} from './retry-no-change.mjs';
+import {writeRuntimeStop, recoverOrphanRuntimeStop} from './runtime-stop.mjs';
+import {appendDiagnosticEvent} from './page-diagnostics.mjs';
 
 const root = path.resolve(process.env.XHS_WORKER_ROOT || ".");
 const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, index, all) => {
@@ -31,16 +36,21 @@ if(!['auto','posts','authors'].includes(phase))throw new Error('phase只允许au
 const dispatchMode = String(args.dispatch || process.env.XHS_DISPATCH || "local");
 if (!["local", "redis"].includes(dispatchMode)) throw new Error("dispatch只允许local或redis");
 const onlyTaskId=args['only-task-id']?String(args['only-task-id']):null;
+const correctionPolicy=args['correction-policy']?String(args['correction-policy']):null;
+if(correctionPolicy&&(!supportedCorrectionPolicy(correctionPolicy)||!onlyTaskId))throw new Error('CORRECTION_REQUIRES_EXACT_TASK_AND_CURRENT_POLICY');
 if(onlyTaskId){
   if(dispatchMode!=='redis')throw new Error('SELECTED_TASK_REQUIRES_REDIS');
   const selectedManifest=await loadTaskManifest(path.join(root,'tasks','redis-tasks.json'));
   if(!selectedManifest.tasks.some(t=>(t.redisTaskId||t.id)===onlyTaskId))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
 }
 const skipImport = args["skip-import"] === true || args["skip-import"] === "true" || process.env.XHS_SKIP_IMPORT === "true";
+const configuredAcceptance=await fs.readFile(path.join(root,'acceptance-policy.json'),'utf8').then(v=>JSON.parse(v.replace(/^\uFEFF/,'')),e=>{if(e.code==='ENOENT')return null;throw e;});
+const volumePolicyEnabled=dispatchMode==='redis'&&!skipImport&&configuredAcceptance?.enabled===true;
 if(onlyTaskId&&(skipImport||phase!=='posts'))throw new Error('SELECTED_TASK_REQUIRES_PRODUCTION_POSTS_PHASE');
 if(phase==='authors' && (dispatchMode!=='redis'||skipImport))throw new Error('作者阶段只支持Redis生产模式，回填数据表需要MySQL；不会回退到本地分片');
 const queueFile = path.resolve(String(args.queue || path.join(root, "tasks", "task-queue.json")));
 const maxRuntimeMinutes = Number(args["max-runtime-minutes"] || 0);
+const cycleId = args['cycle-id'] ? String(args['cycle-id']) : null;
 if (!Number.isFinite(maxRuntimeMinutes) || maxRuntimeMinutes < 0) throw new Error("max-runtime-minutes必须为非负数");
 const queue = JSON.parse(await fs.readFile(queueFile, "utf8"));
 const workerId = queue.workerId || String(args.worker || "worker-unknown");
@@ -132,7 +142,7 @@ async function environmentCheck() {
     asrPythonExists: path.isAbsolute(asrPython) ? await exists(asrPython) : true,
     asrEnabled: config.asrEnabled !== false, asrDependenciesReady: config.asrEnabled === false,
     asrModelReady: config.asrEnabled === false,
-    asrAutoInstall: config.asrAutoInstall !== false, asrBootstrapAttempted: false,
+    asrAutoInstall: !volumePolicyEnabled&&config.asrAutoInstall !== false, asrBootstrapAttempted: false,
     writable: true
   };
   if (checks.asrEnabled && checks.asrPythonExists) {
@@ -175,7 +185,8 @@ async function environmentCheck() {
     await fs.writeFile(probe, "ok", "utf8");
     await fs.unlink(probe);
   } catch { checks.writable = false; }
-  checks.ok = !manifestError && checks.queueExists && checks.taskCount > 0 && checks.browserExists && checks.indexExists && checks.checkpointModuleExists && checks.importerExists && checks.asrPythonExists && checks.asrDependenciesReady && checks.asrModelReady && checks.writable;
+  checks.asrRequiredForAcceptance=!volumePolicyEnabled;
+  checks.ok = !manifestError && checks.queueExists && checks.taskCount > 0 && checks.browserExists && checks.indexExists && checks.checkpointModuleExists && checks.importerExists && (volumePolicyEnabled || checks.asrPythonExists && checks.asrDependenciesReady && checks.asrModelReady) && checks.writable;
   await writeJsonAtomic(path.join(stateRoot, "environment_check.json"), checks);
   return checks;
 }
@@ -210,8 +221,9 @@ await acquireLock();
 const stopFile = path.join(stateRoot, "stop.requested");
 const {RemoteStopControl}=await import('./remote-stop-control.mjs');
 const supervisorStopFile = process.env.XHS_SUPERVISOR_STOP_FILE ? path.resolve(process.env.XHS_SUPERVISOR_STOP_FILE) : null;
-// 人工停止可能恰好发生在周期监督器启动下一轮的瞬间；此时不能删除其已写入的stop.requested。
-if (!supervisorStopFile || !await exists(supervisorStopFile)) await fs.unlink(stopFile).catch(() => {});
+// A launch is not authorization to erase a human, remote, or safety hold.
+// Only a verified timer whose owning process has exited can be archived on
+// startup. Human/remote/safety stops and newer requests remain authoritative.
 let stopSignalCount = 0;
 const requestStop = async (signal) => {
   stopSignalCount += 1;
@@ -236,15 +248,14 @@ async function promptCredentials() {
 }
 
 async function verifyDatabaseConnection() {
-  const host = String(process.env.MYSQL_HOST || "127.0.0.1");
-  const port = Number(process.env.MYSQL_PORT || 3306);
-  const database = String(process.env.MYSQL_DATABASE || "social");
+  const connectionOptions = mysqlConnectionOptions();
+  const { host, port, database } = connectionOptions;
   const statusPath = path.join(stateRoot, "mysql_connection_check.json");
   const status = { checkedAt: now(), host, port, database, user: process.env.MYSQL_USER, connected: false, tables: {}, writePermission: false };
   console.log(`[数据库预检] 正在连接 ${host}:${port}/${database}`);
   let connection;
   try {
-    connection = await mysql.createConnection({ host, port, database, user: process.env.MYSQL_USER, password: process.env.MYSQL_PASSWORD, charset: "utf8mb4", connectTimeout: 15000 });
+    connection = await mysql.createConnection(connectionOptions);
     await connection.query("SELECT 1");
     for (const table of ["ods_social_media_post", "ods_social_media_comment"]) {
       const fields = table === "ods_social_media_post" ? POST_FIELDS : COMMENT_FIELDS;
@@ -279,12 +290,33 @@ const runChild = (childArgs, env = {}) => new Promise((resolve) => {
 let browserProcess = null;
 let dispatcher = null;
 let runtimeTimer = null;
+let runtimeStopRequest = null;
 let fatalError = null;
 let remoteControl=null;
 let cooldown=null, stopCooldownMonitor=null, cooldownMonitorError=null;
 const statusFile = path.join(runsRoot, "worker_status.json");
-let status = { workerId, mode, dispatchMode, startedAt: now(), finishedAt: null, tasks: [] };
+let status = { workerId, mode, dispatchMode, cycleId, startedAt: now(), finishedAt: null, tasks: [] };
+let diagnosticPhase='starting',lifecycleQueue=Promise.resolve(),diagnosticKeyword='';
+const lifecycleFile=path.join(runsRoot,'collection-lifecycle-'+now().slice(0,10)+'.jsonl');
+function markLifecycle(stage,details={}) {
+  const previousPhase=diagnosticPhase;diagnosticPhase=stage;
+  const event={at:new Date().toISOString(),workerId,cycleId,keyword:diagnosticKeyword,stage,previousPhase,...details};
+  lifecycleQueue=lifecycleQueue.then(()=>appendDiagnosticEvent(lifecycleFile,event));
+  return lifecycleQueue;
+}
+await markLifecycle('worker_started');
 try {
+  status.startupStopRecovery = await recoverOrphanRuntimeStop({stopFile,
+    supervisorStopFile, workerId, cycleId});
+  if (status.startupStopRecovery.reason !== 'no_stop_marker') {
+    console.log('[停止标记核查] ' + JSON.stringify(status.startupStopRecovery));
+    await markLifecycle('startup_stop_recovery', status.startupStopRecovery);
+  }
+  if (!status.startupStopRecovery.ready)
+    throw Object.assign(new Error('STOP_REQUESTED：停止标记保留，原因=' + status.startupStopRecovery.reason
+      + '；未领取任务或访问平台'), {code:'STOP_REQUESTED'});
+  if(await exists(stopFile) || supervisorStopFile && await exists(supervisorStopFile))
+    throw Object.assign(new Error('STOP_REQUESTED：已有停止标记，未领取任务或访问平台'),{code:'STOP_REQUESTED'});
   if(dispatchMode==='redis' && !skipImport){
     remoteControl=await RemoteStopControl.open(root,path.dirname(stateRoot));
     await remoteControl.gate();remoteControl.watch();
@@ -345,18 +377,26 @@ try {
     status.deadline = new Date(deadline).toISOString();
     console.log(`[限时采集] 已启动${maxRuntimeMinutes}分钟计时；到时安全停止，不强制打断当前笔记或ASR`);
     runtimeTimer = setTimeout(() => {
+      markLifecycle('runtime_limit_reached',{minutes:maxRuntimeMinutes,phaseAtDeadline:diagnosticPhase});
       console.warn(`[限时采集] 已到${maxRuntimeMinutes}分钟，发出安全停止请求`);
-      fs.writeFile(stopFile, `runtime limit ${maxRuntimeMinutes} minutes ${now()}\n`, "utf8").catch(() => {});
+      runtimeStopRequest = writeRuntimeStop({stopFile, supervisorStopFile, cycleId, workerId,
+        minutes: maxRuntimeMinutes}).then(marker => {
+          if (marker) status.runtimeStop = marker;
+        }).catch(error => {
+          fatalError ||= error;
+          console.warn('[Cycle stop] Runtime stop marker could not be saved; automatic resume disabled.');
+        });
     }, Math.max(1, deadline - Date.now()));
   }
 
-  for await (const [taskIndex, task] of (phase==='authors' ? [] : dispatcher ? dispatcher.tasks({taskId:onlyTaskId}) : tasks.entries())) {
+  for await (const [taskIndex, task] of (phase==='authors' ? [] : dispatcher ? dispatcher.tasks({taskId:onlyTaskId,...(correctionPolicy?{correctionPolicy}:{})}) : tasks.entries())) {
     if (await exists(stopFile)) break;
     console.log(`[工作节点进度] ${workerId}：本机第${taskIndex + 1}词${dispatcher ? `（全局任务池${dispatcher.manifest.taskCount}词）` : `/${tasks.length}`}，开始关键词“${task.keyword}”，专题=${task.topic || ""}，评论=${task.collectComments !== false ? "采集" : "不采集"}`);
-    const taskSubdir = dispatcher ? path.join("redis", dispatcher.campaign, task.topic || "default", `${slug(task.keyword)}-${task.redisTaskId.slice(-12)}`) : path.join(task.topic || "default", slug(task.keyword));
+    const baseSubdir = dispatcher ? path.join("redis", dispatcher.campaign, task.topic || "default", `${slug(task.keyword)}-${task.redisTaskId.slice(-12)}`) : path.join(task.topic || "default", slug(task.keyword));
+    const taskSubdir=dispatcher?.current?.recollectionPolicy?path.join(baseSubdir,dispatcher.current.recollectionPolicy):baseSubdir;
     const taskDir = path.join(runsRoot, taskSubdir);
     const stateDir = path.join(stateRoot, taskSubdir);
-    const taskEnv = { ...childEnv, ...dispatcher?.env() };
+    const taskEnv = { ...childEnv, ...dispatcher?.env(),XHS_MEDIA_CORRECTION_ARCHIVE:path.join(stateDir,'media-corrections','mysql-subtitles.jsonl') };
     const checkpointDb = path.join(stateDir, "checkpoint.sqlite");
     const taskStatusPath = path.join(taskDir, "task_status.json");
     await fs.mkdir(taskDir, { recursive: true });
@@ -365,7 +405,7 @@ try {
     try { previous = JSON.parse(await fs.readFile(taskStatusPath, "utf8")); } catch {}
     let importedAlready = false;
     try { importedAlready = JSON.parse(await fs.readFile(path.join(taskDir, "mysql_import_status.json"), "utf8")).status === "success"; } catch {}
-    if (!dispatcher && mode === "run" && previous?.policyVersion === POLICY_VERSION && previous?.scopeAcceptance?.acceptanceVersion===ACCEPTANCE_VERSION && previous?.searchAcceptance?.ok===true && previous?.status === "completed" && (skipImport || importedAlready)) {
+    if (!dispatcher && mode === "run" && previous?.policyVersion === POLICY_VERSION && previous?.coverage?.policy==='20261015-scoped-usable-db-80-v3' && previous.coverage.ok===true && previous?.scopeAcceptance?.acceptanceVersion===ACCEPTANCE_VERSION && previous?.searchAcceptance?.ok===true && previous?.status === "completed" && !skipImport && importedAlready) {
       console.log(`[工作节点进度] ${workerId}：${taskIndex + 1}/${tasks.length}，已完成，跳过“${task.keyword}”`);
       status.tasks.push({ ...previous, skipped: true });
       continue;
@@ -415,6 +455,8 @@ try {
       configArgs.push("--config", taskConfig);
     }
     await cooldown?.assertReady();
+    diagnosticKeyword=task.keyword;
+    await markLifecycle('collector_started',{runId});
     const result = await runChild([
       path.join(root, "src", "index.mjs"), "--query", task.keyword,
       ...configArgs,
@@ -438,20 +480,24 @@ try {
       if (reported.runId === runId) collector = reported;
     } catch {}
     if (result.code !== 0 && collector.status === "completed") collector.status = "partial_error";
+    await markLifecycle('collector_finished',{runId,collectorStatus:collector.status,collectorExitCode:result.code,
+      firstFailureAt:collector.firstFailureAt||null,error:collector.error||null,pageDiagnostics:collector.pageDiagnostics||null});
     // Same event ID as collector: fallback publication cannot count a second incident.
     if(cooldown && restrictionKind(collector.error)){
       try{await cooldown.record(collector.error,'post:'+runId);}
       catch(error){
         // Keep preserving/importing the collected data, but fail closed on restart.
         fatalError ||= error;
-        await fs.writeFile(stopFile,'COOLDOWN_STATE_UNAVAILABLE','utf8');
+        await fs.writeFile(stopFile,'COOLDOWN_STATE_UNAVAILABLE',{encoding:'utf8',flag:'wx'}).catch(e=>{if(e.code!=='EEXIST')throw e;});
       }
     }
     let importResult = null;
     if (!skipImport && !dispatcher?.lost && await exists(path.join(taskDir, "ods_social_media_post.jsonl"))) {
       await dispatcher?.verify();
       console.log(`[数据保全入库] ${workerId}：${task.keyword}，采集状态=${collector.status}`);
+      await markLifecycle('preservation_import_started',{runId,collectorStatus:collector.status});
       importResult = await runChild([path.join(root, "src", "import-mysql.mjs"), "--input-dir", taskDir, "--commit", "--auto-approved"], taskEnv);
+      await markLifecycle('preservation_import_finished',{runId,importExitCode:importResult.code});
       console.log(`[数据保全入库] ${workerId}：${task.keyword}，${importResult.code === 0 ? "成功" : `失败（退出码${importResult.code}）`}`);
     }
     let taskState = collector.status || (result.code === 0 ? "completed" : "partial_error");
@@ -463,24 +509,38 @@ try {
       status:taskState,error:collector.error||'',stopped:stopping,importOk:!skipImport&&importResult?.code===0,
       runtimeUnavailable:collector.asrJobs?.runtimeUnavailable||observation.asrDrainConfirmed===false,
       pendingAsr:collector.asrJobs?.pendingTotal||0});
-    const acceptanceVerified=collector.searchAcceptance?.ok===true&&collector.scopeAcceptance?.ok===true&&collector.scopeAcceptance.acceptanceVersion===ACCEPTANCE_VERSION;
-    if(noChange&&acceptanceVerified)taskState='completed_with_skips';
-    if(["completed","completed_with_skips"].includes(taskState)&&!acceptanceVerified){
-      taskState='incomplete';collector.error=!collector.scopeAcceptance?.ok?'SCOPE_UNVERIFIED':'SEARCH_END_UNVERIFIED';
+    let coverage={ok:false,reason:'DB_READBACK_NOT_PERFORMED'};
+    if(dispatcher?.volume&&!dispatcher.lost&&!stopping){
+      try{coverage=await dispatcher.volume.read(task.redisTaskId||task.id);if(coverage.ok)taskState='completed';}
+      catch(error){coverage={ok:false,reason:'DB_READBACK_FAILED',errorCode:error.code||'READBACK_ERROR'};}
+    }else if(!skipImport&&importResult?.code===0&&!dispatcher?.lost&&!stopping){
+      try{coverage=await verifyCheckpointCoverage({checkpointDb,keyword:task.keyword,scanComplete:collector.searchAcceptance?.ok===true,year:Number(cutoff.slice(0,4)),cutoff,strictMedia:true});}
+      catch(error){coverage={ok:false,reason:'DB_READBACK_FAILED',errorCode:error.code||'READBACK_ERROR'};}
     }
-    const completed = ["completed","completed_with_skips"].includes(taskState) && (skipImport || importResult?.code === 0);
+    const acceptanceVerified=dispatcher?.volume?coverage.ok===true:collector.searchAcceptance?.ok===true&&coverage.ok===true;
+    if(coverage.ok&&coverage.unresolved&&['completed','completed_with_skips'].includes(taskState))taskState='completed_with_skips';
+    if(["completed","completed_with_skips"].includes(taskState)&&!acceptanceVerified){
+      taskState='incomplete';collector.error=coverage.reason||'SEARCH_END_UNVERIFIED';
+    }
+    let completed = ["completed","completed_with_skips"].includes(taskState) && (dispatcher?.volume ? coverage.ok===true : skipImport || importResult?.code === 0);
     const record = { workerId, runId, policyVersion: POLICY_VERSION, searchSummaries: collector.searchSummaries || [], taskId: task.id || null, topic: task.topic || null, keyword: task.keyword, projectName: task.projectName || null, collectComments: task.collectComments !== false, startedAt, finishedAt: now(), status: completed ? "completed" : taskState, exitCode: result.code, importExitCode: importResult?.code ?? null, outputDir: taskDir, stateDir, checkpointDb, posts: collector.posts ?? null, commentThreads: collector.commentThreads ?? null, error: collector.error || null };
     Object.assign(record,{deadLetterNotes:collector.deadLetterNotes||0,collectionCompleteness:collector.collectionCompleteness||null,asrJobs:collector.asrJobs||null,
-      searchAcceptance:collector.searchAcceptance||null,scopeAcceptance:collector.scopeAcceptance||null});
+      searchAcceptance:collector.searchAcceptance||null,scopeAcceptance:collector.scopeAcceptance||null,coverage,
+      firstFailureAt:collector.firstFailureAt||null,pageDiagnostics:collector.pageDiagnostics||null});
     if(completed && taskState==='completed_with_skips')record.status=taskState;
-    if(noChange&&acceptanceVerified)Object.assign(record,{disposition:'no_change',accepted:false,noChangeEvidence:noChange,originalError:record.error,completionReason:'真实重采结果与原断点相同；结束异常任务，不代表内容完整'});
+    if(noChange)record.stagnationEvidence=noChange;
+    if(completed)record.accepted=coverage.ok;
     if (dispatcher) {
       const finishKind = completed ? "complete" : stopping ? "release" : taskState==="asr_review_required" ? "review" : ["login_required", "risk_controlled", "web_unavailable", "asr_deferred", "import_pending"].includes(taskState) ? "defer" : "fail";
       try {
         const confirmation = await dispatcher.finish(finishKind, record);
-        record.redisConfirmed = finishKind === "complete";
+        record.redisConfirmed = volumeQueueConfirmed(confirmation) || !dispatcher.volume&&finishKind === "complete"&&['completed','completed_with_skips'].includes(confirmation?.status);
+        if(dispatcher.volume&&(finishKind==='complete'||volumeQueueConfirmed(confirmation))){
+          Object.assign(record,reconcileVolumeCompletion(record,confirmation));
+          completed=record.redisConfirmed;taskState=record.status;
+        }
         record.redisReleased = finishKind === "release";
-        record.redisFailedHandled = ["fail","review","defer"].includes(finishKind);
+        record.redisFailedHandled = !record.redisConfirmed&&(["fail","review","defer"].includes(finishKind)||dispatcher.volume&&finishKind==='complete');
         record.requiresHumanReview = finishKind === "review";
         record.redisDisposition = String(confirmation?.status || finishKind);
       } catch (error) {
@@ -501,7 +561,7 @@ try {
       break;
     }
     if (!completed) {
-      console.warn(`[工作节点进度] 关键词“${task.keyword}”未完整完成（状态=${record.status}），数据已保全${dispatcher ? "，任务已退回有限重试队列" : "，下次启动从断点恢复"}`);
+      console.warn(`[工作节点进度] 关键词“${task.keyword}”未通过验收（状态=${record.status}），数据已保全；Redis处置=${record.redisDisposition||'未使用Redis'}`);
       const failure = collectionFailurePolicy(record.error);
       if (failure.stopNode && !failure.release) {
         throw Object.assign(new Error(`NODE_STOP_AFTER_COLLECTION_FAILURE：${record.error || record.status}；已停止领取后续任务`), {code:'COLLECTION_CONTEXT_FAILURE'});
@@ -518,7 +578,7 @@ try {
 } catch (error) {
   fatalError = error;
   if(['RATE_LIMIT_COOLDOWN_ACTIVE','COOLDOWN_MANUAL_REQUIRED'].includes(error.code))
-    await fs.writeFile(stopFile,error.code,'utf8').catch(()=>{});
+    await fs.writeFile(stopFile,error.code,{encoding:'utf8',flag:'wx'}).catch(()=>{});
   console.warn(`[工作节点停止] ${error.code || "ERROR"}：${String(error.message || error).split("\n")[0]}`);
 } finally {
   await stopCooldownMonitor?.();
@@ -528,6 +588,7 @@ try {
   }
   if(cooldownMonitorError?.code==='COOLDOWN_STATE_UNAVAILABLE')fatalError ||= cooldownMonitorError;
   clearTimeout(runtimeTimer);
+  await runtimeStopRequest;
   await dispatcher?.close({ stopped: stopSignalCount > 0 || await exists(stopFile) }).catch(error => {
     // A failed release/confirmation must take precedence over a benign cooldown.
     fatalError = error;
@@ -537,9 +598,21 @@ try {
   status.finishedAt = now();
   Object.assign(status, summarizeWorkerTasks(status.tasks));
   if (dispatcher?.lastStats) status.globalQueue = dispatcher.lastStats.counts;
+  status.fatalError = fatalError ? String(fatalError.message || fatalError) : null;
+  status.manualStopRequested = stopSignalCount > 0;
+  status.exitCode = cooldownWorkerExit({fatalError,lost:dispatcher?.lost,status});
+  status.cycleResumeEligible = status.exitCode === 0 && !status.manualStopRequested && !fatalError;
+  status.exitDiagnosis={runtimeLimitObserved:Boolean(status.runtimeStop),manualStopRequested:status.manualStopRequested,
+    fatalError:status.fatalError,taskStatuses:status.tasks.map(task=>({keyword:task.keyword,status:task.status,importExitCode:task.importExitCode})),
+    automaticResumeEligible:status.cycleResumeEligible,lifecycleFile};
+  await markLifecycle('worker_exit_decided',{exitCode:status.exitCode,...status.exitDiagnosis});
+  console.log('[退出判定] '+JSON.stringify({workerId,exitCode:status.exitCode,
+    runtimeLimitObserved:status.exitDiagnosis.runtimeLimitObserved,automaticResumeEligible:status.cycleResumeEligible,
+    taskStatuses:status.tasks.map(task=>task.status),lifecycleFile}));
   await writeJsonAtomic(statusFile, status).catch(() => {});
   if (browserProcess && !browserProcess.killed) browserProcess.kill();
-  await fs.unlink(stopFile).catch(() => {});
+  // A request written during shutdown is still authoritative. The next
+  // explicitly authorized launch, not this exiting worker, owns clearing it.
   await lockHandle?.close().catch(() => {});
   await fs.unlink(lockFile).catch(() => {});
   await cooldown?.close().catch(()=>{});

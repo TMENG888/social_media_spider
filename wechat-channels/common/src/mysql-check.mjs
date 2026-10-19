@@ -2,16 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
 import { atomicWriteFileSync } from './atomic-file.mjs';
+import {mysqlConnectionOptions} from './mysql-connection-options.mjs';
 
 const args = {};
 for (let i = 2; i < process.argv.length; i += 1) {
   if (process.argv[i].startsWith('--')) args[process.argv[i].slice(2)] = process.argv[++i];
 }
-const host = process.env.MYSQL_HOST || '127.0.0.1';
-const port = Number(process.env.MYSQL_PORT || 3306);
-const database = process.env.MYSQL_DATABASE || 'social';
-const user = process.env.MYSQL_USER;
-const password = process.env.MYSQL_PASSWORD;
+const connectionOptions=mysqlConnectionOptions();
+const {host,port,database,user,password}=connectionOptions;
 const statusFile = args.status ? path.resolve(args.status) : null;
 const writeStatus = (status) => {
   if (statusFile) {
@@ -23,11 +21,7 @@ const writeStatus = (status) => {
 if (!user || !password) throw new Error('MYSQL_USER and MYSQL_PASSWORD are required');
 let connection;
 try {
-  connection = await mysql.createConnection({
-    host, port, user, password, database, charset: 'utf8mb4',
-    connectTimeout: 15000,
-    ssl: /^(1|true|yes)$/i.test(process.env.MYSQL_SSL || '') ? {} : undefined,
-  });
+  connection = await mysql.createConnection(connectionOptions);
   await connection.query('SELECT 1 AS connection_ok');
   await connection.query('SELECT 1 FROM `ods_social_media_post` LIMIT 0');
   await connection.query('SELECT 1 FROM `ods_social_media_comment` LIMIT 0');

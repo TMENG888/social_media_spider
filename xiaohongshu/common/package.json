@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test src/*.test.mjs tests/*.test.mjs",
     "crawl": "node src/index.mjs",
     "validate": "node src/validate-output.mjs",
     "setup:asr": "python -m pip install -r requirements-asr.txt",

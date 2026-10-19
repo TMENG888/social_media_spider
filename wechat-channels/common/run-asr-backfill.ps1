@@ -1,6 +1,13 @@
 param([ValidateSet('run','check')][string]$Mode='run')
 $ErrorActionPreference = 'Stop'
 $Common = Split-Path -Parent $MyInvocation.MyCommand.Path
+$resetPolicyFile = Join-Path $Common 'acceptance-policy.json'
+if ($Mode -eq 'run' -and (Test-Path -LiteralPath $resetPolicyFile)) {
+  $resetPolicy = Get-Content -LiteralPath $resetPolicyFile -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($resetPolicy.enabled -eq $true -and -not $env:WECHAT_RECOLLECT_ONCE) {
+    throw 'VIDEO_BACKFILL_REQUIRES_ORIGINAL_RESET: video recovery now uses one reset of the existing keyword task; standalone ASR replay is disabled under the active acceptance policy.'
+  }
+}
 $Root = (Resolve-Path (Join-Path $Common '..')).Path
 $WorkerRoot = if ($env:WECHAT_WORKER_ROOT) { (Resolve-Path $env:WECHAT_WORKER_ROOT).Path.TrimEnd('\') } else { $Root.TrimEnd('\') }
 function Write-JsonAtomic([object]$Value, [string]$Path, [int]$Depth = 8) {
@@ -42,9 +49,10 @@ New-Item -ItemType Directory -Force -Path $stateRoot,$runsRoot | Out-Null
 if ($redisStateScope) { Write-Host "Redis ASR state scope: $redisStateScope" }
 
 if ($dbEnabled) {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
-  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
-  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
+  $mysqlDefaults = Get-Content -LiteralPath (Join-Path $Common 'src\mysql-defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = [string]$mysqlDefaults.host }
+  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = [string]$mysqlDefaults.port }
+  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = [string]$mysqlDefaults.database }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }
   if (-not $env:MYSQL_PASSWORD) {
     $securePassword = Read-Host 'MySQL password' -AsSecureString

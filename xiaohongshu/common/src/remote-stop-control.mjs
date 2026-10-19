@@ -24,8 +24,8 @@ export function parseRequest(raw,ctx) {
   return value;
 }
 export async function controlContext(commonRoot,workerRoot=null) {
-  const root=path.resolve(commonRoot),directory=path.basename(path.dirname(root));
-  const platform=({'xiaohongshu':'小红书','douyin':'抖音'})[directory] || directory;
+  const root=path.resolve(commonRoot),platformDirectory=path.basename(path.dirname(root));
+  const platform=({'xiaohongshu':'小红书','douyin':'抖音'})[platformDirectory] || platformDirectory;
   const prefix=platform==='小红书'?'xhs':platform==='抖音'?'xhs:douyin':null;
   if(!prefix)throw new Error('UNSUPPORTED_CONTROL_PLATFORM');
   const settings=await redisSettings(root);

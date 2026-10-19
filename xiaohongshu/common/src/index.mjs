@@ -2,17 +2,22 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { POST_FIELDS, COMMENT_FIELDS, blankRecord, canonicalXhsNoteUrl, extractId, normalizeXhsUrl, stableId } from "./schema.mjs";
-import { beijingDateTime, buildThreadContent, dedupeUrls, parseCount, parsePublishedText, parseSubtitleText, threadLikeCount } from "./xhs-utils.mjs";
+import { beijingDateTime, buildThreadContent, dedupeUrls, parseCount, parsePublishedText, threadLikeCount } from "./xhs-utils.mjs";
 import { cleanText, removeEmoji, splitDescriptionAndTags } from "./text-cleaner.mjs";
 import { AsrService } from "./asr.mjs";
 import { AsrJobProcessor } from "./asr-jobs.mjs";
+import {finalizeAsr} from './asr-finalization.mjs';
 import { incompleteCandidates } from "./candidate-acceptance.mjs";
+import {attachScopeAudits,verifiedScopeExclusion} from './coverage-scope.mjs';
 import {retrySnapshot} from './retry-no-change.mjs';
-import {assessKeywordScope,SearchExhaustion,assessSearchAcceptance} from './search-acceptance.mjs';
+import {assessKeywordScope,SearchExhaustion,assessSearchAcceptance,SCOPE_POLICY} from './search-acceptance.mjs';
 import {auditExistingScope,recordScope,scopeSummary} from './scope-audit.mjs';
-import { openCheckpoint, setMeta, saveCandidates, checkpointCandidates, markCompleted, markSkipped, markFailed, markNoteDeadLetter, markImported, importedStats, exportCheckpoint, repairCheckpointDataQuality, writeJsonAtomic } from "./checkpoint.mjs";
+import { openCheckpoint, setMeta, saveCandidates, checkpointCandidates, markCompleted, markSkipped, markFailed, markNoteDeadLetter, markImported, importedStats, exportCheckpoint, repairCheckpointDataQuality, writeJsonAtomic,detailAttemptLimit,asrJobStats } from "./checkpoint.mjs";
+import {currentMediaSnapshot,bindCurrentMedia} from './media-provenance.mjs';
 import { assessAsrAcceptance } from "./acceptance-gate.mjs";
-import { importRows } from "./import-mysql.mjs";
+import { importRows,mysqlConnectionOptions } from "./import-mysql.mjs";
+import mysql from 'mysql2/promise';
+import {readTaskVolume,validateVolumeSnapshot} from './volume-acceptance.mjs';
 import { POLICY_VERSION, ACCEPTANCE_VERSION, YearBoundary, inTargetYear, validDate, scrollBudget } from "./collection-policy.mjs";
 import { assertLocalLease } from "./lease-guard.mjs";
 import { captureSearchState, closeDetailToSearch, ensureLatestSort, isKeywordSearchUrl, renderedControl, visibleAny, searchEndpointSnapshot, advanceSearchScroll } from "./xhs-browser-state.mjs";
@@ -20,6 +25,7 @@ import { collectionFailurePolicy } from "./collection-failure.mjs";
 import { assertWebNoteAccessible, recoverWebUnavailableToSearch, WebUnavailableStreak, WEB_NOTE_UNAVAILABLE_PATTERN } from "./web-access-state.mjs";
 import { itemPause, waitForPacing } from "./collection-pacing.mjs";
 import { RateLimitCooldown, restrictionKind } from "./rate-limit-cooldown.mjs";
+import {createPageDiagnostics} from './page-diagnostics.mjs';
 
 function argsOf(argv) {
   const out = {};
@@ -33,6 +39,9 @@ function argsOf(argv) {
 }
 
 const cli = argsOf(process.argv);
+const volumeMode=process.env.SOCIAL_VOLUME_ENABLED==='1';
+const volumeSnapshot=volumeMode?validateVolumeSnapshot(JSON.parse(await fs.readFile(process.env.SOCIAL_VOLUME_SNAPSHOT,'utf8')),{platform:'小红书'}):null;
+const volumeRead=()=>readTaskVolume({connect:()=>mysql.createConnection(mysqlConnectionOptions()),snapshot:volumeSnapshot,taskId:process.env.XHS_LEASE_TASK_ID});
 const configPath = path.resolve(String(cli.config || "config.json"));
 let fileConfig = {};
 try { fileConfig = JSON.parse(await fs.readFile(configPath, "utf8")); } catch {}
@@ -49,6 +58,7 @@ const delayRange = (value, fallback) => Array.isArray(value) && value.length ===
   : fallback;
 
 const cfg = {
+  scopeExcludedEntitiesByKeyword: fileConfig.scopeExcludedEntitiesByKeyword || {},
   projectName: String(cli["project-name"] || keywordConfig.projectName || fileConfig.projectName || "北京臻澐项目口碑"),
   // 两个专题的需求表均未定义分类。固定为数据库 NULL，禁止命令行、配置或任务清单覆盖。
   category: null,
@@ -186,6 +196,7 @@ async function ensureLogin(page) {
   while (true) {
     const loginVisible = await page.getByText(/登录后推荐更懂你的笔记|登录后查看搜索结果|扫码登录/).first().isVisible().catch(() => false);
     if (!loginVisible) return;
+    await publishRestriction('STOP_LOGIN_REQUIRED：请在本机完成登录');
     if (Date.now() >= deadline) throw new Error("STOP_LOGIN_REQUIRED：等待人工登录超时，请登录后重新运行");
     await page.waitForTimeout(1000);
   }
@@ -241,6 +252,7 @@ async function waitForDetailOrSecurityChallenge(page) {
 }
 
 async function* collectSearchLinks(page, keyword, progress) {
+  progress.startedAt=new Date().toISOString();
   // URL参数不是排序已生效的证据；必须操作并核验页面的排序控件。
   const searchUrl = `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}&source=web_explore_feed&type=51`;
   const input = page.locator('input#search-input:visible,input.search-input:visible,input[placeholder*="搜索"]:visible').first();
@@ -261,6 +273,7 @@ async function* collectSearchLinks(page, keyword, progress) {
   // redundant reloads discard SPA state and add unnecessary navigation.
   // 搜索结果默认排序可能不是最新；每个关键词搜索后优先切换到“最新”。
   await ensureLatestSort(page, keyword, { assertSafe: assertNoSecurityChallenge });
+  progress.latestConfirmed=true;
   console.log(`[结果等待] ${keyword}：等待最新筛选后的帖子列表`);
   const resultSelector = 'section.note-item, .note-item, [data-note-id]';
   let resultsVisible = await page.waitForSelector(resultSelector, { timeout: 12000 }).then(() => true).catch(() => false);
@@ -270,6 +283,7 @@ async function* collectSearchLinks(page, keyword, progress) {
     resultsVisible = await page.waitForSelector(resultSelector, { timeout: 15000 }).then(() => true).catch(() => false);
   }
   if (!resultsVisible) throw new Error(`SEARCH_RESULTS_NOT_RENDERED：${keyword}`);
+  progress.origin={...await searchEndpointSnapshot(page,keyword,0),capturedAt:new Date().toISOString()};
   const links = new Map();
   const maxRounds = scrollBudget(cfg.collectAllCurrentYear, cfg.maxSearchScrolls);
   // 先多取候选，再由文章发布时间过滤，避免最新结果中混入旧帖导致今年数据不足。
@@ -285,7 +299,13 @@ async function* collectSearchLinks(page, keyword, progress) {
     while (yielded.size < candidateLimit) {
       if (await stopRequested()) throw new Error("STOP_REQUESTED：搜索加载已安全停止");
       await assertNoSecurityChallenge(page);
-      if (!isKeywordSearchUrl(page.url(), keyword)) throw new Error("STOP_SEARCH_CONTEXT_LOST：当前页面已不是本关键词结果页");
+      if (!isKeywordSearchUrl(page.url(), keyword)) {
+        const error = new Error("STOP_SEARCH_CONTEXT_LOST：当前页面已不是本关键词结果页");
+        error.observedAt = new Date().toISOString();
+        error.pageDiagnostic = await pageDiagnostics?.capture('search_context_lost', error,
+          {round:round+1,discovered:links.size,lastExamined:progress.examined});
+        throw error;
+      }
       const scanStartCount = links.size;
       const discoveredNow = [];
       const currentNotes = [];
@@ -317,11 +337,13 @@ async function* collectSearchLinks(page, keyword, progress) {
     }
     stagnantRounds = links.size === roundStartCount ? stagnantRounds + 1 : 0;
     const endState=await searchEndpointSnapshot(page,keyword,links.size);
+    endState.capturedAt=new Date().toISOString();
     const endEvidence=exhaustion.observe(endState);
     progress.exhaustion=endEvidence;
     if (endEvidence.ok) {
       console.log(`[搜索完成] ${keyword}：已核验搜索终点，连续${endEvidence.stableRounds}次健康扫描无新增结果；范围为平台当前可见搜索结果`);
       progress.reason = "platform_exhausted";
+      progress.finishedAt=new Date().toISOString();
       return;
     }
     if(stagnantRounds>=cfg.maxStagnantRounds*3)throw new Error('SEARCH_EXHAUSTION_UNCONFIRMED：长期无新增但未核验健康搜索终点，不得冒充年度完成');
@@ -521,49 +543,18 @@ async function openPostFromSearch(page, note, keyword) {
 }
 
 async function closePostToSearch(page, state,{allowWebUnavailable=false}={}) {
-  if(allowWebUnavailable)return recoverWebUnavailableToSearch(page,state,{timeout:cfg.timeout,assertSafe:p=>assertNoSecurityChallenge(p,{allowWebUnavailable:true}),assertStrict:assertNoSecurityChallenge});
-  return closeDetailToSearch(page, state, { timeout: cfg.timeout, assertSafe: assertNoSecurityChallenge });
-}
-async function extractVideoSubtitles(page, root) {
-  const cueText = await root.locator("video").first().evaluate(async (video) => {
-    const tracks = [...(video.textTracks || [])];
-    for (const track of tracks) if (track.mode === "disabled") track.mode = "hidden";
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    return tracks.flatMap((track) => [...(track.cues || [])].map((cue) => cue.text || "")).filter(Boolean);
-  }).catch(() => []);
-  const cueParsed = parseSubtitleText(cueText.join("\n"));
-  if (cueParsed) return { text: removeEmoji(cueParsed), source: "video.textTracks" };
-
-  const trackUrls = await root.locator('video track[kind="subtitles"],video track[kind="captions"]').evaluateAll((nodes) =>
-    nodes.map((node) => node.src || node.getAttribute("src")).filter(Boolean)
-  ).catch(() => []);
-  const resourceUrls = await page.evaluate(() => performance.getEntriesByType("resource").map((entry) => entry.name)
-    .filter((url) => /(?:\.vtt|\.srt|\.ass)(?:\?|$)|subtitle|caption/i.test(url))).catch(() => []);
-  const scriptUrls = await page.locator('script[type*="json"],script:not([src])').evaluateAll((nodes) => {
-    const joined = nodes.map((node) => node.textContent || "").join("\n").replaceAll("\\/", "/");
-    return [...joined.matchAll(/https?:\/\/[^"'\s]+?(?:\.vtt|\.srt|\.ass)(?:\?[^"'\s]*)?/gi)].map((match) => match[0]);
-  }).catch(() => []);
-  for (const url of dedupeUrls([...trackUrls, ...resourceUrls, ...scriptUrls]).slice(0, 12)) {
-    try {
-      const response = await page.request.get(url, { timeout: 10000 });
-      if (!response.ok()) continue;
-      const parsed = parseSubtitleText(await response.text());
-      if (parsed) return { text: removeEmoji(parsed), source: `subtitle_resource:${url}` };
-    } catch {}
+  pageDiagnostics?.mark('detail_close_started',{expectedSearchUrl:state.searchUrl,keyword:state.keyword});
+  try {
+    const result = allowWebUnavailable
+      ? await recoverWebUnavailableToSearch(page,state,{timeout:cfg.timeout,assertSafe:p=>assertNoSecurityChallenge(p,{allowWebUnavailable:true}),assertStrict:assertNoSecurityChallenge})
+      : await closeDetailToSearch(page, state, { timeout: cfg.timeout, assertSafe: assertNoSecurityChallenge });
+    pageDiagnostics?.mark('detail_close_verified',{method:result?.method});
+    return result;
+  } catch(error) {
+    pageDiagnostics?.mark('detail_close_failed',{error:String(error.message||error)});
+    throw error;
   }
-
-  const domLines = await root.locator([
-    '.xhs-webplayer .player-subtitle:visible',
-    '.xhs-webplayer [class*="caption"]:visible',
-    '.xhs-webplayer [class*="subtitle"]:visible:not(.xhs-capsule-widget-subtitle)'
-  ].join(",")).evaluateAll((nodes) => nodes.filter((node) => {
-    const klass = String(node.className || "");
-    return !/(capsule|widget|control|button|title)/i.test(klass);
-  }).map((node) => (node.textContent || "").trim()).filter(Boolean)).catch(() => []);
-  const domParsed = parseSubtitleText(domLines.join("\n"));
-  return domParsed ? { text: removeEmoji(domParsed), source: "visible_player_caption" } : { text: null, source: null };
 }
-
 async function parsePost(page, note, context, { navigate = true } = {}) {
   if (navigate) await page.goto(note.url, { waitUntil: "domcontentloaded", timeout: cfg.timeout });
   await waitForDetailOrSecurityChallenge(page);
@@ -591,7 +582,7 @@ async function parsePost(page, note, context, { navigate = true } = {}) {
     return { outsideYear: true, publishedAt, dateRaw, comments: [] };
   }
   const scopeEvidence={title,body:parsedDescription.content,tags:parsedDescription.tags};
-  const scopeAssessment=assessKeywordScope(context.keyword,{scopeEvidence});
+  const scopeAssessment=assessKeywordScope(context.keyword,{scopeEvidence},{excludedEntities:cfg.scopeExcludedEntitiesByKeyword[context.keyword]||[]});
   if(scopeAssessment.status==='unobserved')throw new Error('SCOPE_DETAIL_CONTENT_NOT_OBSERVED：未读取到相关性核验正文，不可自动跳过');
   if(scopeAssessment.status==='out_of_scope')return {outsideScope:true,publishedAt,scopeEvidence,scopeAssessment,comments:[]};
   const location = await text(root, [".bottom-container .location", ".note-content .location"]);
@@ -606,38 +597,30 @@ async function parsePost(page, note, context, { navigate = true } = {}) {
   const images = dedupeUrls(await root.locator('.swiper-slide img[src*="xhscdn.com"],.note-slider-img img[src*="xhscdn.com"]').evaluateAll((nodes) => nodes.map((n) => n.currentSrc || n.src)).catch(() => []));
   const hasVideo = await root.locator("video").count() > 0;
   const videoInfo = hasVideo ? await root.locator("video").first().evaluate((v) => ({ src: v.currentSrc || v.src || v.querySelector('source')?.src || null, duration: Number.isFinite(v.duration) ? Math.round(v.duration) : null })).catch(() => ({})) : {};
-  const mediaResources = hasVideo ? await page.evaluate(() => {
-    const urls = performance.getEntriesByType("resource").map((entry) => entry.name)
-      .filter((url) => /sns-(?:video|bak).*\.(?:mp4|m4a|m4s|m3u8)(?:\?|$)/i.test(url));
-    const seen = new WeakSet(), walk = (value, depth = 0) => {
-      if (depth > 12 || value == null) return;
-      if (typeof value === "string") {
-        if (/^https?:\/\//i.test(value) && /sns-(?:video|bak).*\.(?:mp4|m4a|m4s|m3u8)(?:\?|$)/i.test(value)) urls.push(value);
-        return;
-      }
-      if (typeof value !== "object" || seen.has(value)) return;
-      seen.add(value);
-      for (const key of Object.keys(value).slice(0, 500)) try { walk(value[key], depth + 1); } catch {}
-    };
-    walk(globalThis.__INITIAL_STATE__);
-    return urls;
-  }).catch(() => []) : [];
-  const normalizedMedia = dedupeUrls(mediaResources.map((url) => String(url).replace(/^http:/i, "https:")));
-  const scoreMedia = (url) => (/\.mp4(?:\?|$)/i.test(url) ? 50 : /\.m4a(?:\?|$)/i.test(url) ? 40 : /\.m3u8(?:\?|$)/i.test(url) ? 30 : 10)
-    + (/\bsign=/i.test(url) ? 5 : 0) + (/sns-video/i.test(url) ? 2 : 0);
-  normalizedMedia.sort((a, b) => scoreMedia(b) - scoreMedia(a));
-  const directVideoUrl = videoInfo.src && !videoInfo.src.startsWith("blob:") ? videoInfo.src : null;
-  const actualVideoUrl = directVideoUrl || normalizedMedia.find((url) => /\.(?:mp4|m3u8)(?:\?|$)/i.test(url)) || normalizedMedia[0] || null;
-  const asrMediaUrl = directVideoUrl || normalizedMedia.find((url) => /\.(?:mp4|m4a|m3u8)(?:\?|$)/i.test(url)) || null;
+  let media={ok:false},mediaSnapshot=null;
+  if(hasVideo)for(let probe=0;probe<20;probe++){
+    if(await stopRequested())throw new Error('STOP_REQUESTED：媒体加载期间收到安全停止');
+    mediaSnapshot=await detailRoot.evaluate(currentMediaSnapshot,note.noteId).catch(()=>null);
+    media=bindCurrentMedia(mediaSnapshot);
+    if(media.ok)break;
+    if(probe%5===0)await assertNoSecurityChallenge(page);
+    await page.waitForTimeout(400);
+  }
+  if(media.ok&&String(removeEmoji(mediaSnapshot.visibleTitle)||'').replace(/\s+/g,'')!==String(title||'').replace(/\s+/g,''))throw new Error('DETAIL_CHANGED_DURING_MEDIA_LOAD：媒体加载期间帖子标题发生切换');
+  const actualVideoUrl = media.ok ? media.url : null;
+  const asrMediaUrl = actualVideoUrl;
   // Live Photos also render short <video> elements beside an image carousel.
   // Only treat a note as a video post when a real stream is found or no image
   // carousel exists; otherwise retain it as image-text content.
   const isVideoPost = Boolean(actualVideoUrl) || (hasVideo && images.length === 0);
-  let subtitle = isVideoPost ? await extractVideoSubtitles(page, root) : { text: null, source: null };
+  // The DOM player may still hold the previous video's tracks during SPA
+  // transitions. Decode only the note-bound file; never accept a single
+  // currently visible caption as the full transcript.
+  let subtitle = { text: null, source: null };
   let asrJob = null;
   if (isVideoPost && !subtitle.text && asrMediaUrl && cfg.asrEnabled) {
     const articleId = note.noteId || extractId(detailUrl);
-    asrJob = { keyword: context.keyword, noteId: articleId, articleId, mediaUrl: asrMediaUrl,
+    asrJob = { keyword: context.keyword, noteId: articleId, articleId, mediaUrl: asrMediaUrl, mediaBinding:media.binding,
       referer: detailUrl, prompt: [context.keyword, title, parsedDescription.tags].filter(Boolean).join("，") };
     subtitle = { text: null, source: null, audit: { status: "pending" } };
   }
@@ -654,7 +637,7 @@ async function parsePost(page, note, context, { navigate = true } = {}) {
     文章链接: url, 文章id: note.noteId || extractId(url), 作者主页链接: authorUrl,
     文章视频链接: actualVideoUrl ? JSON.stringify([actualVideoUrl]) : null, 文章视频内容: subtitle.text,
     关键词: context.keyword, 作者id: extractId(authorUrl, "user"), 作者粉丝数: stats.followerCount ?? null,
-    作者点赞数: stats.likeCount ?? null, 文章分享数: shareCount, 文章视频时长: isVideoPost ? videoInfo.duration ?? null : null,
+    作者点赞数: stats.likeCount ?? null, 文章分享数: shareCount, 文章视频时长: isVideoPost ? (media.ok?Math.round(media.binding.expectedDuration):videoInfo.duration??null) : null,
     平台: "小红书", 文章获取时间: context.capturedAt, 文章标注: null, 分类: null, 清洗标注: JSON.stringify(parsedDescription.stats),
     项目: context.projectName || cfg.projectName, 地点: location || dateRaw?.match(/\s(北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门|海外)$/)?.[1] || null, 内容类型: isVideoPost ? "视频" : images.length ? "图文" : "纯文本",
     是否广告: null, 广告关键词: null
@@ -663,7 +646,8 @@ async function parsePost(page, note, context, { navigate = true } = {}) {
   return {
     post, comments: comments.rows, commentAudits: comments.audits,
     postTextAudit: { article_id: post["文章id"], date_source: "detail_page", date_raw: dateRaw, raw_text: rawContent || "", body_before_cleaning: parsedDescription.bodyBeforeCleaning, cleaned_text: parsedDescription.content, tags: parsedDescription.tags, cleaning_stats: parsedDescription.stats, subtitle_source: subtitle.source, subtitle_status: !isVideoPost ? "not_video" : subtitle.text ? "extracted" : !asrMediaUrl ? "media_url_missing" : asrJob ? "pending" : subtitle.audit?.status === "no_speech" ? "no_speech" : "asr_failed", subtitle_error: subtitle.error || null, subtitle_audit: subtitle.audit || null },
-    asrJob
+    asrJob,
+    mediaProvenance:media.ok?media.binding:{verified:false,reason:media.reason||'not_video'}
   };
 }
 
@@ -674,8 +658,8 @@ const retryBefore = entries.length===1 ? retrySnapshot(checkpoint,entries[0].key
 const repairedQuality = repairCheckpointDataQuality(checkpoint);
 if (repairedQuality.links || repairedQuality.asr) console.log(`[数据质量修复] 文章链接${repairedQuality.links}条，低质量ASR${repairedQuality.asr}条已标记重采`);
 for(const task of entries){
-  const audit=auditExistingScope(checkpoint,task.keyword);
-  console.log(`[范围复核] ${task.keyword}：相关${audit.accepted}，范围外${audit.out_of_scope}，待重新读取${audit.unobserved}；旧库范围外记录保留${audit.legacyImportedExcluded}篇`);
+  const audit=auditExistingScope(checkpoint,task.keyword,{excludedEntities:cfg.scopeExcludedEntitiesByKeyword[task.keyword]||[]});
+  console.log(`[范围复核] ${task.keyword}：相关${audit.accepted}，明确范围外${audit.out_of_scope}，相关性不确定${audit.uncertain}，待重新读取${audit.unobserved}；旧库范围外记录保留${audit.legacyImportedExcluded}篇`);
 }
 // 增量入库：每累计 importBatchSize 篇文章触发一次异步 MySQL 入库并登记断点表，异常终止后恢复时可避免重复入库与漏库。
 let importSeq = 0, incrementalBatches = 0, incrementalPosts = 0, incrementalComments = 0;
@@ -745,6 +729,7 @@ const asrJobs = cfg.asrEnabled ? new AsrJobProcessor({
 asrJobs?.start();
 let session = null;
 let searchPage = null;
+let pageDiagnostics = null, failureDiagnostic = null, firstFailureAt = null;
 let completedDetails = 0, consecutiveFailures = 0, runError = null, runStatus = "running";
 const searchSummaries = [];
 try {
@@ -754,10 +739,14 @@ try {
   await ensureLogin(searchPage);
   for (const task of entries) {
     if (await stopRequested()) throw new Error("STOP_REQUESTED：已在进入下一个关键词前安全停止");
+    pageDiagnostics?.dispose();
+    pageDiagnostics = createPageDiagnostics({page:searchPage,platform:'小红书',keyword:task.keyword,
+      outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId});
+    pageDiagnostics.mark('keyword_started');
     console.log(`[检索开始] ${task.keyword}`);
     const progress = { keyword: task.keyword, rounds: 0, discovered: 0, examined: 0, accepted: 0, skipped: 0, excludedScope:0, failed: 0, reason: null };
     searchSummaries.push(progress);
-    const saved = new Map(checkpointCandidates(checkpoint, task.keyword).map(item => [item.noteId, item]));
+    const saved = new Map(attachScopeAudits(checkpoint,checkpointCandidates(checkpoint, task.keyword),task.keyword).map(item => [item.noteId, item]));
     const boundary = new YearBoundary(cfg.targetYear, cfg.searchStopWindow);
     const unavailableStreak=new WebUnavailableStreak();
     const failedNotes = new Set();
@@ -766,20 +755,23 @@ try {
     async function processNote(note, trackBoundary = true, recoverSaved = false) {
       if (await stopRequested()) throw new Error("STOP_REQUESTED：已在打开下一篇笔记前安全停止");
       const cached = saved.get(note.noteId);
-      if(cached?.status==='skipped_irrelevant'){
+      if(cached?.status==='skipped_irrelevant'&&verifiedScopeExclusion(cached,task.keyword)){
         progress.examined++;progress.excludedScope++;
         console.log(`[范围排除] ${note.noteId}：已留存关键词锚点缺失证据，不重新采集、不计有效帖子`);
         return;
       }
-      if(cached?.status==='dead_letter'){
+      // A parent-keyword reset may revisit a naturally encountered old detail
+      // gap once in this scan. Keep its cumulative attempts and old evidence;
+      // do not spawn an individual-note recovery task or reset its history.
+      if(!volumeMode&&cached?.status==='dead_letter'){
         if(trackBoundary)boundary.observe(note.noteId,null);
         progress.deadLetters=(progress.deadLetters||0)+1;
         console.log(`[明确跳过] ${note.noteId}：已保留不可采证据，不自动复活，不计采集成功`);
         return;
       }
-      const retryFailedAsr = cached?.status === "completed" && cached.attempts < 3 &&
+      const retryFailedAsr = !volumeMode && cached?.status === "completed" && cached.attempts < detailAttemptLimit(checkpoint,task.keyword,note.noteId) &&
         cached.result?.post?.["内容类型"] === "视频" && !cached.result?.post?.["文章视频内容"] &&
-        cached.result?.postTextAudit?.subtitle_status === "asr_failed";
+        ['asr_failed','media_url_missing','source_recheck_required'].includes(cached.result?.postTextAudit?.subtitle_status);
       if (retryFailedAsr) console.log(`[ASR重试] ${task.keyword} / ${note.noteId}：旧断点为ASR失败，使用本地模型重新解析（第${cached.attempts + 1}次）`);
       if (cached?.status === "completed" && !retryFailedAsr && cached.projectName === projectName && inTargetYear(cached.publishedAt, cfg.targetYear, cfg.minPublishedDate)) {
         if (trackBoundary) boundary.observe(note.noteId, cached.publishedAt);
@@ -809,7 +801,9 @@ try {
           // Capture before opening: even a partially opened/missing detail must
           // be restored, otherwise the next iteration may consume home cards.
           inPlaceState = await captureSearchState(detail, task.keyword);
+          pageDiagnostics?.mark('detail_open_started',{noteId:note.noteId});
           await openPostFromSearch(detail, note, task.keyword);
+          pageDiagnostics?.mark('detail_opened',{noteId:note.noteId});
         }
         if (recoverSaved) {
           await detail.goto(note.url, { waitUntil: 'domcontentloaded', timeout: cfg.timeout });
@@ -824,13 +818,13 @@ try {
         if(result.outsideScope){
           recordScope(checkpoint,task.keyword,note,result,result.scopeAssessment,{fresh:true});
           progress.excludedScope++;
-          console.log(`[范围排除] ${note.noteId}：标题/正文/标签未出现任务实体锚点，已留证；未领取该帖ASR或采集评论`);
+          console.log(`[范围排除] ${note.noteId}：详情明确命中已配置的范围外实体，已留证；不计采集成功`);
         } else if (result.outsideYear) {
           markSkipped(checkpoint, task.keyword, note, `详情发布时间${publishedAt}不在目标${cfg.targetYear}年`, publishedAt);
           progress.skipped += 1;
           console.log(`[日期跳过] ${note.noteId}：${publishedAt}；最近窗口${boundary.recent.length}/${cfg.searchStopWindow}`);
         } else {
-          recordScope(checkpoint,task.keyword,note,result,assessKeywordScope(task.keyword,result));
+          recordScope(checkpoint,task.keyword,note,result,assessKeywordScope(task.keyword,result,{excludedEntities:cfg.scopeExcludedEntitiesByKeyword[task.keyword]||[]}));
           const { asrJob, ...storedResult } = result;
           const audit = { keyword: task.keyword, articleId: result.post["文章id"], title: result.post["文章标题"], status: "已持久化", commentThreads: result.comments.length, missing: POST_FIELDS.filter(f => !["id", "文章图片信息", "文章标注", "分类", "清洗标注", "是否广告", "广告关键词"].includes(f) && result.post[f] == null) };
           markCompleted(checkpoint, task.keyword, note, { ...storedResult, audit },{asrJob,asrMaxAttempts:cfg.asrJobMaxAttempts});
@@ -852,7 +846,7 @@ try {
         }
         if(String(error.message||error).startsWith('STOP_WEB_NOTE_UNAVAILABLE')){
           consecutiveFailures=0;
-          const inaccessibleStatus=markNoteDeadLetter(checkpoint,task.keyword,note,error);
+          const inaccessibleStatus=markNoteDeadLetter(checkpoint,task.keyword,note,error,detailAttemptLimit(checkpoint,task.keyword,note.noteId));
           if(inaccessibleStatus!=='dead_letter')failedNotes.add(note.noteId);
           if(trackBoundary)boundary.observe(note.noteId,null);
           progress.deadLetters=(progress.deadLetters||0)+1;
@@ -868,7 +862,7 @@ try {
         consecutiveFailures += 1;
         failedNotes.add(note.noteId);
         progress.failed = failedNotes.size;
-        const detailStatus=markFailed(checkpoint, task.keyword, note, error);
+        const detailStatus=markFailed(checkpoint, task.keyword, note, error,detailAttemptLimit(checkpoint,task.keyword,note.noteId));
         if(detailStatus==='dead_letter'){failedNotes.delete(note.noteId);progress.deadLetters=(progress.deadLetters||0)+1;}
         console.warn(`[详情失败] ${note.noteId}：${String(error.message || error).split("\n")[0]}（不计为非目标年份）`);
         await detail.screenshot({ path: path.join(cfg.outputDir, `详情失败-${note.noteId}.png`), fullPage: false }).catch(() => {});
@@ -905,22 +899,28 @@ try {
       for await (const note of source) {
         progress.freshSearch = true;
         await processNote(note);
+        if(volumeMode){
+          if(importBuffer.length)enqueueImport(task.keyword,importBuffer.splice(0));
+          await importQueue;
+          const decision=await volumeRead();
+          if(decision.ok&&!process.env.SOCIAL_RECOLLECT_ONCE){progress.reason='volume_threshold';progress.volumeAcceptance=decision;break;}
+        }
         if(boundary.reached)progress.oldDateWindowObserved=true; // Diagnostic only, never terminate a live search.
         if (!cfg.collectAllCurrentYear && progress.accepted >= cfg.maxNotesPerKeyword) { progress.reason = "sample_limit"; break; }
       }
       // A visit is not a disposition: recover both omitted old candidates and
       // cards that failed this run, once via their saved URL after the verified
       // search endpoint. Existing per-note attempt limits remain authoritative.
-      if (progress.reason === "platform_exhausted") {
-        const remaining = incompleteCandidates(checkpointCandidates(checkpoint,task.keyword));
+      if (!volumeMode && progress.reason === "platform_exhausted") {
+        const remaining = incompleteCandidates(attachScopeAudits(checkpoint,checkpointCandidates(checkpoint,task.keyword),task.keyword),{keyword:task.keyword});
         for (const note of remaining) await processNote(note, false, true);
       }
-      if (failedNotes.size) throw new Error(`DETAILS_INCOMPLETE：${failedNotes.size}篇详情未成功核验，可从断点重试`);
-      const knownGaps=incompleteCandidates(checkpointCandidates(checkpoint,task.keyword));
-      if(knownGaps.length)throw new Error(`DETAILS_INCOMPLETE：${knownGaps.length}篇已发现候选尚无终态，不能凭年度窗口忽略`);
+      const knownGaps=incompleteCandidates(attachScopeAudits(checkpoint,checkpointCandidates(checkpoint,task.keyword),task.keyword),{keyword:task.keyword});
+      progress.knownIncomplete=knownGaps.map(n=>n.noteId);
+      if(knownGaps.length)console.warn(`[详情缺口保留] ${knownGaps.length}篇未完成，全部保留在80%入库验收分母，不中断已验证搜索终点后的保全入库`);
       if (progress.reason === "search_limit") throw new Error("SEARCH_LIMIT_REACHED：样本滚动上限已达到，不能声明年度采集完成");
       const searchCheck=assessSearchAcceptance([progress],{annual:cfg.collectAllCurrentYear,direct:Boolean(directNoteUrl)});
-      if(!searchCheck.ok)throw new Error('SEARCH_END_UNVERIFIED：未验证搜索终点');
+      if(!volumeMode&&!searchCheck.ok)throw new Error('SEARCH_END_UNVERIFIED：未验证搜索终点');
     } finally {
       if (importBuffer.length) enqueueImport(task.keyword, importBuffer.splice(0));
       await importQueue;
@@ -933,17 +933,19 @@ try {
   runStatus = "completed";
 } catch (error) {
   runError = error;
+  firstFailureAt = error.observedAt || new Date().toISOString();
   const message = String(error?.message || error);
   await publishRestriction(message);
+  failureDiagnostic = error.pageDiagnostic || await pageDiagnostics?.capture('collector_failure',error,{firstFailureAt});
   runStatus = collectionFailurePolicy(message).status;
   console.warn(`[采集收尾] ${runStatus}：${message.split("\n")[0]}`);
 } finally {
   await importQueue.catch(() => {});
-  const asrSummary = await asrJobs?.drain().catch((error) => {
+  const asrSummary = await finalizeAsr(asrJobs,{volumeMode,readStats:()=>asrJobStats(checkpoint)}).catch((error) => {
     console.warn(`[ASR队列] 收尾异常，未完成任务仍保存在asr_job：${String(error.message || error).split("\n")[0]}`);
     return null;
   });
-  const asrAcceptance=assessAsrAcceptance(asrSummary,{required:Boolean(asrJobs),allowExhaustedSkip:true});
+  const asrAcceptance=assessAsrAcceptance(asrSummary,{required:!volumeMode&&Boolean(asrJobs),allowExhaustedSkip:true});
   const skippedDetails=Number(checkpoint.prepare("SELECT COUNT(*) AS n FROM note_dead_letter WHERE status='dead_letter'").get().n);
   if(runStatus==='completed' && asrAcceptance.status==='accepted_with_skips'){
     runStatus='completed_with_skips';
@@ -957,15 +959,16 @@ try {
   }
   if(runStatus==='completed' && skippedDetails>0)runStatus='completed_with_skips';
   const searchAcceptance=assessSearchAcceptance(searchSummaries,{annual:cfg.collectAllCurrentYear,direct:Boolean(directNoteUrl)});
-  const scopeAcceptance={ok:entries.every(task=>scopeSummary(checkpoint,task.keyword).unobserved===0),acceptanceVersion:ACCEPTANCE_VERSION,
-    policy:'20261014-keyword-anchor-v1',tasks:entries.map(task=>({keyword:task.keyword,...scopeSummary(checkpoint,task.keyword)}))};
-  if(['completed','completed_with_skips'].includes(runStatus)&&(!searchAcceptance.ok||!scopeAcceptance.ok)){
-    runStatus='incomplete';runError=new Error(!scopeAcceptance.ok?'SCOPE_UNVERIFIED':'SEARCH_END_UNVERIFIED');
+  const scopeAcceptance={ok:true,unknownCountedAsFailure:true,acceptanceVersion:ACCEPTANCE_VERSION,
+    policy:SCOPE_POLICY,tasks:entries.map(task=>({keyword:task.keyword,...scopeSummary(checkpoint,task.keyword)}))};
+  if(!volumeMode&&['completed','completed_with_skips'].includes(runStatus)&&!searchAcceptance.ok){
+    runStatus='incomplete';runError=new Error('SEARCH_END_UNVERIFIED');
   }
   setMeta(checkpoint, "last_run", { status: runStatus, error: runError ? String(runError.message || runError) : null, finishedAt: beijingDateTime() });
-  const retryObservation=retryBefore ? {before:retryBefore,after:retrySnapshot(checkpoint,entries[0].keyword),freshSearch:searchSummaries.some(s=>s.freshSearch),boundedRecoverySearch:false,asrDrainConfirmed:Boolean(!asrJobs||asrSummary)} : null;
+  const retryObservation=retryBefore ? {before:retryBefore,after:retrySnapshot(checkpoint,entries[0].keyword),freshSearch:searchSummaries.some(s=>s.freshSearch),boundedRecoverySearch:false,asrDrainConfirmed:Boolean(!asrJobs||(asrSummary&&!volumeMode))} : null;
   const exported = await exportCheckpoint(checkpoint, cfg.outputDir, { browserMode: session?.mode || null, status: runStatus, policyVersion: POLICY_VERSION, searchSummaries, targetYear: cfg.targetYear, cutoff: cfg.minPublishedDate, projectName: cfg.projectName, category: null, keywords: entries.map((x) => x.keyword), collectComments: cfg.collectComments, outputDir: cfg.outputDir, requiresHumanReview: false, databaseImported: false, finishedAt: beijingDateTime(), error: runError ? String(runError.message || runError) : null });
-  await writeJsonAtomic(path.join(cfg.outputDir, "collector_status.json"), { searchAcceptance,scopeAcceptance,retryObservation, cooldownPublication, runId: cfg.runId, policyVersion: POLICY_VERSION, status: runStatus, searchSummaries, error: runError ? String(runError.message || runError) : null, posts: exported.posts.length, commentThreads: exported.comments.length, deadLetterNotes:exported.summary.deadLetterNotes,collectionCompleteness:exported.summary.collectionCompleteness,asrJobs: asrSummary, incrementalImports: { batches: incrementalBatches, posts: incrementalPosts, comments: incrementalComments }, checkpointDb: cfg.checkpointDb, finishedAt: beijingDateTime() });
+  await writeJsonAtomic(path.join(cfg.outputDir, "collector_status.json"), { searchAcceptance,scopeAcceptance,retryObservation, cooldownPublication, runId: cfg.runId, policyVersion: POLICY_VERSION, status: runStatus, searchSummaries, error: runError ? String(runError.message || runError) : null, firstFailureAt,pageDiagnostics:failureDiagnostic,posts: exported.posts.length, commentThreads: exported.comments.length, deadLetterNotes:exported.summary.deadLetterNotes,collectionCompleteness:exported.summary.collectionCompleteness,asrJobs: asrSummary, incrementalImports: { batches: incrementalBatches, posts: incrementalPosts, comments: incrementalComments }, checkpointDb: cfg.checkpointDb, finishedAt: beijingDateTime() });
+  pageDiagnostics?.dispose();
   await asrJobs?.close().catch(() => {});
   await asrService?.close().catch(() => {});
   if (session?.owned) await session.context.close().catch(() => {});

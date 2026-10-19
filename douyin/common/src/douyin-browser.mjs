@@ -1,7 +1,29 @@
 import {extractId} from './schema.mjs';
 import {commentPause,waitForPacing} from './collection-pacing.mjs';
 import {aggregateCommentThreads,commentNodesFromResult} from './comment-threads.mjs';
+import {searchScrollDom} from './search-scroll.mjs';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function searchCard(page,id){
+ if(!/^\d{15,22}$/.test(id||''))throw new Error('SEARCH_CARD_ID_INVALID');
+ // Locators must keep resolving the ID when a virtual list inserts/reorders
+ // cards during scroll/hover. A snapshot's numeric cardIndex is diagnostics only.
+ const blocked='[data-e2e="comment-list"],[data-e2e="comment-list-container"],[data-e2e="modal-video-container"],nav,aside';
+ const cards=page.locator(`.search-result-card:visible:not(:is(${blocked}) *)`);
+ const players=page.locator(`[data-e2e-vid="${id}"]:not(:is(${blocked}) *)`);
+ const media=page.locator(`.search-result-card[data-e2e-vid="${id}"]:visible:not(:is(${blocked}) *)`).or(cards.filter({has:players,hasNot:page.locator('.search-result-card')}));
+ if(await media.count())return media.first();
+ const links=[];
+ for(const origin of ['', 'https://www.douyin.com','https://douyin.com','http://www.douyin.com','http://douyin.com']){
+  for(const kind of ['video','note']){
+   const url=`${origin}/${kind}/${id}`;
+   links.push(`a[href="${url}"]`,`a[href="${url}/"]`,`a[href^="${url}?"]`,`a[href^="${url}/?"]`,`a[href^="${url}#"]`);
+  }
+  const prefix=origin?`[href^="${origin}/"]`:'[href^="/"]:not([href^="//"])';
+  for(const query of [`[href$="?modal_id=${id}"]`,`[href$="&modal_id=${id}"]`,`[href*="?modal_id=${id}&"]`,`[href*="&modal_id=${id}&"]`])links.push(`a${prefix}${query}`);
+ }
+ // Other players and comment references cannot identify a link-only card.
+ return page.locator(`.search-result-card:not([data-e2e-vid]):visible:not(:is(${blocked}) *)`).filter({has:page.locator(`:is(${links.join(',')}):not(:is(${blocked}) *)`),hasNot:page.locator('[data-e2e-vid]')}).filter({hasNot:page.locator('.search-result-card')}).first();
+}
 export async function commentScope(page,id) {
  // A search card remains in the DOM behind a modal. Never collect or scroll
  // its hidden/background comments when the site's click opened a modal.
@@ -11,7 +33,7 @@ export async function commentScope(page,id) {
   if(modalId&&modalId!==id)throw new Error('COMMENTS_POST_CONTEXT_MISMATCH');
   return modal.nth(i);
  }
- return page.locator('.search-result-card').filter({has:page.locator(`[data-e2e-vid="${id}"]`)});
+ return searchCard(page,id);
 }
 export async function clickCommentControl(page,scope,{timeoutMs=4000}={}) {
  const controls=scope.locator('[data-e2e="feed-comment-icon"],[data-e2e="video-comment-icon"],[data-e2e="comment-icon"]');
@@ -35,16 +57,51 @@ export async function clickCommentControl(page,scope,{timeoutMs=4000}={}) {
  throw new Error('COMMENTS_CONTROL_NOT_FOUND：未定位当前帖子的评论入口，不等待错误面板');
 }
 export const searchUrl=keyword=>`https://www.douyin.com/search/${encodeURIComponent(keyword)}`;
+export async function navigateSearch(page,keyword,{shouldStop,timeoutMs=45000,settleMs=2500,retryDelaysMs=[15000,30000],allowManualLogin=false,onObservation=()=>{}}={}) {
+ // Only retry the same ordinary search navigation, within this existing lease.
+ // No direct article requests, proxy changes, retry-budget refunds or CAPTCHA retries.
+ if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>2||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>60000))throw new Error('SEARCH_GATEWAY_RETRY_BUDGET_INVALID');
+ const audit={keyword,attempts:[],maxRetries:retryDelaysMs.length};
+ for(let attempt=0;attempt<=retryDelaysMs.length;attempt++){
+  await waitForPacing(0,{shouldStop});
+  const observation={attempt:attempt+1,at:new Date().toISOString(),httpStatus:null};
+  try{
+   const response=await page.goto(searchUrl(keyword),{waitUntil:'domcontentloaded',timeout:timeoutMs});
+   observation.httpStatus=response?.status()??null;
+   await waitForPacing(settleMs,{shouldStop});
+   await assertAccess(page);
+   if([502,503,504].includes(observation.httpStatus))throw new Error('STOP_SEARCH_GATEWAY_ERROR：搜索主文档网关响应异常');
+   observation.status='ready';audit.attempts.push(observation);onObservation(audit);return audit;
+  }catch(error){
+   if(allowManualLogin&&/^STOP_LOGIN_REQUIRED(?:：|:|$)/.test(String(error.message))){
+    observation.status='awaiting_manual_login';audit.attempts.push(observation);onObservation(audit);return audit;
+   }
+   const gateway=/^STOP_SEARCH_GATEWAY_ERROR(?:：|:|$)/.test(String(error.message));
+   observation.status=gateway?'gateway_error':'stopped';observation.error=String(error.message);
+   audit.attempts.push(observation);onObservation(audit);
+   if(!gateway||attempt===retryDelaysMs.length)throw Object.assign(error,{searchNavigation:audit});
+   console.warn(`[搜索网关退避] ${keyword}：第${attempt+1}次网关错误，等待${retryDelaysMs[attempt]/1000}秒后仅重试原搜索；最多${retryDelaysMs.length}次`);
+   await waitForPacing(retryDelaysMs[attempt],{shouldStop});
+  }
+ }
+}
+let accessIncidentReporter=null;
+export function setAccessIncidentReporter(reporter){accessIncidentReporter=reporter;}
+async function stopForRestriction(message){
+ if(accessIncidentReporter)await accessIncidentReporter(message);
+ throw new Error(message);
+}
 export async function assertAccess(page) {
  if(page.isClosed())throw new Error('STOP_BROWSER_CLOSED');
  // The verification UI lives in a cross-origin iframe: body.innerText alone
  // cannot see it. A hidden, preloaded frame is not an active challenge.
  const verification=page.locator('iframe#nocaptcha-container,iframe[src*="rc-verifycenter"]');
- for(let i=0;i<await verification.count();i++)if(await verification.nth(i).isVisible())throw new Error('STOP_PLATFORM_RESTRICTION：出现验证弹窗，请人工处理，不自动重试');
+ for(let i=0;i<await verification.count();i++)if(await verification.nth(i).isVisible())await stopForRestriction('STOP_PLATFORM_RESTRICTION：出现验证弹窗，请人工处理，不自动重试');
  const text=await page.locator('body').innerText({timeout:5000});
  if(/(?:502\s+Bad Gateway|503\s+Service Unavailable|504\s+Gateway Time-out)/i.test(text))throw new Error('STOP_SEARCH_GATEWAY_ERROR：网站网关暂时不可用，保留断点，不冒充搜索无结果');
- if(/请完成.*验证|拖动.*滑块|安全验证|验证码验证|操作频繁|访问过于频繁|暂时无法浏览/.test(text))throw new Error('STOP_PLATFORM_RESTRICTION：需要人工处理，不自动重试');
- if(/登录后即可搜索|登录后查看更多|登录后查看评论/.test(text))throw new Error('STOP_LOGIN_REQUIRED：请人工登录');
+ if(/请完成.*验证|拖动.*滑块|安全验证|验证码验证/.test(text))await stopForRestriction('STOP_PLATFORM_RESTRICTION：出现验证码或安全验证，请人工处理');
+ if(/操作频繁|访问过于频繁|暂时无法浏览/.test(text))await stopForRestriction('STOP_PLATFORM_RESTRICTION：访问频繁，自动冷却等待');
+ if(/登录后即可搜索|登录后查看更多|登录后查看评论/.test(text))await stopForRestriction('STOP_LOGIN_REQUIRED：请人工登录');
 }
 async function searchCheck(page,shouldStop){
  if(await shouldStop?.())throw new Error('STOP_REQUESTED：搜索列表准备期间已安全停止');
@@ -67,16 +124,25 @@ export async function searchEndUi(page,keyword){
  }
  return {visible:false};
 }
-export async function scrollSearchResults(page){
- const list=page.locator('[data-e2e="scroll-list"]');
- for(let i=0;i<await list.count();i++)if(await list.nth(i).isVisible()){
-  const box=await list.nth(i).boundingBox();
-  if(box){const viewport=await page.evaluate(()=>({width:window.innerWidth,height:window.innerHeight}));
-   const x=Math.max(1,Math.min(viewport.width-1,box.x+box.width/2)),y=Math.max(1,Math.min(viewport.height-80,Math.max(180,box.y+Math.min(box.height/2,400))));
-   await page.mouse.move(x,y);break;
-  }
- }
- await page.mouse.wheel(0,750);
+export async function scrollSearchResults(page,{keyword}={}){
+ const url=new URL(page.url());
+ if(!url.pathname.startsWith('/search/')||url.searchParams.has('modal_id')
+  ||(keyword!=null&&decodeURIComponent(url.pathname.slice('/search/'.length))!==keyword))throw new Error('STOP_SEARCH_SCROLL_CONTEXT_LOST');
+ await assertAccess(page);
+ let state=await page.evaluate(searchScrollDom);
+ if(state.reason==='detail_modal_open')throw new Error('STOP_SEARCH_SCROLL_MODAL_OPEN');
+ if(!state.available)return state;
+ // Sorting used to leave the pointer on the search input. A wheel there can
+ // scroll suggestions instead of results. Escape/blur never submits a search.
+ await page.mouse.move(state.point.x,state.point.y);
+ await page.keyboard.press('Escape');
+ await page.evaluate(()=>{
+  const active=document.activeElement;
+  if(active?.matches('[data-e2e="searchbar-input"],input,textarea,[contenteditable="true"]'))active.blur();
+ });
+ state=await page.evaluate(searchScrollDom,{advance:true});
+ // These are movement diagnostics, never independent search-end evidence.
+ return state;
 }
 export async function waitForInitialSearch(page,observer,{shouldStop,timeoutMs=20000,pollMs=500}={}){
  // During hydration the layout controls can accept a click yet do nothing.
@@ -90,28 +156,35 @@ export async function waitForInitialSearch(page,observer,{shouldStop,timeoutMs=2
  }while(Date.now()<deadline);
  throw new Error('SEARCH_INITIAL_RESULTS_NOT_READY：搜索内容尚未加载，禁止把空DOM当年度完成');
 }
-export async function ensureSingleColumn(page,{shouldStop,timeoutMs=10000,pollMs=500}={}){
- const singles=page.locator('.search-result-card [data-e2e-vid]');
- const ready=async()=>{for(let i=0;i<await singles.count();i++)if(await singles.nth(i).isVisible())return true;return false;};
+export async function ensureSingleColumn(page,{shouldStop,timeoutMs=10000,pollMs=500,onDiagnostic}={}){
+ const observe=async(stage,details={},error=null)=>{try{await onDiagnostic?.({stage,details,error});}catch{/* Diagnostics never change the collection decision. */}};
+ // The same mounted, unambiguous cards we can collect must establish layout
+ // readiness. Image-only results and root-level player IDs have no descendant
+ // player. Grid fallback anchors alone still cannot certify single-column UI.
+ const ready=async()=>(await visibleCards(page)).some(row=>Number.isInteger(row.cardIndex));
  await searchCheck(page,shouldStop);
- if(await ready())return;
+ if(await ready()){await observe('layout_already_ready');return;}
  // At most two normal UI clicks, never force-click a loading/verification
  // overlay, never change the search tab to "video" and drop image posts.
  for(let attempt=0;attempt<2;attempt++){
   await searchCheck(page,shouldStop);
+  await observe('layout_click_started',{attempt:attempt+1,selector:'getByText(单列,exact).last'});
   try{await page.getByText('单列',{exact:true}).last().click({timeout:Math.min(10000,timeoutMs)});}
   catch(error){
+   await observe('layout_click_failed',{attempt:attempt+1},error);
    await searchCheck(page,shouldStop);if(await ready())return;
    if(attempt===1)throw Object.assign(new Error('STOP_SEARCH_LAYOUT_UNCONFIRMED：单列控件无法正常点击，保留断点'),{cause:error});
   }
   const deadline=Date.now()+timeoutMs;
   do{
    await searchCheck(page,shouldStop);
-   if(await ready())return;
+   if(await ready()){await observe('layout_verified',{attempt:attempt+1});return;}
    await pause(pollMs);
   }while(Date.now()<deadline);
  }
- throw new Error('STOP_SEARCH_LAYOUT_UNCONFIRMED：单列切换未生效，未发现可读取的帖子卡片；保留断点');
+ const error=new Error('STOP_SEARCH_LAYOUT_UNCONFIRMED：单列切换未生效，未发现可读取的帖子卡片；保留断点');
+ await observe('layout_not_confirmed',{},error);
+ throw error;
 }
 export async function selectLatest(page,observer,keyword,options={}) {
  await waitForInitialSearch(page,observer,options);
@@ -127,7 +200,9 @@ export async function selectLatest(page,observer,keyword,options={}) {
   if(observer.searchRequests.some(r=>r.at>=start&&r.latest&&(!r.keyword||r.keyword===keyword))){
    // Sorting remounts the list. Do not acknowledge the layout from an old
    // click before the new search has rendered its actual single-column rows.
-   await page.locator('[data-e2e="searchbar-input"]').hover({timeout:5000});
+   // Do not hover the search input: that opens suggestions over the feed and
+   // leaves subsequent wheel events targeting the wrong scrollport.
+   await page.keyboard.press('Escape');
    await pause(800);
    const empty=observer.searchPages?.some(p=>p.at>=start&&p.keyword===keyword&&p.latest&&p.hasMore===false&&p.noteIds.length===0)&&(await searchEndUi(page,keyword)).visible;
    if(!empty)await ensureSingleColumn(page,options);
@@ -139,20 +214,45 @@ export async function selectLatest(page,observer,keyword,options={}) {
  throw new Error('STOP_LATEST_SORT_UNCONFIRMED：未观察到最新排序请求，保留断点');
 }
 export async function visibleCards(page) {
- const singles=await page.locator('.search-result-card').evaluateAll(cards=>cards.filter(c=>c.getClientRects().length).map(c=>({noteId:c.querySelector('[data-e2e-vid]')?.getAttribute('data-e2e-vid'),text:c.innerText})).filter(c=>/^\d{15,22}$/.test(c.noteId||'')));
- if(singles.length){const seen=new Set();return singles.filter(c=>!seen.has(c.noteId)&&seen.add(c.noteId)).map(c=>({...c,url:`https://www.douyin.com/video/${c.noteId}`}));}
- return page.locator('a[href*="/video/"],a[href*="/note/"],a[href*="modal_id="]').evaluateAll(anchors=>anchors.filter(a=>a.getClientRects().length).map(a=>({url:a.href,text:a.innerText})) ).then(rows=>{
-  const seen=new Set();return rows.map(r=>({...r,noteId:extractId(r.url)})).filter(r=>r.noteId&&!seen.has(r.noteId)&&seen.add(r.noteId));
+ const snapshot=await page.locator('.search-result-card').evaluateAll(cards=>{
+  const blocked='[data-e2e="comment-list"],[data-e2e="comment-list-container"],[data-e2e="modal-video-container"],nav,aside';
+  const valid=id=>/^\d{15,22}$/.test(id||'');
+  const visible=el=>{const style=getComputedStyle(el);return el.getClientRects().length>0&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)!==0;};
+  const linkedId=a=>{
+   if(a.closest(blocked)||!visible(a))return null;
+   try{const u=new URL(a.href);if(!['www.douyin.com','douyin.com'].includes(u.hostname))return null;
+    const id=u.pathname.match(/^\/(?:video|note)\/(\d{15,22})\/?$/)?.[1]||u.searchParams.get('modal_id');return valid(id)?id:null;
+   }catch{return null;}
+  };
+  const rows=[];
+  cards.forEach((card,cardIndex)=>{
+   if(!visible(card)||card.closest(blocked))return;
+   const own=node=>node.closest('.search-result-card')===card&&!node.closest(blocked);
+   const players=[card,...card.querySelectorAll('[data-e2e-vid]')].filter(own);
+   const ids=[...new Set(players.map(n=>n.getAttribute('data-e2e-vid')).filter(valid))];
+   if(!ids.length)ids.push(...new Set([...card.querySelectorAll('a[href]')].filter(own).map(linkedId).filter(Boolean)));
+   // One search card must identify one post. Never guess among multiple IDs.
+   if(ids.length===1)rows.push({noteId:ids[0],cardIndex,text:card.innerText});
+  });
+  return {mountedCards:cards.length,rows};
+ });
+ if(snapshot.mountedCards){const seen=new Set();return snapshot.rows.filter(c=>!seen.has(c.noteId)&&seen.add(c.noteId)).map(c=>({...c,url:`https://www.douyin.com/video/${c.noteId}`}));}
+ return page.locator('a[href*="/video/"],a[href*="/note/"],a[href*="modal_id="]').evaluateAll(anchors=>anchors.filter(a=>a.getClientRects().length&&!a.closest('[data-e2e="comment-list"],[data-e2e="comment-list-container"],[data-e2e="modal-video-container"],nav,aside')).map(a=>({url:a.href,text:a.innerText})) ).then(rows=>{
+  const seen=new Set();return rows.map(r=>({...r,noteId:extractId(r.url)})).filter(r=>{
+   try{return ['www.douyin.com','douyin.com'].includes(new URL(r.url).hostname)&&r.noteId&&!seen.has(r.noteId)&&seen.add(r.noteId);}catch{return false;}
+  });
  });
 }
 export async function openCard(page,note) {
- const single=page.locator(`.search-result-card [data-e2e-vid="${note.noteId}"]`);
+ if(!/^\d{15,22}$/.test(note.noteId||''))throw new Error('SEARCH_CARD_ID_INVALID');
+ if(!(await visibleCards(page)).some(row=>row.noteId===note.noteId))throw new Error('SEARCH_CARD_NOT_VISIBLE：重新扫描当前搜索结果，不直接打开详情地址');
+ const card=await searchCard(page,note.noteId);
+ const single=await card.count()===1&&await card.getAttribute('data-e2e-vid')===note.noteId?card:card.locator(`[data-e2e-vid="${note.noteId}"]`);
  if(await single.count()){
   const player=single.first();
   await player.evaluate(el=>el.scrollIntoView({block:'center',inline:'nearest'}));
   const box=await player.boundingBox();if(box)await page.mouse.move(box.x+box.width/2,box.y+box.height/2);
   await pause(1200);await assertAccess(page);
-  const card=page.locator('.search-result-card').filter({has:page.locator(`[data-e2e-vid="${note.noteId}"]`)});
   // Centre/hover normally activates the inline player. Clicking an already
   // active player opens a modal and leaves the background card mounted.
   const active=card.locator('[data-e2e="feed-active-video"]');
@@ -163,8 +263,14 @@ export async function openCard(page,note) {
   if(await guide.count()&&await guide.last().isVisible())await guide.last().click({timeout:3000});
   return;
  }
- const links=page.locator(`a[href*="${note.noteId}"]`);
+ const links=(await card.count()?card:page).locator(`a[href*="${note.noteId}"]`);
  for(let i=0;i<await links.count();i++)if(await links.nth(i).isVisible()){
+  const eligible=await links.nth(i).evaluate((a,id)=>{
+   if(a.closest('[data-e2e="comment-list"],[data-e2e="comment-list-container"],[data-e2e="modal-video-container"],nav,aside'))return false;
+   try{const u=new URL(a.href);return ['www.douyin.com','douyin.com'].includes(u.hostname)
+    &&(u.pathname.match(/^\/(?:video|note)\/(\d{15,22})\/?$/)?.[1]||u.searchParams.get('modal_id'))===id;}catch{return false;}
+  },note.noteId);
+  if(!eligible)continue;
   await links.nth(i).click({timeout:10000});await pause(1500);await assertAccess(page);return;
  }
  throw new Error('SEARCH_CARD_NOT_VISIBLE：重新扫描当前搜索结果，不直接打开详情地址');
@@ -172,7 +278,7 @@ export async function openCard(page,note) {
 export async function restoreSearch(page,keyword,noteId=null) {
  // Normal details close in place. Never visit an author or reload search here.
  if(noteId&&!new URL(page.url()).searchParams.has('modal_id')){
-  const card=page.locator('.search-result-card').filter({has:page.locator(`[data-e2e-vid="${noteId}"]`)});
+  const card=await searchCard(page,noteId);
   const comments=card.locator('[data-e2e="comment-list"],[data-e2e="comment-list-container"]');
   let panelOpen=false;for(let i=0;i<await comments.count();i++)if(await comments.nth(i).isVisible()){panelOpen=true;break;}
   if(panelOpen){

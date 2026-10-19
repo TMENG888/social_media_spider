@@ -105,10 +105,28 @@ class PriorityTests(unittest.TestCase):
             args=self.loop_args(root);stop=MagicMock();stop.is_set.return_value=False
             control=MagicMock();control.poll.return_value=False
             item={'task_id':'topic1:new','topic':'topic1','keyword':'new keyword'}
-            with patch('retry_round.claim_round',return_value=(False,None,None,None)), patch.object(priority,'claim_retry_first',return_value=(None,False,{})), patch.object(q,'claim_primary_message',return_value=(('2-0',item),False)) as primary, patch.object(q,'run_task',return_value=0) as child, patch.object(q,'checkpoint_completion_guard',return_value={'ok':True,'deferredCount':0}), patch.object(q,'update_remote_status'), patch.object(q,'publish_remote_log'), patch.object(q,'redis_command'):
+            with patch('retry_round.claim_round',return_value=(False,None,None,None)), patch.object(priority,'claim_retry_first',return_value=(None,False,{})), patch.object(q,'claim_primary_message',return_value=(('2-0',item),False)) as primary, patch.object(q,'run_task',return_value=0) as child, patch.object(q,'primary_search_evidence_readback',return_value={'ok':True,'envelope':{'isolatedFixture':True}}), patch.object(q,'refresh_parent_keyword_status',return_value={'status':'completed'}), patch.object(q,'checkpoint_completion_guard',return_value={'ok':True,'deferredCount':0}), patch.object(q,'update_remote_status'), patch.object(q,'publish_remote_log'), patch.object(q,'redis_command'):
                 result=q._worker_loop(args,stop,control,Path(root)/'stop',Path(root)/'status.json',MagicMock(),'mixed',1,1)
             self.assertEqual(result,0);primary.assert_called_once()
             self.assertEqual(child.call_args.kwargs['task_kind'],'primary')
+
+    def test_primary_exit_zero_without_this_run_search_proof_cannot_ack(self):
+        with tempfile.TemporaryDirectory() as root:
+            args=self.loop_args(root);stop=MagicMock();stop.is_set.return_value=False
+            control=MagicMock();control.poll.return_value=False
+            item={'task_id':'topic1:original','topic':'topic1','keyword':'original keyword'}
+            with patch('retry_round.claim_round',return_value=(False,None,None,None)), patch.object(priority,'claim_retry_first',return_value=(None,False,{})), patch.object(q,'claim_primary_message',return_value=(('2-0',item),False)), patch.object(q,'run_task',return_value=0), patch.object(q,'checkpoint_completion_guard',return_value={'ok':True,'deferredCount':0}), patch.object(q,'acknowledge_primary_scan') as acknowledgement, patch.object(q,'update_remote_status'), patch.object(q,'publish_remote_log'), patch.object(q,'redis_command'):
+                result=q._worker_loop(args,stop,control,Path(root)/'stop',Path(root)/'status.json',MagicMock(),'mixed',1,1)
+            self.assertEqual(result,4);acknowledgement.assert_not_called()
+
+    def test_primary_confirmation_failure_is_nonzero_not_completed_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            args=self.loop_args(root);stop=MagicMock();stop.is_set.return_value=False
+            control=MagicMock();control.poll.return_value=False
+            item={'task_id':'topic1:original','topic':'topic1','keyword':'original keyword'}
+            with patch('retry_round.claim_round',return_value=(False,None,None,None)), patch.object(priority,'claim_retry_first',return_value=(None,False,{})), patch.object(q,'claim_primary_message',return_value=(('2-0',item),False)), patch.object(q,'run_task',return_value=0), patch.object(q,'primary_search_evidence_readback',return_value={'ok':True,'envelope':{'isolatedFixture':True}}), patch.object(q,'checkpoint_completion_guard',return_value={'ok':True,'deferredCount':0}), patch.object(q,'acknowledge_primary_scan',side_effect=TimeoutError('isolated timeout')), patch.object(q,'update_remote_status'), patch.object(q,'publish_remote_log'), patch.object(q,'redis_command'):
+                result=q._worker_loop(args,stop,control,Path(root)/'stop',Path(root)/'status.json',MagicMock(),'mixed',1,1)
+            self.assertEqual(result,4)
 
 
 if __name__ == '__main__': unittest.main()

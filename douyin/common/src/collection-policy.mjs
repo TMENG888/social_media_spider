@@ -23,8 +23,8 @@ export function inTargetYear(value, year, cutoff = `${year}-01-01`) {
 }
 
 // Only distinct, consecutive detail-page observations count. Unknown or failed
-// details occupy a slot, so eight older observations separated by an unknown
-// cannot accidentally satisfy the stopping rule.
+// details occupy a slot. This is diagnostic evidence only: even latest-sorted
+// searches can interleave old posts before current-year results.
 export class YearBoundary {
   constructor(year, size = 8) {
     this.year = Number(year);
@@ -45,12 +45,12 @@ export class YearBoundary {
 }
 
 // A cap is meaningful only for explicit sampling. Annual collection continues
-// until the verified date boundary or repeated no-growth is observed.
+// until a verified search endpoint; stagnation is an incomplete scan.
 export function scrollBudget(collectAll, configured) {
   return collectAll ? Infinity : Math.max(1, Number(configured) || 20);
 }
 
-// Exhaustion is separate from the eight-older-post heuristic. A short result
+// Exhaustion is separate from the eight-older-post diagnostic. A short result
 // set (including zero current-year posts) can be complete, but stagnation alone
 // can never establish that fact.
 export function searchExhaustionEvidence({keyword,after,sortConfirmed,pages=[],failures=[],uiEnd,candidates=[]}={}){
@@ -71,6 +71,16 @@ export function searchExhaustionEvidence({keyword,after,sortConfirmed,pages=[],f
   const c=indexed.get(id);
   if(!c||!['completed','skipped_old'].includes(c.status)||!validDate(c.publishedAt)||(c.status==='completed'&&c.result?.audit?.commentsComplete===false))gaps.push(id);
  }
- if(gaps.length)return {confirmed:false,reason:'known_candidates_incomplete',gaps};
- return {confirmed:true,reason:'search_exhausted',keyword,sortConfirmed:true,hasMore:false,returnedCount:returned.length,checkpointCount:candidates.length,lastResponseAt:last.at,offset:last.offset??null,uiText:uiEnd.text};
+ // Pagination completion is not proof of detail completeness. The independent
+ // DB coverage gate counts every unresolved candidate in its denominator.
+ return {confirmed:true,reason:'search_exhausted',gaps,keyword,sortConfirmed:true,hasMore:false,returnedCount:returned.length,checkpointCount:candidates.length,lastResponseAt:last.at,offset:last.offset??null,uiText:uiEnd.text};
+}
+
+export function verifiedAnnualSearchEnd(summary){
+ const evidence=summary?.searchExhaustion;
+ return summary?.sortConfirmed===true&&summary.stopReason==='search_exhausted'
+  &&evidence?.confirmed===true&&evidence.reason==='search_exhausted'
+  &&evidence.keyword===summary.keyword&&evidence.sortConfirmed===true
+  &&evidence.hasMore===false&&Number.isInteger(evidence.stableChecks)
+  &&evidence.stableChecks>=2;
 }

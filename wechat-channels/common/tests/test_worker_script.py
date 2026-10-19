@@ -1,5 +1,9 @@
 import unittest
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -28,6 +32,63 @@ class WorkerScriptTests(unittest.TestCase):
         self.assertIn(
             "Remove-Item $stopFile -Force -ErrorAction SilentlyContinue", worker
         )
+
+    def test_legacy_date_cutoff_reports_cannot_bypass_collection_and_are_preserved(self):
+        worker = (COMMON / 'run-worker.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("$CompletionSchemaVersion = 'channels-pagination-v8-bound-search-end'", worker)
+        self.assertIn('$oldKeyword.completionSchemaVersion -eq $CompletionSchemaVersion', worker)
+        archive = worker.index("$legacyHistory = Join-Path $outDir 'acceptance-history'")
+        self.assertLess(archive, worker.index("$ks = [ordered]@{keyword=$allowedKeyword"))
+        self.assertIn('Copy-Item -LiteralPath $keywordStatusPath -Destination $legacyStatusBackup', worker)
+        self.assertIn("throw 'Legacy keyword report evidence mismatch; refusing overwrite'", worker)
+
+    def test_primary_and_backfill_use_same_nonsecret_database_defaults_as_verifier(self):
+        for name in ('run-worker.ps1', 'run-asr-backfill.ps1'):
+            source = (COMMON / name).read_text(encoding='utf-8-sig')
+            self.assertIn("Join-Path $Common 'src\\mysql-defaults.json'", source)
+            for setting in ('host', 'port', 'database'):
+                self.assertIn('[string]$mysqlDefaults.' + setting, source)
+            self.assertNotIn("$env:MYSQL_HOST = '127.0.0.1'", source)
+
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('powershell.exe'), 'Windows PowerShell fixture')
+    def test_real_powershell_report_archive_is_byte_exact_idempotent_and_rejects_bad_backup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = root / 'keyword_status.json'
+            content = b'{"status":"completed","oldEvidence":"fixture","completionSchemaVersion":"v5"}\r\n'
+            original.write_bytes(content)
+            script = r'''
+$ErrorActionPreference='Stop'
+$outDir=$env:ARCHIVE_FIXTURE_ROOT
+$keywordStatusPath=Join-Path $outDir 'keyword_status.json'
+$oldKeyword=Get-Content -LiteralPath $keywordStatusPath -Raw | ConvertFrom-Json
+$CompletionSchemaVersion='channels-pagination-v8-bound-search-end'
+$tokens=$null;$errors=$null
+$tree=[System.Management.Automation.Language.Parser]::ParseFile($env:ARCHIVE_FIXTURE_SOURCE,[ref]$tokens,[ref]$errors)
+if($errors.Count){throw 'Fixture parse failed'}
+$hashFunctions=@($tree.FindAll({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-StatusEvidenceHash'},$true))
+if($hashFunctions.Count -ne 1){throw 'Exact evidence hash helper not found'}
+. ([ScriptBlock]::Create($hashFunctions[0].Extent.Text))
+$blocks=@($tree.FindAll({param($node) $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.StartsWith('if ((Test-Path -LiteralPath $keywordStatusPath)')},$true))
+if($blocks.Count -ne 1){throw 'Exact archival branch not found'}
+& ([ScriptBlock]::Create($blocks[0].Extent.Text))
+'''
+            env = {**os.environ, 'ARCHIVE_FIXTURE_ROOT': folder,
+                   'ARCHIVE_FIXTURE_SOURCE': str(COMMON / 'run-worker.ps1')}
+            def run_fixture():
+                return subprocess.run(['powershell.exe', '-NoProfile', '-Command', script],
+                    env=env, capture_output=True, text=True, timeout=20,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            for _ in range(2):
+                result = run_fixture()
+                self.assertEqual(result.returncode, 0, 'Isolated archive branch failed: ' + result.stderr)
+            backups = list((root / 'acceptance-history').glob('*.json'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), content)
+            self.assertEqual(original.read_bytes(), content)
+            backups[0].write_bytes(b'corrupted fixture backup')
+            self.assertNotEqual(run_fixture().returncode, 0)
+            self.assertEqual(original.read_bytes(), content)
 
     def test_absolute_keyword_file_is_not_joined_to_package_root(self):
         source = (COMMON / "run-worker.ps1").read_text(encoding="utf-8-sig")

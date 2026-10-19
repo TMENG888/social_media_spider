@@ -2,7 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
 import { atomicWriteFileSync } from './atomic-file.mjs';
+import {mysqlConnectionOptions} from './mysql-connection-options.mjs';
 import {ProductionOutputRecorder,meaningfulHint,finishOutput,recoverCommittedOutputs} from './production-output.mjs';
+import {acquireImportLocks} from './mysql-import-locks.mjs';
+import {subtitleDedupeEnabled} from './channels-subtitle-policy.mjs';
 
 const args = {};
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -11,15 +14,13 @@ for (let i = 2; i < process.argv.length; i += 1) {
 const postsFile = path.resolve(String(args.posts || ''));
 const commentsFile = args.comments && args.comments !== true ? path.resolve(String(args.comments)) : null;
 const statusFile = path.resolve(String(args.status || path.join(path.dirname(postsFile), 'mysql_import_status.json')));
-const host = process.env.MYSQL_HOST || '127.0.0.1';
-const port = Number(process.env.MYSQL_PORT || 3306);
-const database = process.env.MYSQL_DATABASE || 'social';
-const user = process.env.MYSQL_USER;
-const password = process.env.MYSQL_PASSWORD;
+const connectionOptions = mysqlConnectionOptions();
+const {host,port,database,user,password}=connectionOptions;
 if (!postsFile || !fs.existsSync(postsFile)) throw new Error(`文章文件不存在: ${postsFile}`);
 if (!user || !password) throw new Error('MYSQL_USER 和 MYSQL_PASSWORD 未设置，拒绝无凭据入库');
 const read = (file) => fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map(JSON.parse) : [];
 const posts = read(postsFile), comments = commentsFile ? read(commentsFile) : [];
+const subtitleDedupe = subtitleDedupeEnabled();
 const postFields = ['id','文章图片链接','文章图片信息','作者名字','文章标题','文章内容','文章标签','文章时间地点','文章点赞数','文章收藏数','文章评论数','文章链接','文章id','作者主页链接','文章视频链接','文章视频内容','关键词','作者id','作者粉丝数','作者点赞数','文章分享数','文章视频时长','平台','文章获取时间','文章标注','分类','清洗标注','项目','地点','内容类型','是否广告','广告关键词'];
 const commentFields = ['id','评论id','评论用户链接','评论用户id','评论用户名字','评论内容','评论时间','评论IP','评论点赞数','评论回复数','文章链接','文章id','关键词','评论获取时间','平台','分类','项目','清洗标注'];
 const value = (row, field) => row[field] === '' || row[field] === undefined ? null : row[field];
@@ -42,15 +43,15 @@ const videoSimilarity = (left, right) => {
   for (const token of sa) if (sb.has(token)) overlap += 1;
   return overlap / Math.min(sa.size, sb.size);
 };
-const conn = await mysql.createConnection({host, port, user, password, database, charset:'utf8mb4', supportBigNumbers:true, bigNumberStrings:true, ssl:/^(1|true|yes)$/i.test(process.env.MYSQL_SSL || '') ? {} : undefined, connectTimeout:15000});
+const conn = await mysql.createConnection({...connectionOptions,supportBigNumbers:true,bigNumberStrings:true});
 let insertedPosts=0, updatedPosts=0, insertedComments=0, updatedComments=0, duplicatePostsSkipped=0, duplicateCommentsSkipped=0;
 let compatibilitySanitizedValues=0;
 const subtitleBackups = [];
 const outputRecorder=new ProductionOutputRecorder();
 const subtitleBackupPath = path.join(path.dirname(statusFile), `subtitle-backup-${Date.now()}-${process.pid}.json`);
+let releaseImportLocks=null;
 try {
-  const [lockRows] = await conn.query("SELECT GET_LOCK('wechat_ods_import', 60) AS acquired");
-  if (Number(lockRows[0]?.acquired) !== 1) throw new Error('MySQL import lock unavailable; no writes performed');
+  releaseImportLocks=await acquireImportLocks(conn);
   try {await recoverCommittedOutputs(conn,outputRecorder.root);} catch {}
   await conn.beginTransaction();
   // Existing production ODS tables were originally created with a mixture of
@@ -141,7 +142,7 @@ try {
     // Normalize blanks exactly as INSERT/UPDATE does. Previously the lookup
     // used '' while storage converted it to NULL, breaking retry idempotency.
     const project = value(row, '项目'), platform = value(row, '平台') || '微信视频号';
-    if (platform === '微信视频号' && value(row, '文章视频内容')) {
+    if (subtitleDedupe && platform === '微信视频号' && value(row, '文章视频内容')) {
       const [sameLink] = await conn.execute(
         "SELECT `id` FROM `ods_social_media_post` WHERE `文章链接`=? AND `平台`=? AND `项目` <=> ? LIMIT 1 FOR UPDATE",
         [row['文章链接'], platform, project],
@@ -158,7 +159,7 @@ try {
     }
     const result = await upsert('ods_social_media_post', postFields, row, '`文章链接`=? AND `平台`=? AND `项目` <=> ?', [row['文章链接'], platform, project], `${platform}|${project}|${row['文章链接'] || row['文章id']}`);
     result.updated ? updatedPosts++ : insertedPosts++;
-    if (platform === '微信视频号' && value(row, '文章视频内容')) {
+    if (subtitleDedupe && platform === '微信视频号' && value(row, '文章视频内容')) {
       const pool = await getVideoPool(platform, project);
       const existing = pool.find((item) => item.url === row['文章链接']);
       if (existing) existing.content = row['文章视频内容'];
@@ -180,17 +181,17 @@ try {
   outputRecorder.commitAttempted=true;
   await conn.commit();
   const outputTelemetry=await finishOutput(outputRecorder,conn);
-  const status = {status:'success',host,database,posts:posts.length,comments:comments.length,insertedPosts,updatedPosts,duplicatePostsSkipped,insertedComments,updatedComments,duplicateCommentsSkipped,compatibilitySanitizedValues,subtitleBackupCount:subtitleBackups.length,subtitleBackupPath:subtitleBackups.length ? subtitleBackupPath : null,completedAt:new Date().toISOString(),outputTelemetry};
+  const status = {status:'success',host,database,subtitleDedupeEnabled:subtitleDedupe,posts:posts.length,comments:comments.length,insertedPosts,updatedPosts,duplicatePostsSkipped,insertedComments,updatedComments,duplicateCommentsSkipped,compatibilitySanitizedValues,subtitleBackupCount:subtitleBackups.length,subtitleBackupPath:subtitleBackups.length ? subtitleBackupPath : null,completedAt:new Date().toISOString(),outputTelemetry};
   atomicWriteFileSync(statusFile, JSON.stringify(status,null,2), 'utf8');
   console.log(JSON.stringify(status,null,2));
 } catch (error) {
   await conn.rollback().catch(() => {});
   try {outputRecorder.abort();} catch {}
-  const status = {status:'failed',host,database,error:String(error?.message || error),failedAt:new Date().toISOString()};
+  const status = {status:'failed',host,database,error:String(error?.message || error),errorCode:error?.code||null,failedAt:new Date().toISOString()};
   atomicWriteFileSync(statusFile, JSON.stringify(status,null,2), 'utf8');
   console.error(JSON.stringify(status,null,2));
   process.exitCode = 2;
 } finally {
-  await conn.query("SELECT RELEASE_LOCK('wechat_ods_import')").catch(() => {});
+  await releaseImportLocks?.();
   await conn.end();
 }

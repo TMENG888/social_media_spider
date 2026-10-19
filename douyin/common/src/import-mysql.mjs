@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import mysql from "mysql2/promise";
+import { mysqlTargetOptions } from "./mysql-target-options.mjs";
 import { POST_FIELDS, COMMENT_FIELDS, canonicalDouyinPostUrl } from "./schema.mjs";
 import { pathToFileURL } from "node:url";
 import { assertLocalLease, withImportLease } from "./lease-guard.mjs";
@@ -23,9 +24,7 @@ export function mysqlConnectionOptions() {
   const user = process.env.MYSQL_USER, password = process.env.MYSQL_PASSWORD;
   if (!user || !password) throw new Error("请通过当前进程环境变量 MYSQL_USER 和 MYSQL_PASSWORD 提供数据库凭据，不要写入配置文件");
   return {
-    host: String(process.env.MYSQL_HOST || "127.0.0.1"),
-    port: Number(process.env.MYSQL_PORT || 3306),
-    database: String(process.env.MYSQL_DATABASE || "social"),
+    ...mysqlTargetOptions(),
     user, password, charset: "utf8mb4", supportBigNumbers: true, bigNumberStrings: true, connectTimeout: 15000
   };
 }
@@ -268,4 +267,3 @@ if (isMain) {
     console.log(JSON.stringify({ committed: true, postResult, commentResult }, null, 2));
   }
 }
-

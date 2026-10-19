@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$WorkerRoot,[ValidateSet('auto','posts','authors')][string]$Phase='auto',[switch]$Check,[switch]$SingleCycle,[switch]$Test,[int]$Limit=10)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -50,6 +50,12 @@ try {
   while($true){
     Assert-RemoteControlAvailable
     if(Test-Path -LiteralPath $SupervisorStop){break}
+    if(-not $Test){
+      Set-MonitorSupervisorState 'cooldown'
+      & $Node (Join-Path $Common 'src\operational-gate.mjs') --root $Common --worker-root $Worker --platform '抖音' --action wait
+      if($LASTEXITCODE -eq 20){break}
+      if($LASTEXITCODE -ne 0){throw 'Operational incident state unavailable. Collection not started.'}
+    }
     $Cycle++
     $Minutes=Get-Random -Minimum 45 -Maximum 61
     Write-Host "[Cycle supervisor] Cycle $Cycle starts; runtime=$Minutes minutes."

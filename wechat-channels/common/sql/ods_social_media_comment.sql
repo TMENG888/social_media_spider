@@ -4,7 +4,7 @@
  Source Server         : 全国地产设计产品力监测
  Source Server Type    : MySQL
  Source Server Version : 80036 (8.0.36)
- Source Host           : 127.0.0.1:3306
+ Source Host           : 127.0.0.1:3306 (deployment example)
  Source Schema         : social
 
  Target Server Type    : MySQL

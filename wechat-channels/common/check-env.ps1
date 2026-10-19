@@ -3,7 +3,10 @@ $Common = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Resolve-Path (Join-Path $Common '..')
 $WorkerRoot = if ($env:WECHAT_WORKER_ROOT) { Resolve-Path $env:WECHAT_WORKER_ROOT } else { $Root }
 $checks = @()
-function Add-Check($name, $ok, $detail) { $script:checks += [pscustomobject]@{name=$name; ok=[bool]$ok; detail=[string]$detail} }
+function Add-Check($name, $ok, $detail) {
+  $optionalAudio = $env:SOCIAL_VOLUME_ENABLED -eq '1' -and $name -in @('asr_python_modules','audio_loopback','asr_worker','loopback_recorder','process_loopback_recorder','asr_model')
+  $script:checks += [pscustomobject]@{name=$name; ok=[bool]$ok; required=(-not $optionalAudio); detail=[string]$detail}
+}
 $node = if ($env:WECHAT_NODE) { $env:WECHAT_NODE } else { (Get-Command node -ErrorAction SilentlyContinue).Source }
 $python = if ($env:WECHAT_PYTHON) { $env:WECHAT_PYTHON } else { (Get-Command python -ErrorAction SilentlyContinue).Source }
 $nodeDetail = if ($node) { $node } else { 'not-found' }
@@ -13,8 +16,10 @@ Add-Check 'python' ([bool]$python -and (Test-Path -LiteralPath $python)) $python
 if ($python -and (Test-Path -LiteralPath $python)) {
   # soundcard initializes Media Foundation COM and must stay isolated from
   # pywinauto's COM apartment, just like the production loopback subprocess.
-  $moduleProbe = & $python -c "import openpyxl, PIL, pywinauto, win32clipboard, faster_whisper" 2>&1
-  Add-Check 'python_modules' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {'openpyxl/PIL/pywinauto/pywin32/faster-whisper'} else {[string]$moduleProbe}))
+  $moduleProbe = & $python -c "import openpyxl, PIL, pywinauto, win32clipboard" 2>&1
+  Add-Check 'python_modules' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {'openpyxl/PIL/pywinauto/pywin32'} else {[string]$moduleProbe}))
+  $asrModuleProbe = & $python -c "import faster_whisper" 2>&1
+  Add-Check 'asr_python_modules' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {'faster-whisper'} else {[string]$asrModuleProbe}))
   $audioProbe = & $python -c "import soundcard as sc; s=sc.default_speaker(); assert s is not None; print(s.name)" 2>&1
   Add-Check 'audio_loopback' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {[string]$audioProbe} else {[string]$audioProbe}))
 }
@@ -57,7 +62,7 @@ if ($env:MYSQL_ENABLED -ne '0') {
 Add-Check 'task_queue' (Test-Path "$Root\common\task-queue.json") "$Root\common\task-queue.json"
 Add-Check 'writable' ((Test-Path $WorkerRoot) -and (Test-Path (New-Item -ItemType File -Force -Path (Join-Path $WorkerRoot '.state\write-test.tmp')))) "$WorkerRoot"
 Remove-Item (Join-Path $WorkerRoot '.state\write-test.tmp') -Force -ErrorAction SilentlyContinue
-$result = [pscustomobject]@{workerRoot=[string]$WorkerRoot; checks=$checks; ok=(@($checks | Where-Object {-not $_.ok}).Count -eq 0); checkedAt=(Get-Date).ToString('o')}
+$result = [pscustomobject]@{workerRoot=[string]$WorkerRoot; checks=$checks; ok=(@($checks | Where-Object {$_.required -and -not $_.ok}).Count -eq 0); checkedAt=(Get-Date).ToString('o')}
 $json = $result | ConvertTo-Json -Depth 5
 $statusPath = Join-Path $WorkerRoot '.state\environment_check.json'
 $temporary = "$statusPath.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"

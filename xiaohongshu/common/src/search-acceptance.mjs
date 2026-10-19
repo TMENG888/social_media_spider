@@ -1,19 +1,29 @@
-export const SCOPE_POLICY = '20261014-keyword-anchor-v1';
+import {entityRelevance} from './enterprise-relevance.mjs';
+export const SCOPE_POLICY = '20261015-positive-scope-evidence-v2';
 const normalized = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
 
 // An explicit lexical scope, not an LLM guess. The entity is the first query
 // term; intent terms such as 看房 need not occur verbatim in a relevant note.
-export function assessKeywordScope(keyword, result, {anchors} = {}) {
+export function assessKeywordScope(keyword, result, {anchors,excludedEntities=[]} = {}) {
   const terms = anchors || [String(keyword || '').trim().split(/\s+/)[0]];
   if (!Array.isArray(terms) || !terms.length || terms.some(t => normalized(t).length < 2))
     throw new Error('SCOPE_ANCHOR_INVALID: configure a nonempty entity anchor');
   const post = result?.post || result?.scopeEvidence || {};
+  const relevance=!anchors?entityRelevance(keyword,post):null;
   const fields = {title:post['文章标题'] ?? post.title, body:post['文章内容'] ?? post.body,
     tags:post['文章标签'] ?? post.tags, subtitle:post['文章视频内容'] ?? post.subtitle};
   const values = Object.entries(fields).map(([field,value]) => [field,normalized(Array.isArray(value)?value.join(' '):value)]);
   const matches = terms.flatMap(anchor => values.filter(([,value])=>value.includes(normalized(anchor))).map(([field])=>({anchor,field})));
-  return {policy:SCOPE_POLICY, anchors:terms, status:matches.length?'accepted':values.some(([,v])=>v)?'out_of_scope':'unobserved',
-    matches, reason:matches.length?'entity_anchor_observed':values.some(([,v])=>v)?'entity_anchor_not_observed':'detail_content_not_observed'};
+  const detailObserved=values.some(([field,v])=>['title','body'].includes(field)&&v);
+  const accepted=relevance?relevance.accepted:matches.length>0;
+  const exclusion=!accepted&&!matches.length&&Array.isArray(excludedEntities)?excludedEntities.flatMap(entity=>
+    normalized(entity).length>=2&&!terms.some(term=>normalized(term).includes(normalized(entity))||normalized(entity).includes(normalized(term)))
+    ?values.filter(([field,value])=>['title','body'].includes(field)&&value.includes(normalized(entity)))
+      .map(([field])=>({kind:'configured_entity',entity,field})):[])[0]:null;
+  return {policy:SCOPE_POLICY, anchors:terms,
+    status:accepted?'accepted':exclusion?'out_of_scope':detailObserved?'uncertain':'unobserved',
+    matches,...(relevance?{relevance}:{}),...(exclusion?{exclusion}:{}),
+    reason:accepted?(relevance?.enterprise?relevance.reason:'entity_anchor_observed'):exclusion?'configured_other_entity_observed':detailObserved?'entity_relevance_uncertain':'detail_content_not_observed'};
 }
 
 // Old-date windows are diagnostic only. Even Latest search can be interleaved.

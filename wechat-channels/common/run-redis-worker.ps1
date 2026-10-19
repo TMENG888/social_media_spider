@@ -52,9 +52,10 @@ if (-not $env:REDIS_TASK_PRIORITY) { $env:REDIS_TASK_PRIORITY = 'retry_first' }
 
 if (-not $env:MYSQL_ENABLED) { $env:MYSQL_ENABLED = '1' }
 if ($env:MYSQL_ENABLED -ne '0') {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
-  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
-  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
+  $mysqlDefaults = Get-Content -LiteralPath (Join-Path $Common 'src\mysql-defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = [string]$mysqlDefaults.host }
+  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = [string]$mysqlDefaults.port }
+  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = [string]$mysqlDefaults.database }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }
   if (-not $env:MYSQL_PASSWORD) {
     $mysqlSecure = Read-Host 'MySQL password' -AsSecureString
@@ -90,9 +91,16 @@ try {
   Write-Host "Redis: $env:REDIS_URL"
   Write-Host "DisplayProfile: $env:WECHAT_DISPLAY_PROFILE"
   Write-Host "DatabaseEnabled: $($env:MYSQL_ENABLED -ne '0')"
-  Write-Host 'Checking/downloading and loading ASR model before claiming Redis tasks...'
-  & $Python (Join-Path $Common 'src\asr_model_preflight.py') (Join-Path $Common 'collector_config.json')
-  if ($LASTEXITCODE -ne 0) { throw 'ASR model preflight failed. No Redis task has been claimed; fix model/network and restart.' }
+  $quantityPolicy=Get-Content -LiteralPath (Join-Path $Common 'acceptance-policy.json') -Raw -Encoding UTF8 -ErrorAction SilentlyContinue | ConvertFrom-Json
+  $quantityEnabled=$quantityPolicy.enabled -eq $true -and $quantityPolicy.policy -eq '20261015-keyword-count-p80-v1' -and $quantityPolicy.population -eq 'nonzero_keywords'
+  $env:SOCIAL_VOLUME_ENABLED=if($quantityEnabled){'1'}else{'0'}
+  if($quantityEnabled){
+    Write-Host 'Quantity acceptance: audio is optional; required runtime checks run before claiming any original task.'
+  }else{
+    Write-Host 'Checking/downloading and loading ASR model before claiming Redis tasks...'
+    & $Python (Join-Path $Common 'src\asr_model_preflight.py') (Join-Path $Common 'collector_config.json')
+    if ($LASTEXITCODE -ne 0) { throw 'ASR model preflight failed. No Redis task has been claimed; fix model/network and restart.' }
+  }
   $arguments = @(
     $Scheduler, 'run', '--queue', $Queue, '--common', $Common,
     '--worker-root', $WorkerRoot, '--redis-url', $env:REDIS_URL,

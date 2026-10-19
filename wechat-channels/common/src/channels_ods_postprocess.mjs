@@ -2,6 +2,8 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { cleanText, extractHashtags, normalizeTags } from "./text-cleaner.mjs";
 import { atomicWriteFileSync } from "./atomic-file.mjs";
+import {cleanCompactContent,cleanVideoContent} from './channels-field-normalization.mjs';
+import {subtitleDedupeEnabled} from './channels-subtitle-policy.mjs';
 
 const inputPath = process.argv[2] || "outputs/channels_test/ods_social_media_post_channels.jsonl";
 const enrichmentPath = process.argv[3] || inputPath.replace(/\.jsonl$/i, "_browser_enrichment.jsonl");
@@ -38,51 +40,6 @@ const cleanComment = (raw) => {
   const cleaned = cleanText(source, { removeEmoji: true });
   const compact = cleaned.text.replace(/[\t ]+/g, " ").split(/\r?\n/).map((x) => x.trim()).filter(Boolean).join("，").replace(/，{2,}/g, "，").trim();
   return { text: compact || null, stats: { ...cleaned.stats, 清理后文字数: cpLength(compact) } };
-};
-const cleanVideoContent = (raw) => {
-  const source = String(raw || "");
-  const withoutBoilerplate = source.replace(/请(?:不吝)?点赞订阅转发打赏支持明镜与点点(?:栏目)?/gu, "");
-  let deduped = withoutBoilerplate;
-  for (let index = 0; index < 3; index += 1) {
-    const collapsed = deduped.replace(/(.{6,}?[，。！？；])(?:\1)+/gu, "$1");
-    if (collapsed === deduped) break;
-    deduped = collapsed;
-  }
-  const clauses = deduped.split(/[，。！？；]+/gu).map((value) => value.trim()).filter(Boolean);
-  const originalClauseCount = clauses.length;
-  let changed = true;
-  while (changed && clauses.length >= 2) {
-    changed = false;
-    for (let width = Math.floor(clauses.length / 2); width >= 1 && !changed; width -= 1) {
-      for (let start = 0; start + width * 2 <= clauses.length; start += 1) {
-        const left = clauses.slice(start, start + width).join("\u0000");
-        const right = clauses.slice(start + width, start + width * 2).join("\u0000");
-        if (left === right) {
-          clauses.splice(start + width, width);
-          changed = true;
-          break;
-        }
-      }
-    }
-  }
-  if (clauses.length !== originalClauseCount) deduped = clauses.join("，");
-  const removedCount = Math.max(0, cpLength(source) - cpLength(deduped));
-  const cleaned = cleanText(deduped, {
-    removeEmoji: true,
-    singleParagraph: true,
-    paragraphSeparator: "，",
-  });
-  const text = cleaned.text.replace(/，{2,}/gu, "，").replace(/^，|，$/gu, "").trim();
-  return {
-    text: text || null,
-    stats: {
-      ...cleaned.stats,
-      原始文字数: cpLength(source),
-      清理后文字数: cpLength(text),
-      其他字符个数: Number(cleaned.stats.其他字符个数 || 0) + removedCount,
-      重复字符个数: Number(cleaned.stats.重复字符个数 || 0) + removedCount,
-    },
-  };
 };
 const emptyStats = () => ({ 原始文字数: 0, 清理后文字数: 0, 表情个数: 0, 其他字符个数: 0, 重复字符个数: 0 });
 const aggregateCleaningStats = (...values) => values.reduce((total, value) => {
@@ -169,33 +126,6 @@ function dedupeByVideoContent(items) {
   };
 }
 
-function cleanCompactContent(raw) {
-  // Remove only WeChat's own UI text. Publisher-authored calls to action,
-  // disclaimers and contact details are genuine source content and must stay.
-  const source = String(raw || "")
-    .replace(/，?\s*时长\s*\n?\s*\d{1,2}:\d{2}(?::\d{2})?/gu, "")
-    .split(/\r?\n/)
-    .filter((line) => !/^\s*(?:继续滑动看下一个|向上滑动看下一个|阅读原文|写留言|暂无留言)\s*$/u.test(line))
-    .join("\n");
-  const tags = normalizeTags(extractHashtags(source));
-  // Keep the extracted tag text in the article body, but remove hashtag marks.
-  // This also handles paired forms such as “#标签#”: the regex consumes the
-  // opening mark and the final replace removes the closing (and any other)
-  // hash marks left in the visible article text.
-  const body = source.replace(hashtagPattern, "$1").replace(/#/gu, "");
-  const cleaned = cleanText(body, { removeEmoji: true });
-  const compact = cleaned.text.replace(/[\t\r\n]+/g, "").replace(/ {2,}/g, " ").trim();
-  const compactRemoved = cpLength(cleaned.text) - cpLength(compact);
-  return {
-    content: compact || null,
-    tags,
-    stats: {
-      ...cleaned.stats,
-      清理后文字数: cpLength(compact),
-      其他字符个数: cleaned.stats.其他字符个数 + Math.max(0, compactRemoved),
-    },
-  };
-}
 
 function isArticleImageUrl(value) {
   if (!value || /^(?:data:|blob:|javascript:|about:)/i.test(value)) return false;
@@ -291,9 +221,12 @@ for (const record of records) {
   record["内容类型"] = "视频";
 }
 
-// 视频号以字幕/ASR文本作为核心去重字段。达到80%相似度时保留发布时间
-// 最早的一条；无字幕的视频不参与文本查重，继续依赖finder/link身份。
-const deduped = dedupeByVideoContent(records);
+// Quantity mode must retain distinct video metadata/comments even when their
+// subtitles match. Link/identity idempotency remains the importer's job.
+// Outside quantity mode preserve the existing 80% subtitle dedupe policy.
+const subtitleDedupe = subtitleDedupeEnabled();
+const deduped = subtitleDedupe ? dedupeByVideoContent(records)
+  : {kept:records,removed:0,duplicates:[]};
 records = deduped.kept;
 const keptPostUrls = new Set(records.map((row) => row["文章链接"]).filter(Boolean));
 const dedupeAuditPath = outputPath.replace(/\.jsonl$/i, "_dedupe_audit.jsonl");
@@ -387,4 +320,4 @@ for (const target of [outputPath, csvPath]) {
 }
 atomicWriteFileSync(outputPath, records.map((item) => JSON.stringify(item)).join("\n") + (records.length ? "\n" : ""));
 atomicWriteFileSync(csvPath, "\uFEFF" + headers.map(quote).join(",") + "\n" + records.map((record) => headers.map((field) => quote(record[field])).join(",")).join("\n") + (records.length ? "\n" : ""));
-console.log(JSON.stringify({ records: records.length, invalidLinksRemoved, duplicatesRemoved: deduped.removed, tagged: records.filter((r) => r["文章标签"]).length, images: records.filter((r) => r["文章图片链接"]).length, videos: records.filter((r) => r["文章视频链接"]).length, videoContent: records.filter((r) => r["文章视频内容"]).length, comments: collectComments ? comments.length : 0, authorUrls: records.filter((r) => r["作者主页链接"]).length, dedupeAuditPath, outputPath, csvPath }, null, 2));
+console.log(JSON.stringify({ subtitleDedupeEnabled: subtitleDedupe, records: records.length, invalidLinksRemoved, duplicatesRemoved: deduped.removed, tagged: records.filter((r) => r["文章标签"]).length, images: records.filter((r) => r["文章图片链接"]).length, videos: records.filter((r) => r["文章视频链接"]).length, videoContent: records.filter((r) => r["文章视频内容"]).length, comments: collectComments ? comments.length : 0, authorUrls: records.filter((r) => r["作者主页链接"]).length, dedupeAuditPath, outputPath, csvPath }, null, 2));

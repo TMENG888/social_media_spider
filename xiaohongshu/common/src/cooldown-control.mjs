@@ -17,13 +17,22 @@ try {
     console.log('[Cooldown] Manual confirmation recorded. Shared cooldown reset; no tasks/database/checkpoints changed.');
   }else{
     let announced='';
-    const result=await controller.wait({shouldStop,onState:s=>{
+    const result=await controller.wait({shouldStop,waitForManual:true,onState:s=>{
       const key=`${s.lastIncidentAt}-${s.active}-${s.manualRequired}`;
       if(key===announced)return;announced=key;
       if(s.manualRequired)console.warn('[Cooldown] Manual review required. Automatic resume disabled.');
       else if(s.active)console.log(`[Cooldown] Round ${s.count}; resume no earlier than ${new Date(s.untilMs).toLocaleString('zh-CN')}. No platform access while waiting. Safe-stop BAT cancels resume.`);
     }});
     process.exitCode=result.stopped?20:result.manual?21:0;
+    if(result.ready&&!await shouldStop()){
+      const ownStop=path.join(stateRoot,'stop.requested');
+      try{
+        const before=await fs.stat(ownStop),text=await fs.readFile(ownStop,'utf8');
+        const after=await fs.stat(ownStop);
+        if(['RATE_LIMIT_COOLDOWN_ACTIVE','COOLDOWN_MANUAL_REQUIRED'].includes(text)&&before.mtimeMs===after.mtimeMs&&before.size===after.size)
+          await fs.unlink(ownStop);
+      }catch(e){if(e.code!=='ENOENT')throw e;}
+    }
   }
 }catch(error){console.warn(error.message);process.exitCode=1;}
 finally{await controller?.close();}

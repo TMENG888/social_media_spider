@@ -41,6 +41,10 @@ def _safe_token(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z_-]+", "_", value or "").strip("_") or "default"
 
 
+class RedisCheckpointUnavailable(RuntimeError):
+    """Infrastructure outage, never a content failure or successful completion."""
+
+
 class RedisVideoCheckpointStore:
     """Cross-machine video checkpoints for one Redis keyword task.
 
@@ -68,9 +72,16 @@ class RedisVideoCheckpointStore:
     def _command(url: str, password: str | None, *parts):
         # Imported lazily so local/static mode does not couple collector startup
         # to the Redis scheduler module.
-        from redis_task_queue import redis_command
+        from redis_task_queue import redis_command, RedisError
 
-        return redis_command(url, password, *parts)
+        try:
+            return redis_command(url, password, *parts, timeout=5)
+        except OSError as error:
+            raise RedisCheckpointUnavailable(type(error).__name__) from None
+        except RedisError as error:
+            if 'closed the connection' in str(error):
+                raise RedisCheckpointUnavailable('ConnectionClosed') from None
+            raise
 
     @staticmethod
     def _pairs(reply: Any) -> dict[str, str]:

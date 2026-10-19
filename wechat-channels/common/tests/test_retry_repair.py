@@ -6,6 +6,86 @@ sys.path.insert(0,str(Path(__file__).parents[1]/'src'))
 import channels_pc_collector as c
 
 class RetryRepairTests(unittest.TestCase):
+    def test_known_completed_field_defects_cannot_shortcut_child_ack(self):
+        import json
+        import redis_task_queue as q
+        from subtitle_review import checkpoint_repair_reason
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        args=SimpleNamespace(prefix='fixture',redis_url='fixture',redis_password='fixture')
+        item={'task_id':'test','topic':'topic1','keyword':'word','fingerprint':'fp',
+              'queue':{'tasks':[{'id':'topic1','keywordAllowList':['word'],'collectComments':False}]}}
+        base={'status':'completed','asr_status':'completed',
+              'row':{'title':'原视频','url':'https://weixin.qq.com/sph/Exact1234',
+                     'author_name':'作者','video_duration':20,'video_content':'原视频字幕'},
+              'field_completeness':{'title':True,'comments':False}}
+        self.assertIsNone(checkpoint_repair_reason(base,collect_comments=False))
+        with patch.object(q,'redis_command',return_value=json.dumps(base)):
+            self.assertTrue(q.video_retry_completion_guard(args,item)['ok'])
+        for patch_fields in ({'title':False},{'asr':False},{'comments':False}):
+            cp={**base,'field_completeness':patch_fields}
+            item['queue']['tasks'][0]['collectComments']=True
+            with patch.object(q,'redis_command',return_value=json.dumps(cp)):
+                guard=q.video_retry_completion_guard(args,item)
+            self.assertFalse(guard['ok']);self.assertTrue(guard['repairRequired'])
+            self.assertEqual(guard['reason'],'ASR_QUALITY_INCOMPLETE_TRANSCRIPT' if 'asr' in patch_fields else 'DETAIL_INCOMPLETE_FIELDS')
+        for field,value in (('title',''),('author_name',''),('video_duration',0),('video_content','')):
+            cp={**base,'field_completeness':{},'row':{**base['row'],field:value}}
+            self.assertIsNotNone(checkpoint_repair_reason(cp))
+        for status in ('dead_letter','skipped_unresolved'):
+            self.assertIsNone(checkpoint_repair_reason({**base,'status':status,'field_completeness':{'title':False}}))
+        source=Path(c.__file__).read_text(encoding='utf-8-sig')
+        self.assertIn('force_retranscribe(config, checkpoint) or repair_reason',source)
+
+    def test_known_bad_terminal_is_staged_but_old_seed_is_not_delivery_proof(self):
+        import json
+        import redis_task_queue as q
+        from subtitle_review import force_retranscribe
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        args=SimpleNamespace(prefix='fixture',redis_url='fixture',redis_password='fixture')
+        item={'task_id':'test','keyword':'word'}
+        cp={'status':'completed','retry_count':2,'row':{'title':'原视频','video_content':'中文字幕志愿者刘娅中文字幕组'}}
+        original=json.dumps(cp)
+        for delivery in ('new-message-id','already-staged'):
+            with patch.object(q,'redis_command',return_value=['fp',original]), patch.object(q,'stage_video_retry',return_value=delivery) as stage:
+                guard=q.checkpoint_completion_guard(args,item)
+            self.assertEqual(guard['ok'],delivery!='already-staged')
+            self.assertEqual(guard['repairRequired'],{'fp':'ASR_QUALITY_UNTRUSTED_TRANSCRIPT'})
+            self.assertEqual(stage.call_args.args[-1],cp)
+        self.assertEqual(json.dumps(cp),original)
+        for extra in ({'subtitle_review_required':True},{'field_completeness':{'asr':False}}):
+            self.assertTrue(force_retranscribe({}, {'status':'completed',**extra}))
+
+    def test_legacy_subtitle_artifact_cannot_shortcut_retry_ack_or_reuse(self):
+        import json
+        import redis_task_queue as q
+        from subtitle_review import force_retranscribe
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        args=SimpleNamespace(prefix='fixture',redis_url='fixture',redis_password='fixture')
+        item={'task_id':'test','fingerprint':'fp'}
+        for status in ('completed','no_content','not_applicable'):
+            cp={'status':status,'row':{'video_content':'中海住宅，中文字幕志愿者刘娅中文字幕组'}}
+            self.assertTrue(force_retranscribe({},cp))
+            with patch.object(q,'redis_command',return_value=json.dumps(cp)):
+                guard=q.video_retry_completion_guard(args,item)
+            self.assertFalse(guard['ok'])
+            self.assertFalse(guard['accepted'])
+        cp['status']='skipped_unresolved'
+        with patch.object(q,'redis_command',return_value=json.dumps(cp)):
+            guard=q.video_retry_completion_guard(args,item)
+        self.assertTrue(guard['ok'])
+        self.assertFalse(guard['accepted'])
+
+    def test_exact_target_without_url_still_consumes_a_verified_search_miss(self):
+        from contextlib import closing
+        with tempfile.TemporaryDirectory() as folder,closing(c.init_state(Path(folder)/'state.sqlite')) as db:
+            row=c.ResultRow(project='test',keyword='test',url=None,title='exact title',author_name='author')
+            c.upsert_video_checkpoint(db,keyword='test',project='test',fingerprint='fp',status='retry_pending',retry_count=1,row=row)
+            result=c.record_precise_search_miss(db,keyword='test',project='test',retry_fingerprint='fp',scan_status='partial_retry_target_not_found',seen_fingerprints=set(),max_attempts=3)
+            self.assertEqual(result,('retry_pending',2))
+
     def test_precise_retry_scroll_probe_has_own_bound_without_mutating_annual_config(self):
         original={'load_more_rounds':30,'load_more_search_recovery_attempts':4,'other':7}
         bounded=c.precise_retry_load_config(original)
@@ -79,8 +159,8 @@ class RetryRepairTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import patch
         args=SimpleNamespace(prefix='fixture',redis_url='fixture',redis_password='fixture')
-        item={'task_id':'test','fingerprint':'fp'}
-        with patch.object(q,'update_remote_status'),patch.object(q,'redis_command',side_effect=[['fp',json.dumps({'status':'completed'})],json.dumps({'status':'completed_with_deferred_retries'})]):
+        item={'task_id':'test','fingerprint':'fp','topic':'fixture','keyword':'fixture'}
+        with patch.object(q,'redis_command',side_effect=[['fp',json.dumps({'status':'completed'})],json.dumps({'status':'completed_with_deferred_retries'}),1]):
             result=q.refresh_parent_keyword_status(args,item)
         self.assertEqual(result['status'],'retry_pending')
         self.assertFalse(result['scanCompleted'])

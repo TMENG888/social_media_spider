@@ -16,6 +16,25 @@ sys.modules[SPEC.name] = queue
 SPEC.loader.exec_module(queue)
 
 
+def bound_scan_evidence(item):
+    from search_scan_proof import POLICY, SearchEndTracker
+    keyword = item['keyword']
+    def surface(index, percent=100.):
+        return {'keyword': keyword, 'pageTitle': keyword + ' - 视频 - 搜一搜',
+                'contextValid': True, 'loading': False, 'loadFailed': False,
+                'cardCount': 2, 'cardDigest': 'a' * 64, 'scannedCount': 2,
+                'verticallyScrollable': True, 'scrollPercent': percent,
+                'surfaceGeneration': index, 'capturedAt': f'2026-10-15T20:00:0{index}+08:00'}
+    tracker = SearchEndTracker(keyword, surface(0, 0.), True)
+    for index in range(1, 4):
+        tracker.observe(surface(index))
+    return {'policy': POLICY, 'taskId': item.get('source_task_id') or item['task_id'],
+            'topic': item['topic'], 'keyword': keyword, 'runId': 'fixture-run',
+            'generation': 'fixture-generation', 'runToken': 'a' * 32,
+            'startedAt': '2026-10-15T20:00:00+08:00', 'finishedAt': '2026-10-15T20:00:04+08:00',
+            'summaries': [{'keyword': keyword, 'complete': True, 'searchEndProof': tracker.proof}]}
+
+
 def redis_hash(values):
     output = []
     for index, value in enumerate(values):
@@ -29,6 +48,7 @@ class RedisCompletionGuardTests(unittest.TestCase):
             prefix="wechat:channels:test-run",
             redis_url="redis://127.0.0.1:6379/0",
             redis_password="secret",
+            run_id='fixture-run', run_generation='fixture-generation',
         )
         self.item = {"task_id": "topic1:abc", "keyword": "中海 住宅"}
 
@@ -247,11 +267,20 @@ class RedisCompletionGuardTests(unittest.TestCase):
         pending = json.dumps({"status": "retry_pending"})
         with patch.object(
             queue, "redis_command",
-            side_effect=[["one", completed, "two", pending], json.dumps({"status":"completed_with_deferred_retries","scanCompleted":True}), 1],
+            side_effect=[["one", completed, "two", pending], json.dumps({"status":"completed_with_deferred_retries","scanCompleted":True,'searchScanProof':bound_scan_evidence(item)}), 1],
         ):
             result = queue.refresh_parent_keyword_status(self.args, item)
         self.assertEqual(result["status"], "completed_with_deferred_retries")
         self.assertEqual(result["unresolvedVideoCount"], 1)
+
+    def test_coverage_comments_policy_requires_exact_explicit_original_task(self):
+        item={'topic':'topic1','keyword':'fixture','queue':{'tasks':[{'id':'topic1','keywordAllowList':['fixture'],'collectComments':False}]}}
+        self.assertFalse(queue.coverage_collect_comments(item))
+        self.assertTrue(queue.coverage_collect_comments({'topic':'topic1','keyword':'fixture'}))
+        item['keyword']='other'
+        self.assertTrue(queue.coverage_collect_comments(item))
+        item['keyword']='fixture';item['queue']['tasks'][0]['collectComments']='false'
+        self.assertTrue(queue.coverage_collect_comments(item))
 
     def test_parent_keyword_exposes_dead_letters_instead_of_plain_complete(self):
         item = {
@@ -262,11 +291,28 @@ class RedisCompletionGuardTests(unittest.TestCase):
         }
         dead = json.dumps({"status": "dead_letter"})
         with patch.object(
-            queue, "redis_command", side_effect=[["one", dead], json.dumps({"status":"completed_with_deferred_retries","scanCompleted":True}), 1],
+            queue, "redis_command", side_effect=[["one", dead], json.dumps({"status":"completed_with_deferred_retries","scanCompleted":True,'searchScanProof':bound_scan_evidence(item)}), 1],
         ):
             result = queue.refresh_parent_keyword_status(self.args, item)
-        self.assertEqual(result["status"], "completed_with_dead_letters")
+        self.assertEqual(result["status"], "coverage_below_threshold")
+        self.assertFalse(result["coverage"]["ok"])
         self.assertEqual(result["deadLetterCount"], 1)
+
+    def test_child_refresh_writes_original_parent_key_and_requires_80(self):
+        item={'task_id':'child-id','source_task_id':'original-parent','topic':'topic1','keyword':'fixture'}
+        with patch.object(queue,'verify_database_coverage',return_value={'ok':True,'numerator':8,'denominator':10}), patch.object(queue,'redis_command',side_effect=[
+            ['one',json.dumps({'status':'skipped_unresolved'})],json.dumps({'scanCompleted':True,'searchScanProof':bound_scan_evidence(item)}),1]) as command:
+            result=queue.refresh_parent_keyword_status(self.args,item)
+        self.assertEqual(result['status'],'completed_with_skips')
+        self.assertEqual(command.call_args.args[7],'original-parent')
+
+    def test_concurrent_checkpoint_change_cannot_publish_stale_completion(self):
+        item={'task_id':'original','topic':'topic1','keyword':'fixture'}
+        with patch.object(queue,'verify_database_coverage',return_value={'ok':True}), patch.object(queue,'redis_command',side_effect=[
+            ['one',json.dumps({'status':'completed'})],json.dumps({'scanCompleted':True,'searchScanProof':bound_scan_evidence(item)}),0]):
+            result=queue.refresh_parent_keyword_status(self.args,item)
+        self.assertEqual(result['status'],'refresh_deferred_state_changed')
+        self.assertFalse(result['accepted'])
 
     def test_child_completion_cannot_complete_unfinished_annual_scan(self):
         item={"task_id":"topic2:abc","topic":"topic2","keyword":"unfinished"}
@@ -276,6 +322,26 @@ class RedisCompletionGuardTests(unittest.TestCase):
             result=queue.refresh_parent_keyword_status(self.args,item)
         self.assertEqual(result["status"],"retry_pending")
         self.assertFalse(result["scanCompleted"])
+
+    def test_bare_scan_completed_flag_does_not_become_annual_scan_evidence(self):
+        item={'task_id':'original','topic':'topic1','keyword':'fixture'}
+        with patch.object(queue,'verify_database_coverage') as database, patch.object(queue,'redis_command',side_effect=[
+                ['fp',json.dumps({'status':'completed'})],json.dumps({'scanCompleted':True}),1]):
+            result=queue.refresh_parent_keyword_status(self.args,item)
+        self.assertEqual(result['status'],'retry_pending');self.assertFalse(result['scanCompleted'])
+        database.assert_not_called()
+
+    def test_current_primary_evidence_requires_this_launch_token_and_preserves_file(self):
+        item={'task_id':'original','topic':'topic1','keyword':'fixture'}
+        envelope=bound_scan_evidence(item)
+        with tempfile.TemporaryDirectory() as folder:
+            file=Path(folder)/'proof.json';file.write_text(json.dumps(envelope),encoding='utf-8')
+            expected={field:envelope[field] for field in ['taskId','topic','keyword','runId','generation','runToken']}
+            item['_localSearchScan']={'file':str(file),'expected':expected,'earliest':0}
+            self.assertTrue(queue.primary_search_evidence_readback(item)['ok'])
+            item['_localSearchScan']['expected']={**expected,'runToken':'b'*32}
+            self.assertFalse(queue.primary_search_evidence_readback(item)['ok'])
+            self.assertEqual(json.loads(file.read_text(encoding='utf-8')),envelope)
 
     def test_video_retry_passes_original_result_index_to_collector(self):
         source = SOURCE.read_text(encoding="utf-8")

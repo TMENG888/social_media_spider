@@ -1,7 +1,7 @@
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
-export const isTransient = text => /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|PROTOCOL_CONNECTION_LOST|socket hang up|read ECONNRESET/i.test(text);
+export const isTransient = text => /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|PROTOCOL_CONNECTION_LOST|socket hang up|read ECONNRESET|MYSQL_IMPORT_LOCK_TIMEOUT|ER_LOCK_WAIT_TIMEOUT|ER_LOCK_DEADLOCK|Lock wait timeout exceeded|Deadlock found when trying to get lock/i.test(text);
 export async function retryImport(run, pause, attempts=3) {
   for (let attempt=1; attempt<=attempts; attempt++) {
     const result=await run();

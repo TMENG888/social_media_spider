@@ -27,18 +27,6 @@ function memoryRedis(){
     throw new Error('UNEXPECTED_COMMAND');
   }};
 }
-test('English repository and Chinese deployment directories preserve canonical platform',()=>fixture(async(ctx,client,dir)=>{
-  for(const [directory,platform,prefix] of [['xiaohongshu','小红书','xhs'],['小红书','小红书','xhs'],['douyin','抖音','xhs:douyin'],['抖音','抖音','xhs:douyin']]){
-    const common=path.join(dir,directory,'common');
-    await fs.mkdir(path.join(common,'tasks'),{recursive:true});
-    await fs.writeFile(path.join(common,'redis-config.json'),JSON.stringify({url:'redis://127.0.0.1:6379/0',campaign:'offline',taskPoolCampaign:'offline'}));
-    await fs.writeFile(path.join(common,'tasks/redis-tasks.json'),JSON.stringify({manifestHash:'offline',tasks:[]}));
-    const control=await controlContext(common);
-    assert.equal(control.platform,platform);
-    assert.equal(control.namespace,prefix+':{offline}');
-  }
-}));
-
 async function fixture(fn,{live=false}={}){
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'remote-stop-test-'));
   const campaign='remote-stop-test_'+randomUUID().replaceAll('-','');

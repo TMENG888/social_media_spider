@@ -23,9 +23,10 @@ $env:WECHAT_DISPLAY_SCALE = [string]$display.scalePercent
 
 $requestedDbEnabled = $env:MYSQL_ENABLED -ne '0'
 if ($requestedDbEnabled) {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
-  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
-  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
+  $mysqlDefaults = Get-Content -LiteralPath (Join-Path $Common 'src\mysql-defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = [string]$mysqlDefaults.host }
+  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = [string]$mysqlDefaults.port }
+  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = [string]$mysqlDefaults.database }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }
   if (-not $env:MYSQL_PASSWORD) {
     $secure = Read-Host 'MySQL password' -AsSecureString

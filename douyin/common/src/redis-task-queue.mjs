@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { maySkipExhausted } from "./retry-disposition.mjs";
+import {COVERAGE_REDIS_GUARD} from './coverage-redis-guard.mjs';
 
 // All keys are explicit and share a Redis Cluster hash tag. Never construct keys in Lua.
 const KEY_NAMES = ["payloads", "statuses", "attempts", "tokens", "owners", "pending", "leases", "results", "errors", "failed", "deferrals"];
@@ -24,7 +25,8 @@ local function retry_or_fail(id, now, max_attempts, retry_delay, reason)
   local attempt = tonumber(redis.call('HGET', KEYS[3], id)) or 0
   clear_lease(id)
   redis.call('HSET', KEYS[9], id, reason)
-  if attempt >= max_attempts then
+  local baseline=KEYS[14] and (tonumber(redis.call('HGET',KEYS[14],id)) or 0) or 0
+  if attempt-baseline >= max_attempts then
     redis.call('HSET', KEYS[2], id, 'failed')
     redis.call('ZREM', KEYS[6], id)
     redis.call('ZADD', KEYS[10], now, id)
@@ -75,11 +77,13 @@ local now = now_ms()
 -- Bounded recovery keeps a single claim from monopolizing Redis after a large outage.
 local expired = redis.call('ZRANGEBYSCORE', KEYS[7], '-inf', now, 'LIMIT', 0, 1000)
 for _, id in ipairs(expired) do
+  if not ARGV[6] or ARGV[6] == '' or id == ARGV[6] then
   if redis.call('HGET', KEYS[2], id) == 'leased' then
     retry_or_fail(id, now, max_attempts, retry_delay,
       cjson.encode({message = 'Lease expired before confirmation', code = 'LEASE_EXPIRED', at = now}))
   else
     clear_lease(id)
+  end
   end
 end
 while true do
@@ -96,7 +100,8 @@ while true do
   if redis.call('HGET', KEYS[2], id) == 'pending' then
     local payload = redis.call('HGET', KEYS[1], id)
     local previous = tonumber(redis.call('HGET', KEYS[3], id)) or 0
-    if not payload or previous >= max_attempts then
+    local baseline=KEYS[14] and (tonumber(redis.call('HGET',KEYS[14],id)) or 0) or 0
+    if not payload or previous-baseline >= max_attempts then
       redis.call('HSET', KEYS[2], id, 'failed')
       redis.call('ZADD', KEYS[10], now, id)
       redis.call('HSET', KEYS[9], id, cjson.encode({message = 'Missing task payload or attempt limit reached', code = 'INVALID_PENDING_TASK', at = now}))
@@ -134,6 +139,7 @@ local id, token = ARGV[1], ARGV[2]
 local now = now_ms()
 if not check_lease(id, token, now) then return redis.error_reply('LEASE_LOST') end
 local result=cjson.decode(ARGV[3])
+${COVERAGE_REDIS_GUARD}
 if type(result)=='table' and result.disposition=='no_change' then
  local e=result.noChangeEvidence
  if result.status~='completed_with_skips' or result.accepted~=false or type(e)~='table'
@@ -156,10 +162,21 @@ const FAIL = PRELUDE + `
 local id, token = ARGV[1], ARGV[2]
 local now = now_ms()
 if not check_lease(id, token, now) then return redis.error_reply('LEASE_LOST') end
+local attempt_before=tonumber(redis.call('HGET',KEYS[3],id)) or 0
+local history_field=id..'|'..attempt_before
+if redis.call('HGET',KEYS[12],history_field) then return redis.error_reply('FAILURE_HISTORY_ALREADY_EXISTS') end
+local previous_result=redis.call('HGET',KEYS[8],id) or cjson.null
+local previous_error=redis.call('HGET',KEYS[9],id) or cjson.null
+local evidence=cjson.decode(ARGV[7])
+if type(evidence)~='table' then evidence={submittedResult=evidence} end
 local status, retry_at, attempt = retry_or_fail(id, now, tonumber(ARGV[4]), tonumber(ARGV[5]), ARGV[3])
+redis.call('HSET',KEYS[12],history_field,cjson.encode({taskId=id,attempt=attempt,at=now,
+ previousResult=previous_result,previousError=previous_error,submittedResult=ARGV[7],error=ARGV[3]}))
+evidence.accepted=false; evidence.queueDisposition=status; evidence.attempts=attempt; evidence.dispositionAt=now
+redis.call('HSET',KEYS[8],id,cjson.encode(evidence))
 if status=='failed' and ARGV[6]=='allow_content_skip' then
-  local evidence=cjson.decode(ARGV[7])
   evidence.status='skipped_unresolved'; evidence.accepted=false
+  evidence.queueDisposition='skipped_unresolved'
   evidence.attempts=attempt; evidence.dispositionAt=now
   evidence.policy='20261013-user-authorized-finite-skip'
   redis.call('HSET',KEYS[8],id,cjson.encode(evidence))
@@ -302,9 +319,10 @@ export class RedisTaskQueue {
     this.retryDelayMs = positiveInteger(retryDelayMs, "retryDelayMs", true);
   }
 
-  async evaluate(script, arguments_ = [], taskId = null) {
+  async evaluate(script, arguments_ = [], taskId = null, keys = this.keys) {
+    if(this.volumeBaselineKey){keys=[...keys];while(keys.length<13)keys.push(this.namespace+':volume-unused');keys.push(this.volumeBaselineKey);}
     try {
-      const raw = await this.client.eval(script, { keys: this.keys, arguments: arguments_.map(String) });
+      const raw = await this.client.eval(script, { keys, arguments: arguments_.map(String) });
       return raw == null || raw === false ? null : JSON.parse(raw);
     } catch (error) {
       if (/\bLEASE_LOST\b/u.test(String(error.message || error))) throw new LeaseLostError(taskId, error);
@@ -360,7 +378,8 @@ export class RedisTaskQueue {
       ? { name: error.name, message: error.message, code: error.code ?? null }
       : { message: String(error ?? "Task failed") };
     return this.evaluate(FAIL, [identity(taskId, "taskId"), identity(token, "token"), JSON.stringify(message), this.maxAttempts, this.retryDelayMs,
-      maySkipExhausted(result) ? 'allow_content_skip' : '', jsonPayload(result ?? {}, "result")], taskId);
+      maySkipExhausted(result) ? 'allow_content_skip' : '', jsonPayload(result ?? {}, "result")], taskId,
+      [...this.keys,`${this.namespace}:attempt-result-history`]);
   }
 
   release(taskId, token) {
@@ -380,4 +399,3 @@ export class RedisTaskQueue {
     return result;
   }
 }
-

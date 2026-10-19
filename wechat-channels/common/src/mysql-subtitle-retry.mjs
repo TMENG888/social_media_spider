@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {ProductionOutputRecorder} from './production-output.mjs';
+import {mysqlConnectionOptions} from './mysql-connection-options.mjs';
 export const textHash = value => crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
 export function selector(request) {
   if (request.platform !== '微信视频号' || !request.project) throw new Error('Exact platform/project required');
@@ -69,11 +70,8 @@ async function main() {
   if (!process.env.MYSQL_USER || !process.env.MYSQL_PASSWORD) throw new Error('MYSQL_USER/MYSQL_PASSWORD absent; no DB operation performed');
   const request=JSON.parse(await fs.readFile(requestFile,'utf8'));
   const {default:mysql}=await import('mysql2/promise');
-  const conn=await mysql.createConnection({host:process.env.MYSQL_HOST || '127.0.0.1',
-    port:Number(process.env.MYSQL_PORT || 3306),database:process.env.MYSQL_DATABASE || 'social',
-    user:process.env.MYSQL_USER,password:process.env.MYSQL_PASSWORD,charset:'utf8mb4',
-    supportBigNumbers:true,bigNumberStrings:true,connectTimeout:15000,
-    ssl:/^(1|true|yes)$/i.test(process.env.MYSQL_SSL || '') ? {} : undefined});
+  const conn=await mysql.createConnection({...mysqlConnectionOptions(),
+    supportBigNumbers:true,bigNumberStrings:true});
   try {
     const result=action==='lookup' ? await lookup(conn,request) : await updateSubtitle(conn,request,async backup=>{
       const backupFile=path.join(path.dirname(outputFile),`subtitle-retry-backup-${Date.now()}-${crypto.randomUUID()}.json`);

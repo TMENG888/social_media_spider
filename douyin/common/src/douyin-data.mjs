@@ -134,7 +134,7 @@ export function searchPaginationMetadata(frames){
  * API calls, signatures, private session exports or CAPTCHA workarounds. */
 export class DouyinResponseObserver {
  constructor(page) {
-  this.page=page;this.awemes=new Map();this.comments=new Map();this.commentPages=[];this.embeddedReplyCoverage=new Map();this.profiles=new Map();this.searchRequests=[];this.searchPages=[];this.searchFailures=[];this.pending=new Set();this.failures=[];
+  this.page=page;this.awemes=new Map();this.searchItems=[];this.comments=new Map();this.commentPages=[];this.embeddedReplyCoverage=new Map();this.profiles=new Map();this.searchRequests=[];this.searchPages=[];this.searchFailures=[];this.pending=new Set();this.failures=[];
   this.listener=response=>{const job=this.consume(response).catch(e=>this.failures.push(String(e.message))).finally(()=>this.pending.delete(job));this.pending.add(job);};
   page.on('response',this.listener);
  }
@@ -161,7 +161,9 @@ export class DouyinResponseObserver {
   const visit=(v,depth=0,inheritedRoot=null)=>{
    if(depth>12||v==null||typeof v!=='object')return;
    // Incomplete post shapes still represent a known gap, not an empty result.
-   if(isSearch&&v.aweme_id&&!v.cid&&(v.author||v.video||v.images||v.image_post_info))searchIds.add(String(v.aweme_id));
+   if(isSearch&&v.aweme_id&&!v.cid&&(v.author||v.video||v.images||v.image_post_info)){
+    searchIds.add(String(v.aweme_id));this.searchItems.push({...searchInfo,raw:v});
+   }
    if(v.aweme_id&&v.create_time&&v.author?.sec_uid&&(v.video||v.images||v.image_post_info)){this.awemes.set(String(v.aweme_id),v);if(isSearch)searchIds.add(String(v.aweme_id));return;}
    if(v.cid&&v.user&&v.text!=null){
     const aid=String(v.aweme_id||responseAwemeId);if(aid)this.comments.set(`${aid}/${v.cid}`,{...v,aweme_id:aid,reply_id:inheritedRoot||rootId||v.reply_id});

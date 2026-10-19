@@ -4,6 +4,7 @@ import {createHash} from 'node:crypto';
 import {redisSettings,connectRedis} from './redis-connection.mjs';
 import {loadTaskManifest} from './redis-task-manifest.mjs';
 import {writeJsonAtomic} from './checkpoint.mjs';
+import {OperationalGate,classifyRestriction} from './operational-gate.mjs';
 
 export const COOLDOWN_EXIT = 76;
 export const MANUAL_COOLDOWN_EXIT = 77;
@@ -12,8 +13,7 @@ export function restrictionKind(message) {
   if (/^STOP_LOGIN_REQUIRED/.test(text)) return 'manual';
   if (!/^STOP_SECURITY_CHALLENGE/.test(text)) return null;
   // Never interpret a CAPTCHA/login/network challenge as a timed rate limit.
-  if (/验证码|滑块|安全验证|请完成验证|扫码|登录|网络环境存在风险/.test(text)) return 'manual';
-  return /300013/.test(text) && /访问频繁|操作频繁|访问频率过快/.test(text) ? 'rate' : 'manual';
+  return classifyRestriction(text)?.requiresHuman ? 'manual' : 'rate';
 }
 export function cooldownWorkerExit({fatalError=null,lost=false,status={}}) {
   if(fatalError?.code==='LEASE_LOST' || lost)return 5;
@@ -22,7 +22,7 @@ export function cooldownWorkerExit({fatalError=null,lost=false,status={}}) {
     (task.importExitCode!=null && ![0,75].includes(task.importExitCode)));
   const eligible=(!fatalError || ['RATE_LIMIT_COOLDOWN_ACTIVE','COOLDOWN_MANUAL_REQUIRED'].includes(fatalError.code) ||
     (restrictionKind(fatalError)==='rate' && status.cooldown?.active)) && !unrelatedFailure;
-  if(eligible && !status.failedCount && !status.globalQueue?.failed && status.cooldown?.active)
+  if(eligible && !status.failedCount && status.cooldown?.active)
     return status.cooldown.manualRequired ? MANUAL_COOLDOWN_EXIT : COOLDOWN_EXIT;
   return fatalError || unrelatedFailure || status.failedCount || status.globalQueue?.failed ? 1 : 0;
 }
@@ -46,15 +46,18 @@ redis.call('HSET',KEYS[1],event,now)
 if ARGV[2]=='manual' then
   s.manualRequired=true
   s.reason='manual_restriction'
+  s.untilMs=0
+  s.restrictionKind='manual'
+  s.automaticResume=false
 elseif not s.manualRequired and (s.untilMs or 0)<=now then
   s.count=(s.count or 0)+1
-  if s.count>=3 then
-    s.manualRequired=true
-    s.reason='third_rate_limit'
-  else
-    s.untilMs=now+tonumber(ARGV[3+s.count])
-    s.reason='rate_limit'
-  end
+  -- Repeated ordinary rate limits stay timed: 2h, then capped at 4h by
+  -- default. A rate counter must not invent a CAPTCHA/manual requirement.
+  -- Existing explicit/legacy manual holds are never downgraded here.
+  s.untilMs=now+tonumber(ARGV[3+math.min(s.count,2)])
+  s.reason='rate_limit'
+  s.restrictionKind='rate'
+  s.automaticResume=true
 else
   -- Multiple nodes observing the same cooling interval are one incident.
   return result()
@@ -103,6 +106,7 @@ export class RateLimitCooldown {
     Object.assign(this,{client,campaign,stateRoot,workerId,group,delaysMs});
     this.key=`xhs:{${campaign}}:rate-limit-cooldown:${group}`;
     this.writes=Promise.resolve();
+    this.operations=new OperationalGate({client,workerId,platform:'小红书',keys:[`xhs:{${campaign}}:monitor:incidents`,`xhs:{${campaign}}:monitor:outbox`]});
     this.last=null;
   }
   async evaluate(script,args=[]) {
@@ -122,23 +126,25 @@ export class RateLimitCooldown {
   }
   read(){return this.evaluate(PRELUDE+'return result()');}
   async assertReady(){const s=await this.read();if(s.active)throw new CooldownActiveError(s);return s;}
-  record(message,eventId){
+  async record(message,eventId){
     const kind=restrictionKind(message);
     if(!kind)return Promise.resolve(null);
     if(!eventId)throw new Error('Cooldown incident needs a stable event ID');
     const id=createHash('sha256').update(String(eventId)).digest('hex');
-    return this.evaluate(RECORD,[id,kind,this.workerId,...this.delaysMs]);
+    const state=await this.evaluate(RECORD,[id,kind,this.workerId,...this.delaysMs]);
+    await this.operations.record(message,{cooldownMs:kind==='rate'?Math.max(1,state.untilMs-state.serverTime):this.delaysMs[0]});
+    return state;
   }
-  async resetConfirmed(){return this.evaluate(RESET,[`${Date.now()}-${process.pid}`,this.workerId]);}
-  async wait({shouldStop=async()=>false,onState=()=>{},pollMs=15000,tickMs=250}={}) {
+  async resetConfirmed(){const result=await this.evaluate(RESET,[`${Date.now()}-${process.pid}`,this.workerId]);await this.operations.resolve();return result;}
+  async wait({shouldStop=async()=>false,onState=()=>{},pollMs=15000,tickMs=250,waitForManual=false}={}) {
     while(true){
       if(await shouldStop())return {stopped:true};
       const state=await this.read();
       if(await shouldStop())return {stopped:true};
       onState(state);
-      if(state.manualRequired)return {manual:true,state};
+      if(state.manualRequired&&!waitForManual)return {manual:true,state};
       if(!state.active)return {ready:true,state};
-      const end=Date.now()+Math.min(pollMs,state.remainingMs);
+      const end=Date.now()+(state.manualRequired?pollMs:Math.min(pollMs,state.remainingMs));
       while(Date.now()<end){
         if(await shouldStop())return {stopped:true};
         await new Promise(r=>setTimeout(r,Math.min(tickMs,end-Date.now())));
@@ -153,7 +159,7 @@ export class RateLimitCooldown {
         try{await this.assertReady();}
         catch(error){
           // Cooperative stop keeps current note/import intact and lease renewable.
-          await fs.writeFile(stopFile,error.code || 'COOLDOWN_STATE_UNAVAILABLE','utf8');
+          await fs.writeFile(stopFile,error.code || 'COOLDOWN_STATE_UNAVAILABLE',{encoding:'utf8',flag:'wx'}).catch(e=>{if(e.code!=='EEXIST')throw e;});
           onStop(error);
           closed=true;
         }

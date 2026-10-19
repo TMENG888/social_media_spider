@@ -2,9 +2,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { RedisTaskQueue } from './redis-task-queue.mjs';
+import {claimCorrection,pauseCorrection} from './correction-lease.mjs';
 import { redisSettings, connectRedis } from './redis-connection.mjs';
 import { loadTaskManifest } from './redis-task-manifest.mjs';
 import { writeJsonAtomic } from './checkpoint.mjs';
+import {openVolumeRuntime} from './volume-runtime.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -14,13 +16,14 @@ export class RedisDispatcher {
     const manifest = manifestOverride || await loadTaskManifest(path.join(root, 'tasks', 'redis-tasks.json'));
     const client = await connectRedis(settings);
     // Different task revisions and export-only tests cannot acknowledge production work.
-    const campaign = campaignOverride || `${settings.campaign}-${skipImport ? 'export' : 'mysql'}-${manifest.manifestHash.slice(0, 16)}`;
+    const campaign = campaignOverride || (!skipImport && settings.taskPoolCampaign) || `${settings.campaign}-${skipImport ? 'export' : 'mysql'}-${manifest.manifestHash.slice(0, 16)}`;
     try {
       const dispatcher = new RedisDispatcher({ settings, manifest, client, campaign, stateRoot, workerId, stopFile });
       await client.ping();
       const chosen=selectedTaskIds ? manifest.tasks.filter(t=>selectedTaskIds.includes(t.redisTaskId||t.id)) : null;
       if(chosen && chosen.length!==selectedTaskIds.length)throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
-      const published=chosen ? (await Promise.all(chosen.map(task=>dispatcher.queue.verifyExisting(task)))).at(-1)
+      dispatcher.volume=skipImport||manifestOverride?null:await openVolumeRuntime({root,stateRoot,queue:dispatcher.queue,manifest,platform:'抖音'});
+      const published=chosen||dispatcher.volume ? (await Promise.all((chosen||manifest.tasks).map(task=>dispatcher.queue.verifyExisting(task)))).at(-1)
         : await dispatcher.queue.publish(manifest.tasks);
       console.log(`[Redis预检] 通过；任务池=${campaign}，清单${manifest.taskCount}项，新增${published.added}项、已存在${published.existing}项`);
       await dispatcher.report();
@@ -55,16 +58,37 @@ export class RedisDispatcher {
 
   async stopped() { return fs.access(this.stopFile).then(() => true).catch(() => false); }
 
-  async *tasks({taskIds=null}={}) {
+  async *tasks({taskIds=null,correctionPolicy=null}={}) {
+    if(this.volume){
+      if(correctionPolicy)throw new Error('VOLUME_AND_LEGACY_CORRECTION_ARE_EXCLUSIVE');
+      let index=0;
+      const chosen=taskIds?taskIds.map(id=>this.manifest.tasks.find(t=>(t.redisTaskId||t.id)===id)):this.manifest.tasks;
+      if(chosen.some(t=>!t))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
+      for(const task of chosen){
+        if(this.halted||await this.stopped())return;
+        if(this.operations&&!(await this.operations.wait({shouldStop:this.operationalShouldStop})).ready)return;
+        const id=task.redisTaskId||task.id,prepared=await this.volume.prepare(id);
+        console.log(`[数量判定] ${task.keyword}：${prepared.decision.posts}/${prepared.decision.threshold}篇，${prepared.confirmation.status}`);
+        if(prepared.confirmation.status!=='pending')continue;
+        const started=Date.now(),lease=await this.queue.claim(this.owner,id);if(!lease)continue;
+        if(prepared.confirmation.recollection){await this.volume.recollection.start(id,lease.token);lease.recollectionPolicy=prepared.confirmation.policy;}
+        this.current=lease;this.lost=false;await this.saveLease(started);this.scheduleHeartbeat();
+        yield[index++,lease.task];
+        if(this.current)throw new Error('VOLUME_PREVIOUS_LEASE_NOT_CONFIRMED');
+      }
+      return;
+    }
+    if(correctionPolicy&&(!taskIds||taskIds.length!==1))throw new Error('CORRECTION_EXACT_TASK_REQUIRED');
     let index = 0, lastReport = 0,targetIndex=0;
     if(taskIds&&(!Array.isArray(taskIds)||!taskIds.length||taskIds.some(id=>!this.manifest.tasks.some(t=>(t.redisTaskId||t.id)===id))))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
     while (!this.halted && !await this.stopped()) {
+      if(this.operations&&!(await this.operations.wait({shouldStop:this.operationalShouldStop})).ready)return;
       if(taskIds&&targetIndex>=taskIds.length)return;
       if (this.current) throw new Error('上一个Redis任务尚未确认，禁止领取新任务');
       const started = Date.now();
       const targetId=taskIds?.[targetIndex]||null;
-      if(targetId){const target=await this.queue.inspect(targetId);if(['completed','completed_with_skips','skipped_unresolved'].includes(target.status)){targetIndex++;continue;}if(target.status==='failed'||target.status==='missing')throw new Error(`SELECTED_TASK_UNAVAILABLE：${targetId}状态=${target.status}`);}
-      const lease = await this.queue.claim(this.owner,targetId);
+      if(targetId&&!correctionPolicy){const target=await this.queue.inspect(targetId);if(['completed','completed_with_skips','skipped_unresolved'].includes(target.status)){targetIndex++;continue;}if(target.status==='failed'||target.status==='missing')throw new Error(`SELECTED_TASK_UNAVAILABLE：${targetId}状态=${target.status}`);}
+      const lease = correctionPolicy ? await claimCorrection(this.queue,this.owner,targetId,correctionPolicy) : await this.queue.claim(this.owner,targetId);
       if (!lease) {
         const stats = await this.queue.stats();
         this.lastStats = stats;
@@ -79,13 +103,14 @@ export class RedisDispatcher {
       this.scheduleHeartbeat();
       console.log(`[任务领取] ${this.workerId}：${lease.task.topic} / ${lease.task.keyword}，尝试${lease.attempt}/${this.settings.maxAttempts}`);
       yield [index++, lease.task];
+      if(correctionPolicy)return;
       if(targetId){const target=await this.queue.inspect(targetId);if(['completed','completed_with_skips','skipped_unresolved'].includes(target.status))targetIndex++;else return;} // A partial first task must not advance to topic two.
     }
   }
 
   env() {
     if (!this.current) return {};
-    return { DY_DISPATCH: 'redis', DY_LEASE_FILE: this.leaseFile,
+    return { SOCIAL_RECOLLECT_ONCE:this.current.recollectionPolicy||'', ...(this.volume?{SOCIAL_VOLUME_ENABLED:'1',SOCIAL_VOLUME_TARGET_POSTS:String(this.volume.snapshot.threshold),SOCIAL_VOLUME_SNAPSHOT:this.volume.snapshotFile}:{}), DY_DISPATCH: 'redis', DY_LEASE_FILE: this.leaseFile,
       DY_LEASE_TASK_ID: this.current.taskId, DY_LEASE_TOKEN: this.current.token, DY_LEASE_CAMPAIGN: this.campaign };
   }
 
@@ -162,7 +187,19 @@ export class RedisDispatcher {
     const { taskId, token } = this.current;
     await this.verify();
     let confirmation;
-    if (kind === 'complete') confirmation = await this.queue.complete(taskId, token, result);
+    const volumeResult=this.volume?await this.volume.finish(taskId,token,result,{pause:kind==='release'}):null;
+    if(volumeResult?.annualEvidence&&result)result.annualAcceptance=volumeResult.annualEvidence;
+    if(volumeResult?.confirmation){confirmation=volumeResult.confirmation;Object.assign(result||{},
+      ...(confirmation.acceptedByResetOnce?[{collectionError:result?.collectionError||result?.error||null,
+       collectionSucceeded:confirmation.collectionSucceeded===true,dataImported:confirmation.dataImported===true,
+       pendingImport:confirmation.pendingImport===true,businessCompleted:true}]:[]),
+      {status:'completed',accepted:true,error:null,
+      quantityAccepted:confirmation.acceptedByVolume===true,retryExhaustedCompletion:confirmation.acceptedByExhaustion===true,
+      acceptedBy:confirmation.acceptedByResetOnce?'reset_once_recollection':confirmation.acceptedByExhaustion?'retry_exhausted_completion':confirmation.acceptedByAnnual?'verified_low_year_search':'keyword_post_count_p80',
+      resetOnceCompletion:confirmation.acceptedByResetOnce===true,volumeAcceptance:volumeResult.decision});}
+    else if(this.current.correctionPolicy&&['release','defer'].includes(kind)) confirmation=await pauseCorrection(this.queue,taskId,token,result);
+    else if(this.volume&&kind==='complete')confirmation=await this.queue.fail(taskId,token,'VOLUME_BELOW_THRESHOLD',result);
+    else if (kind === 'complete') confirmation = await this.queue.complete(taskId, token, result);
     else if (kind === 'review') confirmation = await this.queue.park(taskId, token, result);
     else if (kind === 'release') confirmation = await this.queue.release(taskId, token);
     else if (kind === 'defer') confirmation = await this.queue.defer(taskId, token, result);
@@ -192,4 +229,3 @@ export class RedisDispatcher {
     }
   }
 }
-

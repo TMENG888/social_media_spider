@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import uuid
+from subtitle_review import checkpoint_repair_reason
 
 
 def is_content_failure(guard):
@@ -205,6 +206,7 @@ local p=redis.call('XPENDING',KEYS[1],ARGV[1],ARGV[2],ARGV[2],1)
 if #p~=1 or p[1][2]~=ARGV[3] then return redis.error_reply('RETRY_LEASE_LOST') end
 local raw=redis.call('HGET',KEYS[2],ARGV[4])
 if not raw then return redis.error_reply('RETRY_CHECKPOINT_MISSING') end
+if raw~=ARGV[5] then return redis.error_reply('RETRY_CHECKPOINT_CHANGED') end
 local cp=cjson.decode(raw)
 if type(cp)~='table' or (cp.status~='completed' and cp.status~='no_content' and
  cp.status~='not_applicable' and cp.status~='skipped_unresolved') then
@@ -214,10 +216,30 @@ return redis.call('XACK',KEYS[1],ARGV[1],ARGV[2])
 """
 
 def acknowledge_terminal(q,args,stream,group,message_id,item):
-    """Owner and exact checkpoint are checked atomically with XACK."""
+    """Quality admission, owner and the same exact checkpoint fence XACK.
+
+    A concurrent writer can replace completed with another completed record;
+    checking its status alone is insufficient. Retain the validated bytes as
+    the CAS expectation, and leave the message pending on any disagreement.
+    This acknowledges operational completion, not keyword SQL acceptance.
+    """
     parent=q.safe_token(item.get('source_task_id') or item['task_id'])
+    state_key=args.prefix+':video-state:'+parent
+    encoded=q.redis_command(args.redis_url,args.redis_password,'HGET',state_key,item['fingerprint'])
+    try:
+        cp=json.loads(encoded)
+        if not isinstance(cp,dict):
+            raise ValueError('Invalid checkpoint')
+    except (TypeError,ValueError):
+        raise q.RedisError('RETRY_CHECKPOINT_INVALID')
+    status=cp.get('status')
+    comments=q.coverage_collect_comments(item) if hasattr(q,'coverage_collect_comments') else True
+    if status not in {'completed','no_content','not_applicable','skipped_unresolved'}:
+        raise q.RedisError('RETRY_NOT_TERMINAL')
+    if checkpoint_repair_reason(cp,collect_comments=comments):
+        raise q.RedisError('RETRY_CHECKPOINT_REQUIRES_REPAIR')
     return q.redis_command(args.redis_url,args.redis_password,'EVAL',ACK_TERMINAL,2,
-        stream,args.prefix+':video-state:'+parent,group,message_id,args.consumer,item['fingerprint'])
+        stream,state_key,group,message_id,args.consumer,item['fingerprint'],encoded)
 
 
 # One-time repair for the old FINISH bug: a real exhausted content failure

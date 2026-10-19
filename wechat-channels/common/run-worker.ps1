@@ -1,6 +1,7 @@
 param([ValidateSet('run','retry','check')][string]$Mode='run')
 $ErrorActionPreference = 'Stop'
 $Common = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $Common 'worker-recovery.ps1')
 $Root = Resolve-Path (Join-Path $Common '..')
 $WorkerRoot = if ($env:WECHAT_WORKER_ROOT) { Resolve-Path $env:WECHAT_WORKER_ROOT } else { $Root }
 # A primary visit captures metadata/comments and the complete audio in the same
@@ -33,12 +34,20 @@ function Read-JsonSafe([string]$Path) {
     return $null
   }
 }
+function Get-StatusEvidenceHash([string]$Path) {
+  # Do not depend on optional PowerShell modules in the portable runtime.
+  $evidenceStream = [System.IO.File]::OpenRead($Path)
+  $evidenceAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+  try { return [System.BitConverter]::ToString($evidenceAlgorithm.ComputeHash($evidenceStream)).Replace('-', '') }
+  finally { $evidenceAlgorithm.Dispose(); $evidenceStream.Dispose() }
+}
 if ($Mode -eq 'check') { & (Join-Path $Common 'check-env.ps1'); exit $LASTEXITCODE }
 $dbEnabled = $env:MYSQL_ENABLED -ne '0'
 if ($dbEnabled) {
-  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = '127.0.0.1' }
-  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = '3306' }
-  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = 'social' }
+  $mysqlDefaults = Get-Content -LiteralPath (Join-Path $Common 'src\mysql-defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if (-not $env:MYSQL_HOST) { $env:MYSQL_HOST = [string]$mysqlDefaults.host }
+  if (-not $env:MYSQL_PORT) { $env:MYSQL_PORT = [string]$mysqlDefaults.port }
+  if (-not $env:MYSQL_DATABASE) { $env:MYSQL_DATABASE = [string]$mysqlDefaults.database }
   if (-not $env:MYSQL_USER) { $env:MYSQL_USER = Read-Host 'MySQL username' }
   if (-not $env:MYSQL_PASSWORD) {
     $securePassword = Read-Host 'MySQL password' -AsSecureString
@@ -101,12 +110,13 @@ $post = Join-Path $Root 'common\src\channels_ods_postprocess.mjs'
 $importer = Join-Path $Root 'common\src\mysql-import-retry.mjs'
 $workerStatus = [ordered]@{workerId=(Split-Path $WorkerRoot -Leaf); mode=$Mode; startedAt=(Get-Date).ToString('o'); tasks=@()}
 $stopFile = Join-Path $WorkerRoot '.state\stop.requested'
+$infrastructureBlocked = $false
 $redisStateScope = if ($env:WECHAT_REDIS_STATE_SCOPE) { ([string]$env:WECHAT_REDIS_STATE_SCOPE -replace '[^A-Za-z0-9_-]+','_').Trim('_') } else { '' }
 $stateRoot = if ($redisStateScope) { Join-Path $WorkerRoot ('.state\redis-runs\' + $redisStateScope) } else { Join-Path $WorkerRoot '.state' }
 $runsRoot = if ($redisStateScope) { Join-Path $WorkerRoot ('runs\redis-runs\' + $redisStateScope) } else { Join-Path $WorkerRoot 'runs' }
 New-Item -ItemType Directory -Force -Path $stateRoot,$runsRoot | Out-Null
 if ($redisStateScope) { Write-Host "Redis state scope: $redisStateScope (fresh reset generations do not reuse older local checkpoints)." }
-$CompletionSchemaVersion = 'channels-pagination-v5-video-checkpoint-redis'
+$CompletionSchemaVersion = 'channels-pagination-v8-bound-search-end'
 # The outer Redis scheduler owns the safe-stop marker for dynamic workers.
 # Clearing it in every per-keyword child creates a race where the scheduler
 # can claim several new keywords after the operator requested a stop.  Static
@@ -139,8 +149,22 @@ foreach ($task in $queue.tasks) {
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     $keywordStatusPath = Join-Path $outDir 'keyword_status.json'
     $oldKeyword = Read-JsonSafe $keywordStatusPath
-    if ($Mode -eq 'run' -and $oldKeyword -and $oldKeyword.status -eq 'completed' -and $oldKeyword.mysql.status -ne 'failed' -and $oldKeyword.completionSchemaVersion -eq $CompletionSchemaVersion) { $taskStatus.keywords += $oldKeyword; continue }
+    if ($Mode -eq 'run' -and (-not $env:WECHAT_SEARCH_SCAN_RUN_TOKEN) -and $oldKeyword -and $oldKeyword.status -eq 'completed' -and $oldKeyword.mysql.status -ne 'failed' -and $oldKeyword.completionSchemaVersion -eq $CompletionSchemaVersion) { $taskStatus.keywords += $oldKeyword; continue }
+    # Only this already-selected keyword is being revisited. Keep its exact
+    # legacy report before writing the new policy result; SQLite/video/Redis
+    # attempt history is never deleted or reset by the version transition.
+    if ((Test-Path -LiteralPath $keywordStatusPath) -and ($env:WECHAT_SEARCH_SCAN_RUN_TOKEN -or !$oldKeyword -or $oldKeyword.completionSchemaVersion -ne $CompletionSchemaVersion)) {
+      $legacyStatusDigest = Get-StatusEvidenceHash $keywordStatusPath
+      $legacyHistory = Join-Path $outDir 'acceptance-history'
+      New-Item -ItemType Directory -Force -Path $legacyHistory | Out-Null
+      $legacyStatusBackup = Join-Path $legacyHistory ('keyword_status.' + $legacyStatusDigest.ToLowerInvariant() + '.json')
+      if (-not (Test-Path -LiteralPath $legacyStatusBackup)) { Copy-Item -LiteralPath $keywordStatusPath -Destination $legacyStatusBackup }
+      if ((Get-StatusEvidenceHash $legacyStatusBackup) -ne $legacyStatusDigest) { throw 'Legacy keyword report evidence mismatch; refusing overwrite' }
+    }
     $ks = [ordered]@{keyword=$allowedKeyword;status='running';completionSchemaVersion=$CompletionSchemaVersion;startedAt=(Get-Date).ToString('o');outputDir=$outDir;mysql=[ordered]@{status='pending'}}
+    $salvage = $null
+    $salvageAttempted = $false
+    $salvageParameters = @{Python=$python;Node=$node;Collector=$collector;Enricher=$enricher;Postprocessor=$post;Importer=$importer;OutputDir=$outDir;StateDb=$stateDb;Keyword=$allowedKeyword;CollectComments=[bool]$task.collectComments;DatabaseEnabled=$dbEnabled}
     Write-JsonAtomic $ks $keywordStatusPath 8
     try {
       $raw=Join-Path $outDir 'ods_social_media_post_channels.jsonl'; $enrich=Join-Path $outDir 'browser_enrichment.jsonl'; $final=Join-Path $outDir 'ods_social_media_post_channels_final.jsonl'
@@ -172,6 +196,16 @@ foreach ($task in $queue.tasks) {
         & $python $collector @collectArgs
         $collectorExit = $LASTEXITCODE
         if ($collectorExit -eq 0) { break }
+        if ($collectorExit -eq 75) {
+          $infrastructureBlocked = $true
+          throw 'Redis checkpoint unavailable; content retries paused; local recovery required.'
+        }
+        if($env:SOCIAL_VOLUME_ENABLED -eq '1' -or $env:REDIS_URL){
+          & $python (Join-Path $Common 'src\operational_gate.py') --check
+          $OperationalCheck=$LASTEXITCODE
+          if($OperationalCheck -eq 76){Write-Host '[Platform hold] Incident recorded; no inner retry until cooldown/operator confirmation.';break}
+          if($OperationalCheck -ne 0){$infrastructureBlocked=$true;throw 'Operational incident state unavailable; no inner retry.'}
+        }
         if (Test-Path $stopFile) {
           Write-Host "[$($task.id)] Safe stop requested; current keyword will be checkpointed without automatic restart." -ForegroundColor Yellow
           break
@@ -184,14 +218,11 @@ foreach ($task in $queue.tasks) {
       if ($collectorExit -ne 0) { Write-Host "[$($task.id)] Collector stopped with exit $collectorExit; salvaging committed SQLite rows..." -ForegroundColor Yellow }
       # Always export the SQLite checkpoint, even when collection was
       # interrupted or returned a partial status.
-      & $python $collector export-ods --output-dir $outDir --state-db $stateDb --keyword $allowedKeyword; if ($LASTEXITCODE -ne 0) { throw "export exit $LASTEXITCODE" }
-      $enrichArgs=@($enricher,$raw,$enrich); if ($task.collectComments) {$enrichArgs += '--comments'}; & $node @enrichArgs; if ($LASTEXITCODE -ne 0) {throw "enricher exit $LASTEXITCODE"}
-      $postArgs=@($post,$raw,$enrich,$final); if ($task.collectComments) {$postArgs += '--comments'}; & $node @postArgs; if ($LASTEXITCODE -ne 0) {throw "postprocess exit $LASTEXITCODE"}
-      if ($dbEnabled) {
-        $commentFile=Join-Path $outDir 'ods_social_media_comment_channels_final.jsonl'; $importArgs=@($importer,'--posts',$final,'--status',(Join-Path $outDir 'mysql_import_status.json')); if ($task.collectComments -and (Test-Path $commentFile)) {$importArgs += @('--comments',$commentFile)}
-        & $node @importArgs; if ($LASTEXITCODE -ne 0) {throw "mysql import exit $LASTEXITCODE"}
-        $ks.mysql=Get-Content (Join-Path $outDir 'mysql_import_status.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-      } else {$ks.mysql=[ordered]@{status='disabled'}}
+      $salvageAttempted = $true
+      $salvage = Invoke-KeywordCheckpointSalvage @salvageParameters
+      $ks.salvage = $salvage
+      $ks.mysql = $salvage.mysql
+      if (-not $salvage.success) {throw "Checkpoint recovery failed at $($salvage.stage); existing data retained."}
       if ($collectorExit -ne 0) {
         $ks.status='partial'; $ks.error="collector exit $collectorExit; committed rows were exported/imported; retry resumes from SQLite checkpoint"
       } else {
@@ -200,16 +231,33 @@ foreach ($task in $queue.tasks) {
       $ks.completedAt=(Get-Date).ToString('o')
     } catch {
       $ks.status='failed';$ks.error=$_.Exception.Message;$ks.failedAt=(Get-Date).ToString('o')
+      $infrastructureBlocked=$true
       Write-Host "[$($task.id)] FAILED: $allowedKeyword - $($ks.error)" -ForegroundColor Red
+      # An operational-check exception must not bypass durable data salvage.
+      if (-not $salvageAttempted) {
+        $salvageAttempted=$true
+        $salvageParameters.OfflineOnly=$true
+        $salvage=Invoke-KeywordCheckpointSalvage @salvageParameters
+        $ks.salvage=$salvage
+        $ks.mysql=$salvage.mysql
+      }
+      $ks.infrastructureBlocked=$true
     }
     Write-JsonAtomic $ks $keywordStatusPath 10; $taskStatus.keywords += [pscustomobject]$ks
+    if ($infrastructureBlocked) {
+      Write-Host "[$($task.id)] $(Get-KeywordRecoveryMessage $salvage) Infrastructure unavailable; no next keyword will start." -ForegroundColor Yellow
+      break
+    }
     if (Test-Path $stopFile) {
       Write-Host "[$($task.id)] Safe stop requested; remaining keywords will be collected on the next run." -ForegroundColor Yellow
       break
     }
     if ($ks.status -in @('partial','failed')) {
-      Write-Host "[$($task.id)] Keyword '$allowedKeyword' ended as $($ks.status); committed rows were exported/imported and this keyword stays queued. Continuing with the next keyword; a later run resumes it from its SQLite checkpoint." -ForegroundColor Yellow
+      Write-Host "[$($task.id)] Keyword '$allowedKeyword' ended as $($ks.status). $(Get-KeywordRecoveryMessage $salvage) This keyword stays queued." -ForegroundColor Yellow
     }
+    # A selected/--once child has no next keyword. Do not delay its durable
+    # confirmation until a sample deadline; normal multi-task pacing remains.
+    if ($env:WECHAT_FINAL_TASK -eq '1' -and @($task.keywordAllowList).Count -eq 1) { continue }
     if ($collectorSettings.jitter_enabled) {
       $transitionDelay = Get-Random -Minimum $keywordTransitionMinSeconds -Maximum ($keywordTransitionMaxSeconds + 1)
       Write-Host "[$($task.id)] Keyword transition jitter: $transitionDelay seconds before the next keyword."
@@ -221,11 +269,15 @@ foreach ($task in $queue.tasks) {
   $hasFailedKeyword = @($taskStatus.keywords|Where-Object {$_.status -eq 'failed'}).Count -gt 0
   $hasPartialKeyword = @($taskStatus.keywords|Where-Object {$_.status -eq 'partial'}).Count -gt 0
   $taskStatus.status=if ($hasFailedKeyword) {'failed'} elseif ($hasPartialKeyword) {'partial'} else {'completed'}; $taskStatus.finishedAt=(Get-Date).ToString('o'); Write-JsonAtomic $taskStatus $taskStatusPath 10; $workerStatus.tasks += [pscustomobject]$taskStatus
-  if (($hasFailedKeyword -or $hasPartialKeyword) -and (Test-Path $stopFile)) { break }
+  if ($infrastructureBlocked -or (($hasFailedKeyword -or $hasPartialKeyword) -and (Test-Path $stopFile))) { break }
   if ($hasFailedKeyword -or $hasPartialKeyword) {
     Write-Host "[$($task.id)] Task has failed/partial keywords; continuing with the next task. The worker exit code still flags them for a follow-up run." -ForegroundColor Yellow
   }
 }
+$workerStatus.runToken=$env:WECHAT_SEARCH_SCAN_RUN_TOKEN
+$workerStatus.redisTaskId=$env:WECHAT_REDIS_TASK_ID
+$workerStatus.infrastructureBlocked=$infrastructureBlocked
 $workerStatus.finishedAt=(Get-Date).ToString('o'); Write-JsonAtomic $workerStatus (Join-Path $WorkerRoot '.state\worker_status.json') 10
+if ($infrastructureBlocked) {exit 75}
 if (@($workerStatus.tasks|Where-Object {$_.status -eq 'failed'}).Count -gt 0) {exit 3}
 if (@($workerStatus.tasks|Where-Object {$_.status -eq 'partial'}).Count -gt 0) {exit 4}

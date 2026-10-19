@@ -35,7 +35,9 @@ from urllib.parse import unquote, urlparse
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
-from subtitle_review import has_internal_prompt
+from subtitle_review import checkpoint_repair_reason
+from keyword_coverage import verify_database_coverage
+from search_scan_proof import validate_scan_envelope
 
 
 class RedisError(RuntimeError):
@@ -288,13 +290,18 @@ def checkpoint_completion_guard(args, item: dict[str, Any]) -> dict[str, Any]:
     statuses: Counter[str] = Counter()
     malformed = 0
     invalid_deferred_identity = 0
+    repair_reasons = {}
     deferred: list[tuple[str, dict[str, Any]]] = []
     for fingerprint, encoded in values.items():
         try:
             payload = json.loads(encoded)
             status = str(payload.get("status") or "unknown")
             statuses[status] += 1
-            if status in DEFERRED_VIDEO_CHECKPOINT_STATUSES:
+            repair_reason = checkpoint_repair_reason(payload, collect_comments=coverage_collect_comments(item))
+            terminal_repair = status in TERMINAL_VIDEO_CHECKPOINT_STATUSES and bool(repair_reason)
+            if terminal_repair:
+                repair_reasons[fingerprint] = repair_reason
+            if status in DEFERRED_VIDEO_CHECKPOINT_STATUSES or terminal_repair:
                 if retry_payload_has_identity(payload):
                     deferred.append((fingerprint, payload))
                 else:
@@ -311,10 +318,21 @@ def checkpoint_completion_guard(args, item: dict[str, Any]) -> dict[str, Any]:
     if malformed:
         blocking["invalid_json"] = malformed
     staged = []
+    repair_delivery_unverified = []
     if not blocking:
         for fingerprint, payload in deferred:
-            stage_video_retry(args, item, fingerprint, payload)
+            delivery = stage_video_retry(args, item, fingerprint, payload)
+            if fingerprint in repair_reasons and delivery == 'already-staged':
+                # The original dedup seed may refer to an already ACKed child.
+                # Do not create concurrent duplicate deliveries or reset its
+                # shared budget. Existing pending work may repair it; otherwise
+                # the original exact child needs explicit correction evidence.
+                repair_delivery_unverified.append(fingerprint)
             staged.append(fingerprint)
+    if repair_delivery_unverified:
+        blocking['repair_delivery_unverified'] = len(repair_delivery_unverified)
+    if repair_reasons and any(fp not in {entry[0] for entry in deferred} for fp in repair_reasons):
+        blocking['repair_identity_missing'] = sum(fp not in {entry[0] for entry in deferred} for fp in repair_reasons)
     return {
         "ok": not blocking,
         "checkpointCount": len(values),
@@ -323,6 +341,8 @@ def checkpoint_completion_guard(args, item: dict[str, Any]) -> dict[str, Any]:
         "deferredCount": len(deferred),
         "deferredStaged": len(staged),
         "invalidDeferredIdentitySkipped": invalid_deferred_identity,
+        "repairRequired": repair_reasons,
+        "repairDeliveryUnverified": repair_delivery_unverified,
     }
 
 
@@ -343,22 +363,145 @@ def video_retry_completion_guard(args, item: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {"ok": False, "status": "invalid_json"}
     status = str(payload.get("status") or "unknown")
-    contaminated = has_internal_prompt((payload.get('row') or {}).get('video_content'))
+    repair_reason = checkpoint_repair_reason(payload, collect_comments=coverage_collect_comments(item))
     return {
         # A dead letter is evidence of failure, not a disposition. It must
         # pass the shared finite-budget/evidence gate before acknowledgment.
         "ok": status == "skipped_unresolved" or (
-            status in TERMINAL_VIDEO_CHECKPOINT_STATUSES and status != "dead_letter" and not contaminated
+            status in TERMINAL_VIDEO_CHECKPOINT_STATUSES and status != "dead_letter" and not repair_reason
         ),
         "status": status,
         "retryCount": int(payload.get("retry_count") or 0),
         "asrStatus": payload.get("asr_status"),
-        "reason": payload.get("last_error"),
+        "reason": repair_reason or payload.get("last_error"),
+        "repairRequired": bool(repair_reason),
         "checkpointUpdatedAt": payload.get("updated_at"),
-        "accepted": status=="completed" and not contaminated,
+        "accepted": status=="completed" and not repair_reason,
         "skipped": status in {"dead_letter","skipped_unresolved"},
         "disposition": payload.get("disposition"),
     }
+
+
+PRESERVE_KEYWORD_ACCEPTANCE_LUA = """
+-- Subtitle/legacy status writers may observe, but never revoke a verified
+-- keyword-policy completion. Re-evaluation belongs to the volume transition.
+local function keyword_accepted(raw,id)
+ if not raw then return false end
+ local ok,v=pcall(cjson.decode,raw)
+ if not ok or type(v)~='table' or v.status~='completed' or v.accepted~=true then return false end
+ if v.acceptedBy=='reset_once_recollection' then
+  return v.policy=='reset-once-20261016-v1' and v.taskId==id and v.businessCompleted==true
+   and v.quantityAccepted==false and v.qualityVerified==false and v.previousDataPreserved==true
+ end
+ local p=v.volumeAcceptance
+ if type(p)~='table' or p.policy~='20261015-keyword-count-p80-v1'
+  or p.taskId~=id or p.keyword~=v.keyword or p.dbReadbackVerified~=true
+  or type(p.snapshotId)~='string' or #p.snapshotId~=64
+  or type(p.posts)~='number' or type(p.threshold)~='number' or p.posts<0 or p.threshold<1 then return false end
+ if v.acceptedBy=='user_approved_completion' and v.quantityAccepted==false then
+  local u=v.userCompletion
+  return type(u)=='table' and u.policy=='20261016-user-approved-exact-original-v1'
+   and u.taskId==id and u.keyword==v.keyword and u.messageId==v.messageId
+   and type(u.messageId)=='string' and u.stopFurtherRetries==true
+   and u.authorizationScope=='exact_original_only'
+ end
+ if v.acceptedBy=='keyword_post_count_p80' then
+  return v.quantityAccepted==true and p.ok==true and p.posts>=p.threshold
+ end
+ if v.acceptedBy=='retry_exhausted_completion' then
+  return v.businessCompleted==true and v.quantityAccepted==false and v.retryExhaustedCompletion==true
+   and type(v.attempts)=='number' and type(v.retryBudget)=='number'
+   and v.retryBudget>=1 and v.attempts>=v.retryBudget and p.posts<p.threshold
+ end
+ if v.acceptedBy=='verified_low_year_search' and v.quantityAccepted==false then
+  local a=v.annualAcceptance
+  return type(a)=='table' and a.ok==true and a.policy=='20261016-keyword-p80-or-low-year-v2'
+   and a.taskId==id and a.snapshotId==p.snapshotId and a.posts==p.posts and a.threshold==p.threshold
+   and p.posts<p.threshold and type(a.databaseCoverageLowerBound)=='number' and a.databaseCoverageLowerBound>=0.8
+   and type(a.annualAvailableUpperBound)=='number' and a.annualAvailableUpperBound>=p.posts
+   and a.annualAvailableUpperBound<p.threshold
+ end
+ return false
+end
+"""
+
+PARENT_STATUS_CAS = PRESERVE_KEYWORD_ACCEPTANCE_LUA + """
+local old=redis.call('HGET',KEYS[2],ARGV[1]) or ''
+if keyword_accepted(old,ARGV[1]) then return 2 end
+if old~=ARGV[2] then return 0 end
+local expected=cjson.decode(ARGV[4]);local count=0
+for fp,encoded in pairs(expected) do
+ count=count+1
+ if redis.call('HGET',KEYS[1],fp)~=encoded then return 0 end
+end
+if redis.call('HLEN',KEYS[1])~=count then return 0 end
+redis.call('HSET',KEYS[2],ARGV[1],ARGV[3]);return 1
+"""
+
+def coverage_collect_comments(item: dict[str, Any]) -> bool:
+    """Only an exact, explicit original task policy can waive comment content."""
+    task_queue = item.get('queue')
+    if not isinstance(task_queue, dict) or not isinstance(task_queue.get('tasks'), list):
+        return True
+    matches = [task for task in task_queue['tasks'] if isinstance(task, dict)
+               and task.get('id') == item.get('topic')
+               and item.get('keyword') in (task.get('keywordAllowList') or [])]
+    return not (len(matches) == 1 and matches[0].get('collectComments') is False)
+
+
+def validate_parent_search_evidence(args, item, envelope):
+    expected = {'taskId': str(item.get('source_task_id') or item['task_id']),
+                'topic': str(item['topic']), 'keyword': str(item['keyword']),
+                'runId': str(getattr(args, 'run_id', '')),
+                'generation': str(getattr(args, 'run_generation', ''))}
+    return validate_scan_envelope(envelope, expected)
+
+
+def primary_search_evidence_readback(item):
+    context = item.get('_localSearchScan')
+    if not isinstance(context, dict):
+        return {'ok': False, 'reason': 'SEARCH_SCAN_RUN_NOT_BOUND'}
+    try:
+        file = Path(context['file'])
+        if file.stat().st_size > 2_000_000:
+            return {'ok': False, 'reason': 'SEARCH_SCAN_EVIDENCE_TOO_LARGE'}
+        envelope = json.loads(file.read_text(encoding='utf-8'))
+        result = validate_scan_envelope(envelope, context['expected'], earliest=context['earliest'])
+        return {**result, **({'envelope': envelope} if result['ok'] else {})}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {'ok': False, 'reason': 'SEARCH_SCAN_EVIDENCE_UNREADABLE'}
+
+
+ACK_PRIMARY_SCAN = PRESERVE_KEYWORD_ACCEPTANCE_LUA + """
+local value=cjson.decode(ARGV[5]);local proof=value.searchScanProof
+if type(proof)~='table' or proof.policy~='20261015-bound-search-end-v1'
+ or proof.taskId~=ARGV[4] or proof.keyword~=value.keyword or proof.topic~=value.topic
+ or type(proof.runToken)~='string' or #proof.runToken<16 then
+ return redis.error_reply('PRIMARY_SCAN_EVIDENCE_INVALID') end
+local old=redis.call('HGET',KEYS[2],ARGV[4])
+local pending=redis.call('XPENDING',KEYS[1],ARGV[1],ARGV[2],ARGV[2],1)
+if #pending~=1 or pending[1][1]~=ARGV[2] or pending[1][2]~=ARGV[3] then
+ return redis.error_reply('PRIMARY_SCAN_LEASE_LOST') end
+-- Save the exact replayable evidence before closing this owned delivery in
+-- one atomic operation. A failed status write can never consume the message.
+if not keyword_accepted(old,ARGV[4]) then redis.call('HSET',KEYS[2],ARGV[4],ARGV[5]) end
+return redis.call('XACK',KEYS[1],ARGV[1],ARGV[2])
+"""
+
+
+def acknowledge_primary_scan(args, item, message_id, envelope, checkpoint_guard):
+    parent_id = str(item.get('source_task_id') or item['task_id'])
+    value = {'status': 'scan_completed_pending_verification', 'accepted': False,
+             'worker': args.consumer, 'topic': item['topic'], 'keyword': item['keyword'],
+             'updatedAt': datetime.now().astimezone().isoformat(),
+             'scanCompleted': True, 'searchScanProof': envelope,
+             'messageId': message_id, 'checkpointGuard': checkpoint_guard}
+    reply = redis_command(args.redis_url, args.redis_password, 'EVAL', ACK_PRIMARY_SCAN, 2,
+                          args.stream, getattr(args, 'status_key', args.prefix + ':status'),
+                          args.group, message_id, args.consumer, parent_id,
+                          json.dumps(value, ensure_ascii=False, separators=(',', ':')))
+    if int(reply) != 1:
+        raise RedisError('PRIMARY_SCAN_ACK_UNCONFIRMED')
 
 
 def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
@@ -369,6 +512,16 @@ def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
     the parent visibly non-final while any child is pending/running, and expose
     dead letters instead of silently converting them into ``completed``.
     """
+    if getattr(args, 'volume_runtime', None):
+        parent = str(item.get('source_task_id') or item['task_id'])
+        proof = args.volume_runtime.read(parent)
+        annual=not proof['ok'] and args.volume_runtime.annual_closed(parent)
+        # Child status must never downgrade a quantity-accepted parent. Only
+        # the owned primary transition can mutate its final acceptance record.
+        return {'status':'completed' if proof['ok'] or annual else 'retry_pending',
+                'accepted':proof['ok'] or annual, 'volumeAcceptance':proof,
+                'quantityAccepted':proof['ok'], 'annualLowVolumeAccepted':annual,
+                'qualityVerified':False, 'subtitleRetriesRequired':False}
     task_token = safe_token(item.get("source_task_id") or item.get("task_id", ""))
     state_key = f"{args.prefix}:video-state:{task_token}"
     raw = redis_command(
@@ -377,12 +530,15 @@ def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
     values = fields_to_dict(raw)
     statuses: Counter[str] = Counter()
     malformed = 0
-    for encoded in values.values():
+    checkpoints = {}
+    for fingerprint, encoded in values.items():
         try:
             payload = json.loads(encoded)
+            checkpoints[fingerprint] = payload
             statuses[str(payload.get("status") or "unknown")] += 1
         except (TypeError, ValueError, json.JSONDecodeError):
             malformed += 1
+            checkpoints[fingerprint]={'status':'invalid_json'}
     unresolved = malformed + sum(
         count for status, count in statuses.items()
         if status not in TERMINAL_VIDEO_CHECKPOINT_STATUSES
@@ -395,11 +551,17 @@ def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
     except (TypeError,ValueError):
         prior={}
     # Legacy aggregate status is not proof that the annual scan finished.
-    scan_complete=prior.get("scanCompleted") is True
+    scan_evidence=validate_parent_search_evidence(args,item,prior.get('searchScanProof'))
+    scan_complete=prior.get("scanCompleted") is True and scan_evidence.get('ok') is True
+    coverage=verify_database_coverage(checkpoints,scan_complete=scan_complete,collect_comments=coverage_collect_comments(item)) if scan_complete else {'ok':False,'reason':'SEARCH_END_UNVERIFIED'}
+    if len(values)<int((prior.get('checkpointGuard') or {}).get('checkpointCount') or 0):
+        coverage={'ok':False,'reason':'DISCOVERED_CHECKPOINTS_MISSING'}
     if not scan_complete:
         parent_status="retry_pending"
     elif unresolved:
         parent_status = "completed_with_deferred_retries"
+    elif not coverage.get('ok'):
+        parent_status = "coverage_below_threshold"
     elif statuses.get("skipped_unresolved"):
         parent_status = "completed_with_skips"
     elif dead_letters:
@@ -413,8 +575,22 @@ def refresh_parent_keyword_status(args, item: dict[str, Any]) -> dict[str, Any]:
         "deadLetterCount": dead_letters,
         "skippedVideoCount": int(statuses.get("skipped_unresolved",0)),
         "scanCompleted": scan_complete,
+        "searchScanProof": prior.get('searchScanProof') if scan_complete else None,
+        "searchScanEvidence": scan_evidence,
+        "coverage": coverage,
     }
-    update_remote_status(args, item, parent_status, detail)
+    parent_id=item.get('source_task_id') or item['task_id']
+    value={'status':parent_status,'worker':getattr(args,'consumer','status-reconciler'),
+           'topic':item['topic'],'keyword':item['keyword'],
+           'updatedAt':datetime.now().astimezone().isoformat(),**detail}
+    changed=redis_command(args.redis_url,args.redis_password,'EVAL',PARENT_STATUS_CAS,2,
+        state_key,getattr(args,'status_key',args.prefix+':status'),parent_id,parent_raw or '',
+        json.dumps(value,ensure_ascii=False,separators=(',',':')),json.dumps(values,ensure_ascii=False,separators=(',',':')))
+    if int(changed)==2:
+        return {'status':'completed','accepted':True,'keywordAcceptancePreserved':True,
+                'subtitleRetriesRequired':False,'qualityVerified':False}
+    if int(changed)!=1:
+        return {'status':'refresh_deferred_state_changed','accepted':False,'reason':'CONCURRENT_CHECKPOINT_CHANGE'}
     return {"status": parent_status, **detail}
 
 
@@ -705,6 +881,8 @@ class PersistentAsrService:
             config = self.args.common / "collector_config.json"
             worker = self.args.common / "src" / "asr-worker.py"
             child_env = os.environ.copy()
+            if getattr(self.args, 'volume_runtime', None):
+                child_env['SOCIAL_VOLUME_ENABLED'] = '1'
             child_env["PYTHONUTF8"] = "1"
             child_env["PYTHONIOENCODING"] = "utf-8"
             child_env["WECHAT_PERSISTENT_ASR_TOKEN"] = self.token
@@ -861,6 +1039,13 @@ def run_task(
         "leaseGroup": lease_group or args.group,
     })
     env = os.environ.copy()
+    env['WECHAT_FINAL_TASK'] = '1' if getattr(args,'once',False) or getattr(args,'only_task_id',None) else '0'
+    if getattr(args, 'volume_runtime', None):
+        env['SOCIAL_VOLUME_ENABLED'] = '1'
+        env['SOCIAL_VOLUME_TARGET_POSTS'] = str(args.volume_runtime.snapshot['threshold'])
+        fresh_volume = args.volume_runtime.read(str(item.get('source_task_id') or item['task_id']))
+        env['SOCIAL_VOLUME_INITIAL_POSTS'] = str(fresh_volume['posts'])
+        env['SOCIAL_VOLUME_SNAPSHOT'] = str(args.volume_runtime.snapshot_file)
     env["WECHAT_QUEUE_FILE"] = str(task_queue_path)
     env["WECHAT_WORKER_ROOT"] = str(args.worker_root)
     env["WECHAT_REDIS_TASK_ID"] = str(item.get("source_task_id") or item["task_id"])
@@ -870,6 +1055,18 @@ def run_task(
     env["WECHAT_REDIS_CONSUMER"] = str(args.consumer)
     env["WECHAT_WORKER_ID"] = str(args.worker_root.name)
     env["WECHAT_REDIS_GENERATION"] = str(args.run_generation)
+    if task_kind == 'primary':
+        token = secrets.token_hex(24)
+        proof_file = state_path.parent / 'search-scan-evidence' / (safe_token(item['task_id']) + '-' + token + '.json')
+        item['_localSearchScan'] = {'file': str(proof_file), 'earliest': time.time(),
+            'expected': {'taskId': env['WECHAT_REDIS_TASK_ID'], 'topic': env['WECHAT_REDIS_TOPIC'],
+                         'keyword': env['WECHAT_REDIS_KEYWORD'], 'runId': env['WECHAT_REDIS_RUN_ID'],
+                         'generation': env['WECHAT_REDIS_GENERATION'], 'runToken': token}}
+        env['WECHAT_SEARCH_SCAN_PROOF_FILE'] = str(proof_file)
+        env['WECHAT_SEARCH_SCAN_RUN_TOKEN'] = token
+    else:
+        env.pop('WECHAT_SEARCH_SCAN_PROOF_FILE', None)
+        env.pop('WECHAT_SEARCH_SCAN_RUN_TOKEN', None)
     # The scheduler accepts Redis connectivity through command-line options,
     # while the collector/checkpoint store reads environment variables.  Always
     # bridge the resolved values into the child so dedicated ASR nodes can
@@ -886,6 +1083,9 @@ def run_task(
     # its parent environment.
     env["REDIS_RUN_ID"] = str(args.run_id)
     env["WECHAT_REDIS_STATE_SCOPE"] = f"{safe_token(args.run_id)}-{safe_token(args.run_generation)}"
+    env['WECHAT_RECOLLECT_ONCE']=str(item.get('_recollectPolicy') or '')
+    if item.get('_recollectPolicy'):
+        env['WECHAT_REDIS_STATE_SCOPE']+='-'+safe_token(item['_recollectPolicy'])
     if task_kind == "video_retry":
         env['WECHAT_FORCE_ASR'] = '1'
         env['WECHAT_RETRY_OBSERVATION_RUN_ID'] = str(item.get('retryObservationRunId') or '')
@@ -903,6 +1103,8 @@ def run_task(
         env.pop("WECHAT_REDIS_VIDEO_FINGERPRINT", None)
         env.pop("WECHAT_REDIS_VIDEO_ARTICLE_KEY", None)
         env.pop("WECHAT_REDIS_VIDEO_RESULT_INDEX", None)
+    if item.get('_recollectPolicy'):
+        env['WECHAT_FORCE_ASR']='1'
     # Primary work records complete audio during the first detail visit and
     # transcribes through the node-local persistent service.  The independent
     # retry stream is reserved for exact videos whose recording/transcript did
@@ -1015,7 +1217,7 @@ def run_task(
             message_id=message_id,
             extra={"exitCode": exit_code},
         )
-        return 75 if heartbeat.lease_lost.is_set() and exit_code == 0 else exit_code
+        return 75 if heartbeat.lease_lost.is_set() else exit_code
     finally:
         if output_thread is not None and output_thread.is_alive():
             output_thread.join(timeout=2)
@@ -1023,6 +1225,13 @@ def run_task(
             stop_child_log_publisher(log_lines)
         heartbeat.stop()
         heartbeat.join(timeout=5)
+
+
+UPDATE_REMOTE_STATUS = PRESERVE_KEYWORD_ACCEPTANCE_LUA + """
+local old=redis.call('HGET',KEYS[1],ARGV[1])
+if keyword_accepted(old,ARGV[1]) then return 0 end
+redis.call('HSET',KEYS[1],ARGV[1],ARGV[2]);return 1
+"""
 
 
 def update_remote_status(args, item, status: str, detail: dict[str, Any]):
@@ -1037,7 +1246,7 @@ def update_remote_status(args, item, status: str, detail: dict[str, Any]):
     redis_command(
         args.redis_url,
         args.redis_password,
-        "HSET",
+        "EVAL", UPDATE_REMOTE_STATUS, 1,
         getattr(args, "status_key", f"{args.prefix}:status"),
         item["task_id"],
         json.dumps(value, ensure_ascii=False, separators=(",", ":")),
@@ -1082,7 +1291,37 @@ def claim_primary_message(args, *, recover_stale_pending: bool):
     ), False
 
 
+def select_original_keyword(tasks, keyword):
+    """Exact, unique original only; never infer another keyword or clone it."""
+    if not isinstance(keyword, str) or not keyword or keyword != keyword.strip():
+        raise ValueError('SELECTED_ORIGINAL_KEYWORD_INVALID')
+    matches = [task for task in tasks if task.get('keyword') == keyword]
+    if len(matches) != 1:
+        raise ValueError('SELECTED_ORIGINAL_KEYWORD_NOT_UNIQUE')
+    selected = matches[0]
+    if not selected.get('task_id') or sum(task.get('task_id') == selected['task_id'] for task in tasks) != 1:
+        raise ValueError('SELECTED_ORIGINAL_ID_NOT_UNIQUE')
+    return selected
+
+
+def validate_selected_original(args, tasks=None):
+    """Fail closed before control startup/stop consumption/generation writes."""
+    selected = getattr(args, 'only_task_id', None)
+    if selected is None:
+        return
+    if not isinstance(selected, str) or not selected or selected != selected.strip():
+        raise ValueError('SELECTED_ORIGINAL_ID_INVALID')
+    from volume_policy import read_volume_config
+    if read_volume_config(args.common) is None:
+        raise RuntimeError('SELECTED_ORIGINAL_REQUIRES_VOLUME_POLICY')
+    if tasks is None:
+        tasks = flatten_queue(json.loads(args.queue.read_text(encoding='utf-8-sig')))
+    if sum(task.get('task_id') == selected for task in tasks) != 1:
+        raise ValueError('SELECTED_ORIGINAL_ID_NOT_UNIQUE')
+
+
 def run_worker(args) -> int:
+    validate_selected_original(args)
     from redis_worker_control import WorkerControl
     stop_requested = threading.Event()
     stop_file = args.worker_root / ".state" / "stop.requested"
@@ -1102,13 +1341,14 @@ def run_worker(args) -> int:
             orderly = True
             return 130
         result = _run_worker(args, stop_requested, control)
-        orderly = True
+        orderly = result != 75
         return result
     finally:
         control.close(orderly=orderly)
 
 
 def _run_worker(args, stop_requested, control) -> int:
+    validate_selected_original(args)
     # Replay verified telemetry from previous runs, without claiming tasks.
     try:
         from production_output_publisher import flush as flush_output
@@ -1119,6 +1359,12 @@ def _run_worker(args, stop_requested, control) -> int:
         print(json.dumps({'event':'production_output_upload_deferred','errorType':type(output_error).__name__},ensure_ascii=False),flush=True)
     queue = json.loads(args.queue.read_text(encoding="utf-8-sig"))
     tasks = flatten_queue(queue)
+    from volume_policy import open_runtime, run_volume_worker
+    args.volume_runtime = open_runtime(SimpleNamespace(**globals()), args, tasks)
+    if args.volume_runtime:
+        return run_volume_worker(SimpleNamespace(**globals()), args, stop_requested, control)
+    if getattr(args, 'only_task_id', None):
+        raise RuntimeError('SELECTED_ORIGINAL_NO_UNRESTRICTED_FALLBACK')
     ensure_group(args.redis_url, args.redis_password, args.stream, args.group)
     ensure_group(args.redis_url, args.redis_password, args.retry_stream, args.retry_group)
     inserted = seed_tasks(args.redis_url, args.redis_password, args.stream, args.seeded_key, tasks)
@@ -1461,6 +1707,17 @@ def _worker_loop(args, stop_requested, control, stop_file, state_path,
             task_kind=task_kind,
             asr_service=asr_service,
         )
+        if exit_code == 75:
+            # No ACK, budget exhaustion, reset, or further claim on an
+            # infrastructure failure, even when the child salvaged SQL rows.
+            write_json(state_path, {"status": "infrastructure_paused",
+                "taskId": item["task_id"], "messageId": message_id,
+                "taskKind": task_kind, "childExitCode": 75,
+                "localCheckpointRetained": True, "remoteSyncConfirmed": False,
+                "updatedAt": datetime.now().astimezone().isoformat()})
+            print(json.dumps({"event": "redis_infrastructure_paused_no_ack",
+                "taskId": item["task_id"], "exitCode": 75}), flush=True)
+            return 75
         safe_stop_observed = stop_file.exists()
         if safe_stop_observed:
             # Finish the current task's checkpoint/retry persistence below,
@@ -1597,6 +1854,11 @@ def _worker_loop(args, stop_requested, control, stop_file, state_path,
                 return once_exit
             continue
         checkpoint_guard = None
+        search_scan_evidence = primary_search_evidence_readback(item)
+        if exit_code == 0 and search_scan_evidence.get('ok') is not True:
+            exit_code = 4
+            print(json.dumps({'event': 'redis_primary_ack_blocked_search_end_unverified',
+                'taskId': item['task_id'], 'evidence': search_scan_evidence}, ensure_ascii=False), flush=True)
         # Persist every already-committed video's follow-up work even when the
         # keyword scan ends partial/failed (most importantly, safe stop).  The
         # old exit-code gate staged ASR only after a fully successful annual
@@ -1638,21 +1900,16 @@ def _worker_loop(args, stop_requested, control, stop_file, state_path,
                 }, ensure_ascii=False), flush=True)
         if exit_code == 0:
             try:
-                redis_command(args.redis_url, args.redis_password, "XACK", args.stream, args.group, message_id)
                 deferred_count = int((checkpoint_guard or {}).get("deferredCount") or 0)
-                completion_status = (
-                    "completed_with_deferred_retries" if deferred_count else "completed"
-                )
-                if not deferred_count and any((checkpoint_guard or {}).get("statuses",{}).get(s) for s in ("dead_letter","skipped_unresolved")):
-                    completion_status="completed_with_skips"
-                update_remote_status(args, item, completion_status, {
-                    "scanCompleted": True,
-                    "messageId": message_id,
-                    "checkpointGuard": checkpoint_guard,
-                })
+                completion_status = "scan_completed_pending_verification"
+                acknowledge_primary_scan(args,item,message_id,search_scan_evidence['envelope'],checkpoint_guard)
+                # XACK closes the completed scan, not a claim of 80% business
+                # success. Re-read the exact rows before final parent status.
+                parent_result=refresh_parent_keyword_status(args,item)
+                completion_status=parent_result['status']
                 if completion_status=="completed_with_skips":
                     skipped+=1
-                else:
+                elif completion_status=="completed":
                     completed += 1
                 print(json.dumps({
                     "event": "redis_task_acked",
@@ -1661,8 +1918,9 @@ def _worker_loop(args, stop_requested, control, stop_file, state_path,
                 }, ensure_ascii=False), flush=True)
             except Exception as error:
                 failed += 1
+                exit_code = 4
                 print(json.dumps({
-                    "event": "redis_task_ack_failed_left_pending",
+                    "event": "redis_task_confirmation_failed_state_unverified",
                     "taskId": item["task_id"],
                     "error": str(error),
                 }, ensure_ascii=False), flush=True)
@@ -1671,6 +1929,7 @@ def _worker_loop(args, stop_requested, control, stop_file, state_path,
             try:
                 update_remote_status(args, item, "retry_pending", {
                     "scanCompleted": False,
+                    "searchScanEvidence": {key:value for key,value in search_scan_evidence.items() if key!='envelope'},
                     "messageId": message_id,
                     "exitCode": exit_code,
                     "checkpointGuard": checkpoint_guard,
@@ -1761,6 +2020,7 @@ def build_parser():
         help="approximate maximum number of centralized Redis log events retained per run",
     )
     run.add_argument("--once", action="store_true")
+    run.add_argument('--only-task-id', help='volume mode: one retained original keyword task only')
     return parser
 
 
@@ -1785,6 +2045,7 @@ def main() -> int:
     args.redis_password = os.environ.get("REDIS_PASSWORD") or None
     args.common = args.common.resolve()
     args.worker_root = args.worker_root.resolve()
+    validate_selected_original(args, tasks)
     safe_run_id = safe_token(args.run_id)
     prefix = f"wechat:channels:{safe_run_id}"
     args.prefix = prefix

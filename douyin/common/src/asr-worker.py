@@ -51,6 +51,8 @@ def compare_key(value):
 
 
 def assess_text(value, prompt, capture_seconds, speech_seconds=None, fallback=False):
+    if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1':
+        return clean_asr_text(value), {'accepted': None, 'reason': 'quality_check_disabled_by_volume_policy', 'qualityChecked': False}
     text, marker_removed = strip_known_hallucination_markers(value)
     if not text:
         return None, {"accepted": False, "reason": "known_whisper_hallucination" if marker_removed else "empty",
@@ -79,6 +81,8 @@ def assess_text(value, prompt, capture_seconds, speech_seconds=None, fallback=Fa
 
 
 def needs_review(text, capture_seconds, speech_seconds=None):
+    if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1':
+        return False
     capture = float(capture_seconds or 0)
     if capture < 10:
         return False
@@ -209,7 +213,7 @@ def transcribe_media(model, request, args):
         item.get("quality", {}).get("reason") not in (None, "empty")
         for item in passes if isinstance(item, dict)
     )
-    quality_rejected = (had_candidate and not text) or (not text and rejected_during_passes)
+    quality_rejected = os.environ.get('SOCIAL_VOLUME_ENABLED') != '1' and ((had_candidate and not text) or (not text and rejected_during_passes))
     result.update({
         "text": text,
         "status": "ok" if text else "quality_rejected" if quality_rejected else "no_speech",

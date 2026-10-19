@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import mysql from "mysql2/promise";
+import { mysqlTargetOptions } from "./mysql-target-options.mjs";
 import { POST_FIELDS, COMMENT_FIELDS, canonicalXhsNoteUrl } from "./schema.mjs";
 import { pathToFileURL } from "node:url";
 import { assertLocalLease, withImportLease } from "./lease-guard.mjs";
@@ -23,9 +24,7 @@ export function mysqlConnectionOptions() {
   const user = process.env.MYSQL_USER, password = process.env.MYSQL_PASSWORD;
   if (!user || !password) throw new Error("请通过当前进程环境变量 MYSQL_USER 和 MYSQL_PASSWORD 提供数据库凭据，不要写入配置文件");
   return {
-    host: String(process.env.MYSQL_HOST || "127.0.0.1"),
-    port: Number(process.env.MYSQL_PORT || 3306),
-    database: String(process.env.MYSQL_DATABASE || "social"),
+    ...mysqlTargetOptions(),
     user, password, charset: "utf8mb4", supportBigNumbers: true, bigNumberStrings: true, connectTimeout: 15000
   };
 }
@@ -143,9 +142,11 @@ async function upsertRows(connection, table, fields, rows, uniqueWhere) {
   for (const row of rows) {
     await assertLocalLease();
     const { sql, values } = uniqueWhere(row);
-    const [existing] = await connection.execute(`SELECT \`id\`${table==='ods_social_media_post'?',`文章视频内容`':''} FROM \`${table}\` WHERE ${sql} LIMIT 1 FOR UPDATE`, values);
+    const [existing] = await connection.execute(`SELECT \`id\`${table==='ods_social_media_post'?',`文章视频内容`':''} FROM \`${table}\` WHERE ${sql} LIMIT 2 FOR UPDATE`, values);
+    if(existing.length>1)throw Object.assign(new Error('MYSQL_DUPLICATE_BUSINESS_KEY：同一业务身份存在多行，禁止任意选取覆盖'),{code:'MYSQL_DUPLICATE_BUSINESS_KEY'});
     if (existing.length) {
       row.id = String(existing[0].id);
+      if(table==='ods_social_media_post')await archiveSubtitleReplacement(existing[0],row);
       await connection.execute(updateSql, [...dataFields.map((f) => row[f]), row.id]);
       if(table==='ods_social_media_post')videoContentWrites+=subtitleWriteCount(existing[0]['文章视频内容'],row['文章视频内容']);
       updated += 1;
@@ -157,6 +158,17 @@ async function upsertRows(connection, table, fields, rows, uniqueWhere) {
     }
   }
   return { inserted, updated, videoContentWrites };
+}
+export async function archiveSubtitleReplacement(existing,row,{archive=process.env.XHS_MEDIA_CORRECTION_ARCHIVE||path.resolve('.state','media-corrections','mysql-subtitles.jsonl')}={}){
+  const before=existing['文章视频内容'],after=row['文章视频内容'];
+  if(!String(before||'').trim()||String(before||'')===String(after||''))return false;
+  // Persist the exact pre-write DB value even if it differs from the old local
+  // checkpoint. An archive records an attempted replacement, not a commit.
+  await fs.mkdir(path.dirname(archive),{recursive:true});
+  const handle=await fs.open(archive,'a');
+  try{await handle.writeFile(JSON.stringify({at:new Date().toISOString(),event:'subtitle_replacement_attempt',id:String(existing.id),platform:row.平台,project:row.项目,articleId:row.文章id,before,after:after??null})+'\n','utf8');await handle.sync();}
+  finally{await handle.close();}
+  return true;
 }
 export async function importRows({ posts = [], comments = [], verify = false, lockTimeoutSeconds = 15,
   batchRows = 10, maxAttempts = 4, retryDelayMs = 2000, onProgress = async () => {} } = {}) {

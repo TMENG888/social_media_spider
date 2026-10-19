@@ -3,6 +3,7 @@ import path from "node:path";
 import { inTargetYear } from "./collection-policy.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { POST_FIELDS, COMMENT_FIELDS, canonicalXhsNoteUrl } from "./schema.mjs";
+import {assertMediaProvenance,MEDIA_BINDING_VERSION} from './media-provenance.mjs';
 
 const now = () => new Intl.DateTimeFormat("sv-SE", {
   timeZone: "Asia/Shanghai", dateStyle: "short", timeStyle: "medium", hourCycle: "h23"
@@ -32,6 +33,11 @@ export function openCheckpoint(dbPath) {
     CREATE TABLE IF NOT EXISTS scope_audit (
       keyword TEXT NOT NULL,note_id TEXT NOT NULL,assessment_json TEXT NOT NULL,
       checked_at TEXT NOT NULL,PRIMARY KEY(keyword,note_id)
+    );
+    CREATE TABLE IF NOT EXISTS scope_evidence_history (
+      keyword TEXT NOT NULL,note_id TEXT NOT NULL,evidence_hash TEXT NOT NULL,
+      previous_candidate_json TEXT NOT NULL,previous_scope_json TEXT,
+      replaced_at TEXT NOT NULL,PRIMARY KEY(keyword,note_id,evidence_hash)
     );
     -- 增量入库断点表：登记已写入 MySQL 的帖子/评论，异常终止后恢复时据此避免重复入库与漏库。
     CREATE TABLE IF NOT EXISTS note_dead_letter (
@@ -69,6 +75,11 @@ export function openCheckpoint(dbPath) {
       PRIMARY KEY(keyword, note_id)
     );
   `);
+  if(!db.prepare('PRAGMA table_info(asr_job)').all().some(c=>c.name==='binding_json'))db.exec('ALTER TABLE asr_job ADD COLUMN binding_json TEXT');
+  db.exec(`CREATE TABLE IF NOT EXISTS media_correction_history (
+    keyword TEXT NOT NULL,note_id TEXT NOT NULL,version TEXT NOT NULL,
+    original_result TEXT,original_job TEXT,created_at TEXT NOT NULL,
+    PRIMARY KEY(keyword,note_id,version))`);
   // A killed process cannot still own a local download/inference operation.
   // Keep the durable job and retry only this video on the next start.
   db.prepare(`UPDATE asr_job SET status='retry_pending',last_error=COALESCE(last_error,'进程中断后恢复'),updated_at=?
@@ -128,9 +139,12 @@ function retainCompletedAsrEvidence(db,keyword,noteId,result) {
   // Restore only blank fields with the same article identity and a trustworthy
   // durable audit; never overwrite a new nonempty text or revive failed jobs.
   if(!result?.post || result.post.内容类型!=='视频' || String(result.post.文章视频内容||'').trim())return false;
-  const job=db.prepare('SELECT status,article_id,transcript,audit_json FROM asr_job WHERE keyword=? AND note_id=?').get(keyword,noteId);
+  const job=db.prepare('SELECT status,article_id,transcript,audit_json,media_url,binding_json FROM asr_job WHERE keyword=? AND note_id=?').get(keyword,noteId);
   if(job?.status!=='completed'||String(job.article_id)!==String(result.post.文章id))return false;
   let audit;try{audit=JSON.parse(job.audit_json||'null');}catch{return false;}
+  try{assertMediaProvenance(JSON.parse(job.binding_json||'null'),{noteId,url:job.media_url,duration:audit?.duration});}catch{return false;}
+  const currentDuration=Number(result.mediaProvenance?.expectedDuration);
+  if(!(currentDuration>0)||Math.abs(currentDuration-Number(audit.duration))>Math.max(2,currentDuration*.03))return false;
   const text=String(job.transcript||'');
   const noSpeech=!text&&['no_speech','no_audio_track','empty_audio_track','silent_audio'].includes(audit?.status);
   if(audit?.quality?.accepted===false||(!noSpeech&&(!text||audit?.status!=='ok')))return false;
@@ -159,11 +173,36 @@ export function markFailed(db, keyword, note, error, maxAttempts = 3) {
 
 export function enqueueAsrJob(db, job, maxAttempts = 3) {
   const timestamp = now();
+  const previous=db.prepare('SELECT * FROM asr_job WHERE keyword=? AND note_id=?').get(job.keyword,job.noteId);
+  // Completed, verified evidence belongs to its original source. A refreshed
+  // signed URL must not rewrite its provenance underneath that evidence.
+  if(previous?.status==='completed'){
+    let verified=null;try{verified=assertMediaProvenance(JSON.parse(previous.binding_json||'null'),{noteId:job.noteId,url:previous.media_url,duration:JSON.parse(previous.audit_json||'null')?.duration});}catch{}
+    if(verified){
+      const expected=Number(job.mediaBinding?.expectedDuration);
+      if(!(expected>0)||Math.abs(expected-verified.decodedDuration)>Math.max(2,expected*.03))throw new Error('MEDIA_NOTE_CONTENT_CHANGED：此前核验媒体与当前详情时长冲突');
+      return;
+    }
+  }
+  const changed=previous&&previous.media_url!==job.mediaUrl;
+  if(changed&&['running','downloading'].includes(previous.status))throw new Error('MEDIA_SOURCE_CHANGE_WHILE_RUNNING');
+  const ownsTransaction=!db.isTransaction;
+  if(ownsTransaction)db.exec('BEGIN IMMEDIATE');
+  try{
+  let priorBinding;try{priorBinding=JSON.parse(previous?.binding_json||'null');}catch{}
+  if(previous&&previous.status!=='quarantined'&&priorBinding?.version!==MEDIA_BINDING_VERSION&&job.mediaBinding?.version===MEDIA_BINDING_VERSION){
+    const candidate=db.prepare('SELECT result_json,attempts FROM candidate WHERE keyword=? AND note_id=?').get(job.keyword,job.noteId);
+    const archived=db.prepare('INSERT OR IGNORE INTO media_correction_history VALUES(?,?,?,?,?,?)')
+      .run(job.keyword,job.noteId,MEDIA_BINDING_VERSION,candidate?.result_json||null,JSON.stringify({...previous,candidateAttempts:candidate?.attempts||0}),timestamp);
+    if(!Number(archived.changes))throw new Error('MEDIA_LEGACY_CORRECTION_ALREADY_CONSUMED');
+    db.prepare("UPDATE asr_job SET status='quarantined' WHERE keyword=? AND note_id=?").run(job.keyword,job.noteId);
+    previous.status='quarantined';
+  }
   db.prepare(`INSERT INTO asr_job(keyword,note_id,article_id,media_url,media_path,referer,prompt,status,attempts,max_attempts,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'pending',0,?,?,?)
     ON CONFLICT(keyword,note_id) DO UPDATE SET
       article_id=excluded.article_id,media_url=excluded.media_url,
-      media_path=COALESCE(asr_job.media_path,excluded.media_path),
+      media_path=CASE WHEN asr_job.media_url=excluded.media_url THEN asr_job.media_path ELSE NULL END,
       referer=excluded.referer,prompt=excluded.prompt,
       status=CASE
         WHEN asr_job.status IN ('completed','dead_letter','running','downloading') THEN asr_job.status
@@ -175,6 +214,15 @@ export function enqueueAsrJob(db, job, maxAttempts = 3) {
       updated_at=excluded.updated_at`)
     .run(String(job.keyword), String(job.noteId), String(job.articleId), String(job.mediaUrl), job.mediaPath || null,
       job.referer || null, job.prompt || null, Math.max(1, Number(maxAttempts) || 3), timestamp, timestamp);
+  db.prepare('UPDATE asr_job SET binding_json=? WHERE keyword=? AND note_id=?').run(JSON.stringify(job.mediaBinding||null),job.keyword,job.noteId);
+  if(previous?.status==='quarantined'){
+    // Exactly one correction budget per migration; cumulative attempts/history
+    // are retained. Reopening the process or refreshing URLs grants no budget.
+    db.prepare("UPDATE asr_job SET status='pending',media_path=NULL,max_attempts=attempts+?,transcript=NULL,audit_json=NULL WHERE keyword=? AND note_id=?")
+      .run(Math.max(1,Number(maxAttempts)||3),job.keyword,job.noteId);
+  }
+  if(ownsTransaction)db.exec('COMMIT');
+  }catch(error){if(ownsTransaction)db.exec('ROLLBACK');throw error;}
 }
 
 export function markNoteDeadLetter(db, keyword, note, error, maxAttempts=3, countAttempt=true) {
@@ -199,7 +247,7 @@ export function claimAsrJob(db) {
   db.exec("BEGIN IMMEDIATE");
   try {
     const row = db.prepare(`SELECT keyword,note_id AS noteId,article_id AS articleId,media_url AS mediaUrl,
-      media_path AS mediaPath,referer,prompt,status,attempts,max_attempts AS maxAttempts
+      media_path AS mediaPath,referer,prompt,status,attempts,max_attempts AS maxAttempts,binding_json AS bindingJson
       FROM asr_job WHERE status IN ('pending','retry_pending') AND attempts < max_attempts
       AND NOT EXISTS(SELECT 1 FROM candidate c WHERE c.keyword=asr_job.keyword AND c.note_id=asr_job.note_id AND c.status='skipped_irrelevant')
       ORDER BY updated_at,keyword,note_id LIMIT 1`).get();
@@ -212,7 +260,7 @@ export function claimAsrJob(db) {
       .run(now(), row.keyword, row.noteId, row.attempts);
     if (Number(result.changes) !== 1) throw new Error(`ASR_CLAIM_CONFLICT：${row.keyword}/${row.noteId}`);
     db.exec("COMMIT");
-    return { ...row, attempts: Number(row.attempts) + 1 };
+    return { ...row, mediaBinding:JSON.parse(row.bindingJson||'null'), attempts: Number(row.attempts) + 1 };
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
@@ -225,6 +273,8 @@ export function markAsrRunning(db, job, mediaPath) {
 }
 
 export function completeAsrJob(db, job, output) {
+  const provenance=assertMediaProvenance(job.mediaBinding,{noteId:job.noteId,url:job.mediaUrl,duration:output.audit?.duration});
+  output={...output,audit:{...output.audit,mediaProvenance:provenance}};
   const row = db.prepare("SELECT result_json AS resultJson FROM candidate WHERE keyword=? AND note_id=?").get(job.keyword, job.noteId);
   if (!row?.resultJson) throw new Error(`ASR_RESULT_MISSING：${job.keyword}/${job.noteId}没有文章断点`);
   const result = JSON.parse(row.resultJson);
@@ -251,6 +301,38 @@ export function completeAsrJob(db, job, output) {
     db.exec("COMMIT");
   } catch (error) { db.exec("ROLLBACK"); throw error; }
   return result;
+}
+
+export function quarantineUnverifiedMedia(db) {
+  const rows=db.prepare("SELECT keyword,note_id,result_json,attempts FROM candidate WHERE status='completed' AND result_json IS NOT NULL").all();
+  let count=0;
+  db.exec('BEGIN IMMEDIATE');
+  try{
+  for(const row of rows){
+    let result;try{result=JSON.parse(row.result_json);}catch{continue;}
+    if(result?.post?.内容类型!=='视频')continue;
+    const job=db.prepare('SELECT * FROM asr_job WHERE keyword=? AND note_id=?').get(row.keyword,row.note_id);
+    const binding=result.mediaProvenance;
+    if(binding?.version===MEDIA_BINDING_VERSION&&binding.identityVerified===true)continue;
+    const archived=db.prepare('INSERT OR IGNORE INTO media_correction_history VALUES(?,?,?,?,?,?)')
+      .run(row.keyword,row.note_id,MEDIA_BINDING_VERSION,row.result_json,JSON.stringify({...job,candidateAttempts:row.attempts}),now());
+    if(!Number(archived.changes))continue;
+    // Preserve the original evidence before making it ineligible for export.
+    result.post.文章视频内容=null;result.post.文章视频链接=null;
+    result.postTextAudit={...result.postTextAudit,subtitle_source:null,subtitle_status:'source_recheck_required',subtitle_error:'MEDIA_LEGACY_SOURCE_UNVERIFIED'};
+    db.prepare("UPDATE candidate SET status='failed',result_json=?,last_error='MEDIA_LEGACY_SOURCE_UNVERIFIED',updated_at=? WHERE keyword=? AND note_id=?")
+      .run(JSON.stringify(result),now(),row.keyword,row.note_id);
+    db.prepare("UPDATE asr_job SET status='quarantined',last_error='MEDIA_LEGACY_SOURCE_UNVERIFIED',updated_at=? WHERE keyword=? AND note_id=?")
+      .run(now(),row.keyword,row.note_id);count++;
+  }
+    db.exec('COMMIT');return count;
+  }catch(error){db.exec('ROLLBACK');throw error;}
+}
+
+export function detailAttemptLimit(db,keyword,noteId){
+  const history=db.prepare('SELECT original_job FROM media_correction_history WHERE keyword=? AND note_id=? AND version=?').get(keyword,noteId,MEDIA_BINDING_VERSION);
+  let prior;try{prior=JSON.parse(history?.original_job||'null');}catch{}
+  return Number.isSafeInteger(prior?.candidateAttempts)?Math.max(3,prior.candidateAttempts+3):3;
 }
 
 export function failAsrJob(db, job, error) {
@@ -328,6 +410,7 @@ export function needsAsrQualityRetry(result) {
 }
 
 export function repairCheckpointDataQuality(db) {
+  const quarantinedMedia=quarantineUnverifiedMedia(db);
   const rows = db.prepare("SELECT keyword,note_id,result_json FROM candidate WHERE status='completed' AND result_json IS NOT NULL").all();
   let links = 0, asr = 0, restoredAsr = 0;
   const update = db.prepare("UPDATE candidate SET result_json=?,updated_at=? WHERE keyword=? AND note_id=?");
@@ -346,7 +429,7 @@ export function repairCheckpointDataQuality(db) {
         if (fixed && fixed !== result.post["文章链接"]) { result.post["文章链接"] = fixed; links += 1; changed = true; }
         for (const comment of result.comments || []) if (comment["文章链接"] !== fixed) { comment["文章链接"] = fixed; changed = true; }
       }
-      if (needsAsrQualityRetry(result)) {
+      if (process.env.SOCIAL_VOLUME_ENABLED!=='1' && needsAsrQualityRetry(result)) {
         result.post["文章视频内容"] = null;
         result.postTextAudit = { ...(result.postTextAudit || {}), subtitle_source: null,
           subtitle_status: "asr_failed", subtitle_error: "ASR_QUALITY_RECHECK_REQUIRED" };
@@ -357,7 +440,7 @@ export function repairCheckpointDataQuality(db) {
     }
     db.exec("COMMIT");
   } catch (error) { db.exec("ROLLBACK"); throw error; }
-  return { links, asr, restoredAsr };
+  return { links, asr, restoredAsr,quarantinedMedia };
 }
 
 const csvCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
@@ -405,6 +488,8 @@ export async function exportCheckpoint(db, outputDir, extra = {}) {
   const scopeAudits=db.prepare('SELECT keyword,note_id AS noteId,assessment_json,checked_at AS checkedAt FROM scope_audit ORDER BY keyword,note_id').all()
     .map(({assessment_json,...row})=>({...row,assessment:JSON.parse(assessment_json)}));
   await atomicWrite(path.join(outputDir,'scope_audit.jsonl'),scopeAudits.map(JSON.stringify).join('\n')+(scopeAudits.length?'\n':''));
+  const scopeHistory=db.prepare('SELECT * FROM scope_evidence_history ORDER BY keyword,note_id,replaced_at,evidence_hash').all();
+  await atomicWrite(path.join(outputDir,'scope_evidence_history.jsonl'),scopeHistory.map(JSON.stringify).join('\n')+(scopeHistory.length?'\n':''));
   const excluded=db.prepare("SELECT keyword,note_id AS noteId,result_json FROM candidate WHERE status='skipped_irrelevant' ORDER BY keyword,note_id").all()
     .map(({result_json,...row})=>({...row,result:JSON.parse(result_json||'null')}));
   await atomicWrite(path.join(outputDir,'excluded_scope_records.jsonl'),excluded.map(JSON.stringify).join('\n')+(excluded.length?'\n':''));

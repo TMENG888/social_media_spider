@@ -55,4 +55,6 @@ cookies*.json
 user-data/
 browser-profile*/
 wechat-channels/feishu-monitor/config.json
-
+feishu-monitor/config.json
+feishu-monitor/cloud-log-cli.json
+feishu-monitor/cloud-log-target.json
