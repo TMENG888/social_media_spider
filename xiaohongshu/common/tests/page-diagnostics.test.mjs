@@ -174,7 +174,13 @@ test('context failure plus later runtime timeout remains distinct from an ordina
   assert.equal(cooldownWorkerExit({status:{tasks,...summary},fatalError:null}),1);
   assert.equal(cooldownWorkerExit({status:{tasks:[{status:'partial_stopped',importExitCode:0,redisReleased:true}],failedCount:0},fatalError:null}),0);
 });
-test('both platform deployments carry identical standalone logging modules',async()=>{
-  assert.equal(await fs.readFile(path.join(base,'xiaohongshu/common/src/page-diagnostics.mjs'),'utf8'),
-    await fs.readFile(path.join(base,'douyin/common/src/page-diagnostics.mjs'),'utf8'));
+test('both platform deployments expose the same safe standalone diagnostic interface',async()=>{
+  const modules=await Promise.all(['小红书','抖音'].map(p=>load(p,'page-diagnostics.mjs')));
+  assert.deepEqual(Object.keys(modules[0]).sort(),Object.keys(modules[1]).sort());
+  for(const module of modules){
+    assert.equal(typeof module.createPageDiagnostics,'function');
+    assert.equal(typeof module.appendDiagnosticEvent,'function');
+    assert.ok(module.DIAGNOSTIC_VERSION.startsWith('page-diagnostics-'));
+    assert.equal(module.safeUrl('https://example.com/?token=fixture-secret'),modules[0].safeUrl('https://example.com/?token=fixture-secret'));
+  }
 });

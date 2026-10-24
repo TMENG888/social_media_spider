@@ -103,11 +103,26 @@ def try_direct_retry(c, keyword, project, fingerprint, config, db, remote, colle
     try:
         surface = open_saved_video(c, url, config,
                                    locator_query=data.get('title') or cp.get('title') or keyword)
+        surface = c.prepare_video_detail(surface, config,
+            {'title': data.get('title') or cp.get('title'),
+             'author_name': data.get('author_name') or cp.get('author_name')}, keyword=keyword)
         records, details, title, author, duration = verify_target(c, surface, cp)
         print(json.dumps({'event':'retry_direct_url_identity_verified',
                           'keyword':keyword, 'fingerprint':fingerprint,
                           'duration':duration}, ensure_ascii=False), flush=True)
     except Exception as exc:
+        if isinstance(exc, getattr(c, 'VideoDetailRecoveryBlockedError', ())):
+            if surface is not None:
+                c.return_to_search_results(config)
+            raise
+        if isinstance(exc, getattr(c, 'VideoPlaybackUnavailableError', ())):
+            # Do not rebuild a search or charge a content retry after the
+            # same-video network refresh budget is exhausted.
+            if surface is not None:
+                c.return_to_search_results(config)
+            return {'keyword': keyword, 'saved': 0, 'failed': 0, 'examined': 0,
+                    'status': 'partial_retry_pending', 'complete': False,
+                    'locator': 'saved_url', 'reason': 'VIDEO_PLAYBACK_UNAVAILABLE'}
         print(json.dumps({'event':'retry_direct_url_fallback', 'keyword':keyword,
                           'fingerprint':fingerprint, 'error':str(exc)}, ensure_ascii=False), flush=True)
         if surface is not None:
@@ -159,6 +174,12 @@ def try_direct_retry(c, keyword, project, fingerprint, config, db, remote, colle
                 'examined':1, 'status':'complete_retry_fingerprint' if complete else 'partial_retry_pending',
                 'complete':complete, 'locator':'saved_url', 'retry_pending':0 if complete else 1}
     except Exception as exc:
+        if isinstance(exc, getattr(c, 'VideoDetailRecoveryBlockedError', ())):
+            raise
+        if isinstance(exc, getattr(c, 'VideoPlaybackUnavailableError', ())):
+            return {'keyword': keyword, 'saved': 0, 'failed': 0, 'examined': 0,
+                    'status': 'partial_retry_pending', 'complete': False,
+                    'locator': 'saved_url', 'reason': 'VIDEO_PLAYBACK_UNAVAILABLE'}
         c.upsert_video_checkpoint(db, keyword=keyword, project=project,
             fingerprint=fingerprint, status='retry_pending', row=row,
             retry_count=int(cp.get('retry_count') or 0)+1, asr_status='retry_pending',

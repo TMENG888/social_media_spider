@@ -6,6 +6,7 @@ import {randomUUID} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {createClient} from 'redis';
 import {redisSettings} from './redis-connection.mjs';
+import {markControlFailure,recoverControlFailure} from './remote-control-recovery.mjs';
 
 export function targetKey(computer,worker) {
   computer=String(computer||'').trim().toUpperCase();
@@ -76,6 +77,7 @@ export class RemoteStopControl {
   static async open(commonRoot,workerRoot){const ctx=await controlContext(commonRoot,workerRoot);return new RemoteStopControl(ctx,await connectControl(ctx));}
   get receiptFile(){return path.join(this.ctx.workerRoot,'.state','remote-stop-receipt.json');}
   async flags(request) {
+    if(request.reason==='REMOTE_CONTROL_UNAVAILABLE'&&!request.commandId)return markControlFailure(this.ctx);
     const state=path.join(this.ctx.workerRoot,'.state');await fs.mkdir(state,{recursive:true});
     // Supervisor first; no future cycle may clear the collector stop flag.
     for(const name of ['supervisor.stop','stop.requested'])await atomicJson(path.join(state,name),{source:'redis_remote_control',...request});
@@ -93,18 +95,25 @@ export class RemoteStopControl {
     if(request){this.request=request;await this.flags(request);await this.ack(terminal||'draining');}
     return Boolean(this.request);
   }
-  async gate() {
+  async gate({recoverFailureMarkers=false}={}) {
+    try{await fs.lstat(path.join(this.ctx.workerRoot,'.state','remote-control-recovery.lock'));throw new Error('CONTROL_RECOVERY_INCOMPLETE');}
+    catch(error){if(error.code!=='ENOENT')throw error;}
     // An authoritative empty read is needed before a manual new launch.
     const held=await this.poll();
     if(held)throw new Error('REMOTE_STOP_HOLD: release the exact command before manual startup');
+    const recovery=recoverFailureMarkers?await recoverControlFailure(this.ctx,async()=>{
+      if(await this.poll())throw new Error('REMOTE_STOP_HOLD');
+    }):null;
     await fs.unlink(this.receiptFile).catch(error=>{if(error.code!=='ENOENT')throw error;});
+    return recovery;
   }
   watch(onFailure=()=>{}) {
     const tick=async()=>{
       if(this.closed)return;
-      this.polling=this.poll().catch(async()=>{
+      this.polling=this.poll().catch(async(error)=>{
         // Fail closed on control-channel loss; no forced termination, no false ACK.
-        await this.flags({reason:'REMOTE_CONTROL_UNAVAILABLE'});await onFailure();
+        const code=await markControlFailure(this.ctx,error);
+        console.warn('[Remote control unavailable] '+code+'; safe stop retained.');await onFailure();
       });
       try{await this.polling;}finally{if(!this.closed)this.timer=setTimeout(tick,3000);}
     };
@@ -157,7 +166,10 @@ if(process.argv[1]&&pathToFileURL(path.resolve(process.argv[1])).href===import.m
   let client,control;
   try {
     if(args.action==='gate'){
-      control=await RemoteStopControl.open(args.root,args['worker-root']);await control.gate();console.log('Remote stop gate verified: no hold.');
+      control=await RemoteStopControl.open(args.root,args['worker-root']);
+      const recovery=await control.gate({recoverFailureMarkers:args['recover-control-failure']==='yes'});
+      if(recovery?.archived.length)console.log('[Control failure recovered] '+JSON.stringify(recovery));
+      console.log('Remote stop gate verified: no hold.');
     }else{
       const ctx=await controlContext(args.root);
       if(args.action==='preview'){

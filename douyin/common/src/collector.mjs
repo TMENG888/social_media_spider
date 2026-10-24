@@ -7,9 +7,10 @@ import {openCheckpoint,saveCandidates,checkpointCandidates,markCompleted,markSki
 import {mergeCommentResults} from './comment-threads.mjs';
 import {YearBoundary,inTargetYear,searchExhaustionEvidence,verifiedAnnualSearchEnd} from './collection-policy.mjs';
 import {postFromAweme,DouyinResponseObserver,shanghaiTime} from './douyin-data.mjs';
-import {assertAccess,navigateSearch,selectLatest,visibleCards,openCard,restoreSearch,collectComments,ensureSingleColumn,searchEndUi,scrollSearchResults} from './douyin-browser.mjs';
+import {assertAccess,navigateSearch,selectLatestWithRecovery,visibleCards,openCard,restoreSearch,collectComments,ensureSingleColumn,searchEndUi,scrollSearchResults} from './douyin-browser.mjs';
 import {AsrService} from './asr.mjs';
 import {AsrJobProcessor} from './asr-jobs.mjs';
+import {recordAsrMediaImport} from './asr-media-cleanup.mjs';
 import {assessAsrAcceptance} from './acceptance-gate.mjs';
 import {importRows,mysqlConnectionOptions,retryMysqlDeadlock} from './import-mysql.mjs';
 import {assertLocalLease,withImportLease} from './lease-guard.mjs';
@@ -39,11 +40,13 @@ async function patchTranscript(result) {
    const [updated]=await connection.execute('UPDATE ods_social_media_post SET `文章视频内容`=? WHERE `id`=?',[result.post.文章视频内容,rows[0].id]);
    if(!updated.affectedRows)throw new Error('ASR_BASE_POST_NOT_IMPORTED');
    await verify();await connection.commit();
+   const [readback]=await connection.execute('SELECT `文章视频内容` FROM ods_social_media_post WHERE `id`=?',[rows[0].id]);
+   if(readback.length!==1 || (readback[0]['文章视频内容']??null)!==(result.post.文章视频内容??null))throw new Error('ASR_TRANSCRIPT_READBACK_MISMATCH');
    await recordCommittedPosts(connection,[result.post],{inserted:0,videoContentWrites:subtitleWriteCount(rows[0]['文章视频内容'],result.post.文章视频内容)},new Date().toISOString(),true);
   }catch(e){await connection.rollback();throw e;}finally{await connection.end();}
  }));
 }
-export async function collectKeyword({page,task,config,commonRoot,stateDir,outputDir,shouldStop,sampleLimit=0,commit=true,allowManualLogin=false,importer=importRows}) {
+export async function collectKeyword({page,task,config,commonRoot,stateDir,outputDir,shouldStop,sampleLimit=0,commit=true,allowManualLogin=false,importer=importRows,prepareLatest=selectLatestWithRecovery}) {
  const volumeMode=commit&&!sampleLimit&&process.env.SOCIAL_VOLUME_ENABLED==='1';
  const volumeSnapshot=volumeMode?validateVolumeSnapshot(JSON.parse(await fs.readFile(process.env.SOCIAL_VOLUME_SNAPSHOT,'utf8')),{platform:'抖音'}):null;
  const volumeRead=()=>readTaskVolume({connect:()=>mysql.createConnection(mysqlConnectionOptions()),snapshot:volumeSnapshot,taskId:task.redisTaskId||task.id});
@@ -71,8 +74,15 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
  const importResults=async results=>{
   const ids=results.map(r=>String(r.post.文章id));
   try {
-   if(commit&&results.length)await importer({posts:results.map(r=>r.post),comments:results.flatMap(r=>r.audit?.comments?.aggregation_mode==='legacy_unresolved'?[]:r.comments||[]),shouldStop:stop});
+   if(commit&&results.length)await importer({posts:results.map(r=>r.post),comments:results.flatMap(r=>r.audit?.comments?.aggregation_mode==='legacy_unresolved'?[]:r.comments||[]),shouldStop:stop,verify:true});
    if(commit)markBaseImported(db,task.keyword,ids);
+   if(commit){
+    for(const result of results){
+     try{recordAsrMediaImport(db,{keyword:task.keyword,noteId:String(result.post.文章id)},result);}
+     catch{console.warn('[ASR媒体保留] 入库确认记录未保存；媒体暂留，不影响已提交文章');}
+    }
+    await asr?.cleanupMedia();
+   }
   }catch(e){markImportPending(db,task.keyword,ids,e);e.importPending=true;throw e;}
  };
  const importSaved=async()=>{
@@ -90,11 +100,11 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   if(summary.recoveredImportNotes.length)console.log(`[断点修复] ${task.keyword}: ${summary.recoveredImportNotes.length}篇已保存帖子恢复为待入库；不重新访问帖子、不改评论完整性`);
   if(config.asrEnabled){
    service=new AsrService({pythonExecutable:path.join(commonRoot,'runtime/python/python.exe'),model:path.resolve(commonRoot,config.asrModelPath),device:config.asrDevice||'cpu',computeType:config.asrComputeType||'int8_float32',cpuThreads:config.asrCpuThreads||1,beamSize:config.asrBeamSize||1,localFilesOnly:true,tempDir:path.join(stateDir,'media'),cacheDir:path.join(stateDir,'asr-cache')});
-   asr=new AsrJobProcessor({db,service,mediaDir:path.join(stateDir,'media'),keepMedia:config.asrKeepMedia===true,shouldStop:stop,onCompleted:async(_job,_output,result)=>{if(commit&&baseImported)await patchTranscript(result);}});
+   asr=new AsrJobProcessor({db,service,mediaDir:path.join(stateDir,'media'),keepMedia:config.asrKeepMedia===true,shouldStop:stop,onCompleted:async(_job,_output,result)=>{if(commit&&baseImported){await patchTranscript(result);return true;}return false;}});
   }
   await importSaved();
   asr?.start().catch(e=>{summary.asrError=String(e.message);});
-  await navigateSearch(page,task.keyword,{shouldStop:stop,timeoutMs:config.navigationTimeoutMs||45000,allowManualLogin,
+  const initialSearch=await navigateSearch(page,task.keyword,{shouldStop:stop,timeoutMs:config.navigationTimeoutMs||45000,allowManualLogin,
    onObservation:audit=>{summary.searchNavigation=audit;}});
   if(allowManualLogin){
    const deadline=Date.now()+300000;
@@ -104,7 +114,18 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
    }
   }
   await assertAccess(page);
-  let prepared=await selectLatest(page,observer,task.keyword,{shouldStop:stop,onDiagnostic});summary.sortConfirmed=true;summary.searchPreparation=prepared;
+  // Login can now happen on the home/search shell before any keyword was
+  // submitted. Resume the ordinary UI search after manual login, never accept
+  // the home page (or a previous word's results) as this task's search.
+  let activeSearch=initialSearch;
+  if(initialSearch.awaitingManualLogin)activeSearch=await navigateSearch(page,task.keyword,{shouldStop:stop,timeoutMs:config.navigationTimeoutMs||45000,
+   onObservation:audit=>{summary.postLoginSearchNavigation=audit;}});
+  const prepareSearch=audit=>prepareLatest(page,observer,task.keyword,{
+   after:Date.parse(audit.attempts.at(-1).submittedAt),documentVerified:audit.attempts.at(-1).response?.kind==='search_document',shouldStop:stop,onDiagnostic,
+   timeoutMs:config.navigationTimeoutMs||45000,
+   navigationOptions:{timeoutMs:config.navigationTimeoutMs||45000,onObservation:audit=>{summary.searchRecoveryNavigation=audit;}},
+   onRecovery:audit=>{summary.searchPreparationRecovery=audit;}});
+  let prepared=await prepareSearch(activeSearch);summary.sortConfirmed=true;summary.searchPreparation=prepared;
   const observedPlan=()=>planObservedSearchItems({items:observer.searchItems,scope:{keyword:task.keyword,after:prepared.at},
    task,notes:checkpointCandidates(db,task.keyword),year:config.targetYear||2026,cutoff:task.cutoff||'2026-01-01'});
   await page.screenshot({path:path.join(outputDir,'latest-search.png'),timeout:4000}).catch(()=>{});
@@ -138,9 +159,9 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
    if(recovering&&!recoveryIds.size){
     // Recovery may have scrolled past newer cards. Restart this search once,
     // then reconfirm latest; never reopen individual articles by direct URL.
-    await navigateSearch(page,task.keyword,{shouldStop:stop,timeoutMs:config.navigationTimeoutMs||45000,
+    activeSearch=await navigateSearch(page,task.keyword,{shouldStop:stop,timeoutMs:config.navigationTimeoutMs||45000,
      onObservation:audit=>{summary.recoverySearchNavigation=audit;}});
-    prepared=await selectLatest(page,observer,task.keyword,{shouldStop:stop});summary.searchPreparation=prepared;
+    prepared=await prepareSearch(activeSearch);summary.searchPreparation=prepared;
     recovering=false;seen.clear();stagnant=0;layoutRecovered=false;scrollProgress={};
     summary.posts=0;summary.comments=0;summary.verified=0;summary.old=0;
     if(sampleLimit)summary.sampleNoteIds=[];
@@ -297,8 +318,10 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   summary.status=sampleLimit?'sample_completed':'completed';
  }catch(e){
   error=e;summary.error=String(e.message||e);summary.status=/STOP_REQUESTED/.test(summary.error)?'partial_stopped':'incomplete';
+  if(e.searchReadiness)summary.searchReadiness=e.searchReadiness;
+  if(e.searchPreparationRecovery)summary.searchPreparationRecovery=e.searchPreparationRecovery;
   summary.firstFailureAt=new Date().toISOString();
-  (summary.pageDiagnostics||=[]).push(await diagnostics.capture('collector_failure',e,{sortConfirmed:summary.sortConfirmed,firstFailureAt:summary.firstFailureAt}));
+  (summary.pageDiagnostics||=[]).push(await diagnostics.capture('collector_failure',e,{sortConfirmed:summary.sortConfirmed,firstFailureAt:summary.firstFailureAt,searchReadiness:e.searchReadiness}));
   console.error(`[采集异常] ${task.keyword}: ${summary.error}；当前媒体或入库收尾后退出`);
   await page.screenshot({path:path.join(outputDir,'failure-page.png'),timeout:4000,
     mask:[page.locator('input,canvas,iframe,[class*="qr"],[class*="QR"],[data-e2e*="qr"]')]}).catch(()=>{});

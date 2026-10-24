@@ -16,10 +16,12 @@ import time
 from operational_gate import OperationalGate
 from database_diagnostics import observe as observe_database, safe_code
 from reset_once import ResetOncePolicy, POLICY as RECOLLECT_POLICY
+from pending_import_recovery import recover_pending_imports, completion_snapshot
 from datetime import datetime
 from pathlib import Path
 
 POLICY = '20261015-keyword-count-p80-v1'
+RECOLLECTION_ISOLATION_VERSION = 'channels-recollection-isolation-20261023-v1'
 
 
 def _database_observation(common, payload, code=None, stage='unknown'):
@@ -48,6 +50,26 @@ def bridge(common, payload):
     except OSError:
         _database_observation(common, payload, 'VOLUME_NODE_EXEC_FAILED', 'runtime')
         raise RuntimeError('VOLUME_DATABASE_READBACK_FAILED:VOLUME_NODE_EXEC_FAILED') from None
+    # The Node bridge owns the bounded read-only retries. Forward only its
+    # structured, allowlisted progress, never raw driver stderr or secrets.
+    for line in (getattr(process, 'stderr', '') or '').splitlines():
+        try:
+            progress = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(progress, dict) or progress.get('operation') != 'database_readback':
+            continue
+        if progress.get('event') not in {'infrastructure_retry_wait', 'infrastructure_retry_recovered',
+                                         'infrastructure_circuit_open', 'infrastructure_failure_not_retried'}:
+            continue
+        safe = {'event': progress['event'], 'operation': 'database_readback'}
+        if 'errorCode' in progress:
+            safe['errorCode'] = safe_code(progress['errorCode'])
+        for field in ('attempt', 'nextAttempt', 'maxAttempts', 'waitSeconds'):
+            value = progress.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 60:
+                safe[field] = value
+        print(json.dumps(safe), flush=True)
     if process.returncode:
         detail = {}
         for line in (process.stderr or '').splitlines():
@@ -248,6 +270,7 @@ class VolumeRuntime:
         self.tokens = {}
         self.cursor = 0
         self.pending_pass = False
+        self.recovery_required_tasks = {}
         self.messages = {}
         for entry in self.command('XRANGE',args.stream,'-','+') or []:
             mid, item = api.decode_message(entry)
@@ -266,6 +289,16 @@ class VolumeRuntime:
 
     def command(self,*parts):
         return self.api.redis_command(self.args.redis_url,self.args.redis_password,*parts)
+
+    def recover_imports(self, stopped):
+        return recover_pending_imports(self, stopped)
+
+    def completion_state(self):
+        return completion_snapshot(self)
+
+    def repair_infrastructure_completions(self, stopped):
+        from infrastructure_completion_repair import repair_legacy_completions
+        return repair_legacy_completions(self, stopped)
 
     def read(self,task_id):
         return bridge(self.args.common,{'operation':'task','snapshot':self.snapshot,'taskId':task_id})
@@ -318,7 +351,19 @@ class VolumeRuntime:
             self.cursor+=1
             mid,_ = self.messages[task['task_id']]
             replay=self.recollection.prepare(task['task_id'],mid)
+            if replay['status']=='recovery_required':
+                # A stale source may still own local-only data. Quarantine the
+                # original, never ACK/steal/finalize it or charge a content try.
+                # Other originals must remain schedulable on every node.
+                self.recovery_required_tasks[task['task_id']]={
+                    'taskId':task['task_id'],'keyword':task['keyword'],'messageId':mid,
+                    'reason':replay.get('reason','RECOLLECTION_LEASE_EXPIRED')}
+                self.pending_pass=True
+                log_volume_decision(self,task,'recovery_required',reason='reset_once_recollection')
+                continue
+            self.recovery_required_tasks.pop(task['task_id'],None)
             if replay['status']!='absent':
+                log_volume_decision(self,task,replay['status'],reason='reset_once_recollection')
                 if replay['status']=='claimed':
                     self.tokens[task['task_id']]=replay['token']
                     return mid,{**task,'_recollectPolicy':RECOLLECT_POLICY}
@@ -330,6 +375,7 @@ class VolumeRuntime:
                 official = self.api.read_new(self.args.redis_url,self.args.redis_password,
                     self.args.stream,self.args.group,self.args.consumer,1)
                 if not official:
+                    log_volume_decision(self,task,'waiting_delivery',reason='sequential_delivery_unavailable')
                     continue
                 mid,task = official
                 original = self.messages.get(task['task_id'])
@@ -337,9 +383,7 @@ class VolumeRuntime:
                     raise RuntimeError('VOLUME_OFFICIAL_DELIVERY_MISMATCH')
                 decision = self.read(task['task_id'])
                 result = self.apply(task,mid,decision,delivered=True)
-            print(json.dumps({'event':'volume_keyword_decision','taskId':task['task_id'],
-                'keyword':task['keyword'],'posts':decision['posts'],'threshold':decision['threshold'],
-                'status':result['status']},ensure_ascii=False),flush=True)
+            log_volume_decision(self,task,result['status'],decision=decision,reason='quantity_policy')
             if result['status']=='claimed':
                 return mid,dict(task)
             if result['status'] in ('busy','unread_requires_sequential_delivery'):
@@ -379,6 +423,40 @@ class VolumeRuntime:
         if annual is not None:
             result['annualAcceptance']=annual
         return result
+
+
+def log_volume_decision(runtime,task,status,*,reason,decision=None):
+    """Log changed decisions once, but count every observation for the pass."""
+    counts=getattr(runtime,'pass_decision_counts',{})
+    counts[status]=counts.get(status,0)+1
+    runtime.pass_decision_counts=counts
+    row={'event':'volume_keyword_decision','taskId':task['task_id'],
+         'keyword':task['keyword'],'status':status,'reason':reason}
+    if status=='recovery_required':
+        row.update(errorCode='RECOLLECTION_LEASE_EXPIRED_RECOVERY_REQUIRED',
+                   recoveryPolicy=RECOLLECTION_ISOLATION_VERSION,
+                   action='quarantine_original_continue_scan',sourceOwnerRetained=True,
+                   collectionReplayed=False,contentAttemptCharged=False)
+    if decision is not None:
+        row.update(posts=decision['posts'],threshold=decision['threshold'])
+    seen=getattr(runtime,'logged_decisions',{})
+    signature=(status,reason,row.get('posts'),row.get('threshold'))
+    if seen.get(task['task_id'])!=signature:
+        print(json.dumps(row,ensure_ascii=False),flush=True)
+        seen[task['task_id']]=signature
+    runtime.logged_decisions=seen
+
+
+def recovery_wait_snapshot(runtime):
+    """Expose quarantine debt without changing Redis ownership or completion."""
+    records=getattr(runtime,'recovery_required_tasks',{})
+    if not isinstance(records,dict):
+        records={}
+    value={'recoveryPolicy':RECOLLECTION_ISOLATION_VERSION,
+           'recoveryRequired':len(records),'recoveryTasks':list(records.values())}
+    if records:
+        value.update(businessKeywordsComplete=False,allKeywordsComplete=False)
+    return value
 
 
 def read_volume_config(common):
@@ -426,7 +504,8 @@ def recollection_outcome(args,item,code):
         row=keywords[0]
         record.update(importOk=row.get('mysql',{}).get('status')=='success',
             collectionSucceeded=code==0 and row.get('status')=='completed',status=row.get('status'),
-            error=row.get('error') or (None if code==0 else record['error']))
+            error=row.get('error') or (None if code==0 else record['error']),
+            infrastructureBlocked=report.get('infrastructureBlocked') is True or row.get('infrastructureBlocked') is True)
     except (OSError,ValueError,TypeError,KeyError,AttributeError):pass
     return record
 
@@ -472,6 +551,39 @@ def run_volume_worker(api,args,stop_requested,control):
     retry policy; actual SQL counts and the remaining deficit stay visible.
     """
     runtime = args.volume_runtime
+    # Import-only recovery runs before browser/display preflight, under the
+    # existing remote control heartbeat. It never claims or recollects a word.
+    def recovery_stopped():
+        return stop_requested.is_set() or (args.worker_root/'.state'/'stop.requested').exists() or control.poll()
+    if isinstance(runtime, VolumeRuntime):
+        recovery = runtime.recover_imports(recovery_stopped)
+        if recovery['failed']:
+            api.write_json(args.worker_root/'.state'/'redis_worker_status.json', {
+                'status':'import_recovery_paused','recovery':recovery,
+                'allKeywordsComplete':False,'collectionReplayed':False,
+                'updatedAt':datetime.now().astimezone().isoformat()})
+            print(json.dumps({'event':'pending_import_circuit_open','exitCode':75,
+                              'localDataRetained':True,'collectionReplayed':False}),flush=True)
+            return 75
+        # Offline SQL confirmation alone must not preserve a legacy false
+        # completion caused solely by infrastructure/lease failures. Repair
+        # only allowlisted, CAS-bound records once, before the terminal check.
+        runtime.repair_infrastructure_completions(recovery_stopped)
+        completion = runtime.completion_state()
+        if completion['businessKeywordsComplete']:
+            # Nothing needs platform access. Do not wait behind a login gate or
+            # require display/ASR preflight just to report offline import debt.
+            stopped_now = recovery_stopped()
+            final_status = 'stopped' if stopped_now else 'volume_import_pending' if completion['pendingImport'] else 'volume_pass_finished'
+            value = {'status':final_status,'attempts':0,'completedThisPass':0,
+                     'recovery':recovery,**completion,'quantityOnly':True,'qualityVerified':False,
+                     'updatedAt':datetime.now().astimezone().isoformat()}
+            api.write_json(args.worker_root/'.state'/'redis_worker_status.json', value)
+            print(json.dumps({'event':'volume_scan_summary','attempts':0,'completedThisRun':0,
+                              'collectionReplayed':False,**completion},ensure_ascii=False),flush=True)
+            print(json.dumps({'event':'volume_worker_exit','exitCode':130 if stopped_now else 0,
+                              **value},ensure_ascii=False),flush=True)
+            return 130 if stopped_now else 0
     preflight_local_environment(args)
     stop_file = args.worker_root/'.state'/'stop.requested'
     state_file = args.worker_root/'.state'/'redis_worker_status.json'
@@ -491,17 +603,32 @@ def run_volume_worker(api,args,stop_requested,control):
                 break
             message = runtime.claim_next(stopped)
             if not message:
+                completion = runtime.completion_state() if isinstance(runtime, VolumeRuntime) else {'allKeywordsComplete':False}
+                completion.update(recovery_wait_snapshot(runtime))
+                print(json.dumps({'event':'volume_scan_summary',
+                    'decisionCounts':getattr(runtime,'pass_decision_counts',{}),
+                    'pendingPass':getattr(runtime,'pending_pass',False),
+                    'cursor':getattr(runtime,'cursor',0),
+                    'selectedCount':len(getattr(runtime,'selected',[])),
+                    'attempts':attempts,'completedThisRun':completed,
+                    **completion},ensure_ascii=False),flush=True)
                 if getattr(runtime,'pending_pass',False) and not args.once and not getattr(args,'only_task_id',None):
                     # Full workers revisit existing content retries after a
                     # quiet, interruptible interval. Exact/--once tests retain
                     # their one-attempt scope; no new keyword is published.
-                    api.write_json(state_file,{'status':'volume_retry_wait','attempts':attempts,
-                        'completedThisPass':completed,'updatedAt':datetime.now().astimezone().isoformat()})
+                    api.write_json(state_file,{'status':'volume_recovery_wait' if completion['recoveryRequired'] else 'volume_retry_wait',
+                        'attempts':attempts,'completedThisPass':completed,**completion,
+                        'updatedAt':datetime.now().astimezone().isoformat()})
+                    print(json.dumps({'event':'volume_retry_wait','waitSeconds':60,
+                        'reason':'pending_recollection_recovery' if completion['recoveryRequired'] else 'pending_retry_or_busy_delivery',
+                        **recovery_wait_snapshot(runtime),
+                        'decisionCounts':getattr(runtime,'pass_decision_counts',{})},ensure_ascii=False),flush=True)
                     end=time.monotonic()+60
                     while time.monotonic()<end and not stopped():
                         time.sleep(0.5)
                     runtime.cursor=0
                     runtime.pending_pass=False
+                    runtime.pass_decision_counts={}
                     continue
                 break
             mid,item = message
@@ -509,12 +636,28 @@ def run_volume_worker(api,args,stop_requested,control):
             try:
                 code = api.run_task(args,mid,item,state_file,lease_stream=args.stream,
                     lease_group=args.group,task_kind='primary',asr_service=service)
-            except Exception:
+            except Exception as exc:
                 if not item.get('_recollectPolicy'):raise
-                code=-1
+                print(json.dumps({'event':'recollection_child_exception',
+                    'taskId':item['task_id'],'errorType':type(exc).__name__,
+                    'contentCompletion':False}),flush=True)
+                code=75
             if code == 75:
                 # Do not classify network/lease failure as content exhaustion
                 # or invoke reset-once completion. Keep the delivery pending.
+                if item.get('_recollectPolicy'):
+                    preservation=recollection_outcome(args,item,75)
+                    preservation.update(infrastructureBlocked=True,error='INFRASTRUCTURE_PAUSED')
+                    if preservation.get('importOk') is True:
+                        # Release only after bound SQL preservation succeeded.
+                        # If Redis fails, retain the running lease/evidence.
+                        runtime.recollection.finish(item['task_id'],mid,runtime.tokens[item['task_id']],preservation)
+                    else:
+                        # Do not let a different node replay before this
+                        # source's local-only checkpoint has been preserved.
+                        print(json.dumps({'event':'recollection_preservation_required',
+                            'taskId':item['task_id'],'localDataRetained':True,
+                            'sourceOwnerRetained':True,'contentCompletion':False}),flush=True)
                 api.write_json(state_file, {'status':'infrastructure_paused',
                     'taskId':item['task_id'],'messageId':mid,'childExitCode':75,
                     'localCheckpointRetained':True,'remoteSyncConfirmed':False,
@@ -581,10 +724,19 @@ return 1
             if args.once:
                 return 0 if keyword_complete else 4
         # Do not equate a completed scheduling pass with all keywords accepted.
-        api.write_json(state_file,{'status':'volume_pass_finished' if not stopped() else 'stopped',
-            'attempts':attempts,'completedThisPass':completed,'allKeywordsComplete':False,
+        completion = runtime.completion_state() if isinstance(runtime, VolumeRuntime) else {'allKeywordsComplete':False}
+        completion.update(recovery_wait_snapshot(runtime))
+        final_status = ('volume_recovery_required' if completion['recoveryRequired'] else
+                        'volume_import_pending' if completion.get('pendingImport') else 'volume_pass_finished') if not stopped() else 'stopped'
+        api.write_json(state_file,{'status':final_status,
+            'attempts':attempts,'completedThisPass':completed,**completion,
             'quantityOnly':True,'qualityVerified':False,
             'updatedAt':datetime.now().astimezone().isoformat()})
-        return 130 if stopped() else 0
+        exit_code=130 if stopped() else 75 if completion['recoveryRequired'] else 0
+        print(json.dumps({'event':'volume_worker_exit','exitCode':exit_code,
+            'status':final_status,
+            'attempts':attempts,'completedThisRun':completed,
+            **completion},ensure_ascii=False),flush=True)
+        return exit_code
     finally:
         service.stop()

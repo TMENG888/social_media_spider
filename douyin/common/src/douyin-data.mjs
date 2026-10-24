@@ -135,6 +135,9 @@ export function searchPaginationMetadata(frames){
 export class DouyinResponseObserver {
  constructor(page) {
   this.page=page;this.awemes=new Map();this.searchItems=[];this.comments=new Map();this.commentPages=[];this.embeddedReplyCoverage=new Map();this.profiles=new Map();this.searchRequests=[];this.searchPages=[];this.searchFailures=[];this.pending=new Set();this.failures=[];
+  this.requestTimes=new WeakMap();
+  this.requestListener=request=>{this.requestTimes.set(request,Date.now());};
+  page.on('request',this.requestListener);
   this.listener=response=>{const job=this.consume(response).catch(e=>this.failures.push(String(e.message))).finally(()=>this.pending.delete(job));this.pending.add(job);};
   page.on('response',this.listener);
  }
@@ -143,7 +146,10 @@ export class DouyinResponseObserver {
   const u=new URL(response.url());
   if(!/(^|\.)douyin\.com$/.test(u.hostname)||!/(?:general\/search|aweme\/detail|comment\/list|user\/profile\/other)/.test(u.pathname))return;
   const isSearch=/general\/search/.test(u.pathname);
-  const searchInfo=isSearch?{at:Date.now(),keyword:u.searchParams.get('keyword'),latest:latestRequest(response.url(),response.request().postData()||''),path:u.pathname,offset:u.searchParams.get('offset')||u.searchParams.get('cursor')||null}:null;
+  const request=response.request(),body=request.postData()||'';
+  let bodyKeyword=null;try{bodyKeyword=JSON.parse(body).keyword;}catch{bodyKeyword=new URLSearchParams(body).get('keyword');}
+  const searchInfo=isSearch?{at:Date.now(),requestStartedAt:this.requestTimes.get(request)??null,
+   keyword:u.searchParams.get('keyword')??bodyKeyword,latest:latestRequest(response.url(),body),path:u.pathname,offset:u.searchParams.get('offset')||u.searchParams.get('cursor')||null}:null;
   if(!response.ok()){if(isSearch)this.searchFailures.push({...searchInfo,http:response.status()});return;}
   if(!/json/.test(response.headers()['content-type']||'')){if(isSearch)this.searchFailures.push({...searchInfo,error:'unexpected_content_type'});return;}
   let text;
@@ -157,7 +163,7 @@ export class DouyinResponseObserver {
   const rootId=u.searchParams.get('comment_id')||null;
   const rootComment=rootId?[...this.comments.values()].find(c=>String(c.cid)===rootId):null;
   const responseAwemeId=String(u.searchParams.get('aweme_id')||u.searchParams.get('item_id')||rootComment?.aweme_id||data.comments?.[0]?.aweme_id||'');
-  if(/search/.test(u.pathname))this.searchRequests.push({at:Date.now(),keyword:u.searchParams.get('keyword'),latest:latestRequest(response.url(),response.request().postData()||''),path:u.pathname});
+  if(isSearch)this.searchRequests.push({...searchInfo});
   const visit=(v,depth=0,inheritedRoot=null)=>{
    if(depth>12||v==null||typeof v!=='object')return;
    // Incomplete post shapes still represent a known gap, not an empty result.
@@ -180,5 +186,5 @@ export class DouyinResponseObserver {
   }
   if(isSearch&&validFrames.length)this.searchPages.push({...searchInfo,hasMore:searchPaginationMetadata(validFrames),noteIds:[...searchIds]});
  }
- detach(){this.page.off('response',this.listener);}
+ detach(){this.page.off('response',this.listener);this.page.off('request',this.requestListener);}
 }

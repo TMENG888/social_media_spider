@@ -6,10 +6,11 @@ $startedAt = [DateTimeOffset]::Now
 $runId = $startedAt.ToString('yyyyMMdd-HHmmss-fff') + '-' + $PID
 $logRoot = Join-Path $monitorRoot 'output\scheduler'
 $record = [ordered]@{
-    schemaVersion = 1; runId = $runId; startedAt = $startedAt.ToString('o')
+    schemaVersion = 2; runId = $runId; startedAt = $startedAt.ToString('o')
     finishedAt = $null; status = 'running'; preview = [bool]$Preview
     exitCode = $null; childExitCode = $null; deliveryConfirmed = $false
     archiveConfirmed = $false; cloudConfirmed = $false; reportId = $null; errorType = $null
+    stage = 'INITIALIZE'; errorCode = $null; deliveryOutcome = $null; retrySafe = $false
 }
 function Save-SchedulerRecord {
     [IO.Directory]::CreateDirectory($logRoot) | Out-Null
@@ -27,13 +28,15 @@ try {
     if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw 'Monitor entry missing.' }
     $processInfo = New-Object Diagnostics.ProcessStartInfo
     $processInfo.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $processInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $entry + '"'
+    $processInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $entry + '" -RunId ' + $runId
     if (-not $Preview) { $processInfo.Arguments += ' -Send' }
     $processInfo.WorkingDirectory = $monitorRoot
     $processInfo.UseShellExecute = $false
     $processInfo.CreateNoWindow = $true
     $processInfo.RedirectStandardOutput = $true
     $processInfo.RedirectStandardError = $true
+    $processInfo.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+    $processInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $processInfo
     try {
@@ -48,7 +51,28 @@ try {
     # Do not persist raw process output: an unexpected exception could contain credentials.
     $record.deliveryConfirmed = $stdout -match '(?m)^Feishu delivery confirmed\s*$'
     $archiveMarker = $stdout -match '(?m)^Confirmed report archived locally;'
-    if ($Preview) {
+    $runnerFile = Join-Path $monitorRoot ('output\runner\' + $runId + '.json')
+    $skipped = $false
+    if (Test-Path -LiteralPath $runnerFile) {
+        $runner = Get-Content -LiteralPath $runnerFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($runner.runId -eq $runId) {
+            if ($runner.stage -match '^[A-Z_]{1,50}$') {$record.stage=$runner.stage}
+            if ($runner.errorCode -match '^MONITOR_[A-Z_]{1,70}$') {$record.errorCode=$runner.errorCode}
+            $skipped = $runner.status -eq 'skipped_existing_run' -and $record.childExitCode -eq 0
+        }
+    }
+    $attemptFile = Join-Path $monitorRoot 'output\delivery-attempt.json'
+    if (-not $Preview -and (Test-Path -LiteralPath $attemptFile)) {
+        $attempt = Get-Content -LiteralPath $attemptFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($attempt.runId -eq $runId) {
+            if ($attempt.errorCode -match '^FEISHU_[A-Z_]{1,60}$') {$record.errorCode=$attempt.errorCode}
+            if ($attempt.deliveryOutcome -in @('not_sent','not_attempted','unknown','rejected')) {$record.deliveryOutcome=$attempt.deliveryOutcome}
+            $record.retrySafe = $attempt.retrySafe -eq $true
+        }
+    }
+    if ($skipped) {
+        $record.status = 'skipped_existing_run'
+    } elseif ($Preview) {
         if ($record.childExitCode -ne 0) { throw 'Monitor process failed.' }
         if ($stdout -notmatch 'Preview generated; no message sent') { throw 'Preview was not confirmed.' }
         $record.status = 'preview_verified'

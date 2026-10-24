@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import os from 'node:os';
+import {inspectPlatformAccess} from './platform-access.mjs';
 export const DIAGNOSTIC_VERSION='page-diagnostics-20261019-v1';
 
 export function safeUrl(value) {
@@ -55,6 +56,7 @@ export function diagnosticReasons(evidence) {
   const layoutFailure=/^layout_(?:click_failed|not_confirmed)$/.test(evidence.stage||'')
     || evidence.errors?.some(error=>/STOP_SEARCH_LAYOUT_UNCONFIRMED/.test(error.message||''));
   if(evidence.closed)reasons.push('browser_page_closed');
+  if(evidence.access?.kind)reasons.push('platform_'+evidence.access.kind+'_required');
   if(evidence.context?.matches===false)reasons.push('search_url_keyword_mismatch');
   const controls=evidence.dom?.singleColumnControls;
   if(evidence.platform==='抖音'&&layoutFailure&&Array.isArray(controls)){
@@ -103,6 +105,7 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
         computer:os.hostname(),pid:process.pid,stage,url:safeUrl(rawUrl),closed:!page||page.isClosed(),
         context:contextFor(rawUrl,platform,keyword),errors:diagnosticError(error),details:safeValue(details)};
       if(!evidence.closed){
+        try{evidence.access=await bounded(()=>inspectPlatformAccess(page,platform));}catch{}
         try{
           evidence.dom=await bounded(()=>page.evaluate(()=>{
             const visible=el=>{

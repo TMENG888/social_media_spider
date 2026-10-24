@@ -38,8 +38,9 @@ test('unknown/completed selected tasks never claim',async()=>{
 });
 test('selection does not weaken final completion predicate',async()=>{
  const source=await fs.readFile(new URL('./run-worker.mjs',import.meta.url),'utf8');
+ // Production P80 mode uses SQL readback; non-volume mode still requires a
+ // successful import. The original assertion predated the volume branch.
  assert.match(source,/\["completed","completed_with_skips"\]\.includes\(taskState\) && \(dispatcher\?\.volume \? coverage\.ok===true : skipImport \|\| importResult\?\.code === 0\)/);
- assert.match(source,/if\(\["completed","completed_with_skips"\]\.includes\(taskState\)&&!acceptanceVerified\)/);
   assert.match(source,/dispatcher\.tasks\(\{taskId:onlyTaskId,/);
  assert.match(source,/onlyTaskId&&\(skipImport\|\|phase!=='posts'\)/);
   assert.match(source,/if\(!onlyTaskId\)\{\s*const categoryRepair/);

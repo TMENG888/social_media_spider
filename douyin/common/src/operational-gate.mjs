@@ -14,12 +14,19 @@ export function classifyRestriction(error){
  return null;
 }
 export class OperationalGate{
- static async open({root,workerId,platform}){
+ static async open({root,workerId,platform,onStage=()=>{}}){
+  onStage('READ_REDIS_SETTINGS');
   const settings=await redisSettings(root);
-  const config=JSON.parse(await fs.readFile(path.join(root,'redis-config.json'),'utf8'));
-  const manifest=JSON.parse(await fs.readFile(path.join(root,'tasks','redis-tasks.json'),'utf8'));
+  onStage('READ_REDIS_CONFIG');
+  const config=JSON.parse((await fs.readFile(path.join(root,'redis-config.json'),'utf8')).replace(/^\uFEFF/,''));
+  onStage('READ_MANIFEST');
+  const manifest=JSON.parse((await fs.readFile(path.join(root,'tasks','redis-tasks.json'),'utf8')).replace(/^\uFEFF/,''));
+  onStage('VALIDATE_MANIFEST');
+  if(!config.taskPoolCampaign&&(typeof manifest.manifestHash!=='string'||!manifest.manifestHash))
+   throw Object.assign(new Error('Invalid manifest'),{code:'INVALID_MANIFEST'});
   const campaign=config.taskPoolCampaign||settings.campaign+'-mysql-'+manifest.manifestHash.slice(0,16);
   const namespace='xhs:douyin:{'+campaign+'}';
+  onStage('CONNECT_REDIS');
   const client=await connectRedis(settings);
   return new OperationalGate({client,workerId,platform,ownsClient:true,keys:[namespace+':monitor:incidents',namespace+':monitor:outbox']});
  }

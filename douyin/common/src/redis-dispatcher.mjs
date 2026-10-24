@@ -189,13 +189,18 @@ export class RedisDispatcher {
     let confirmation;
     const volumeResult=this.volume?await this.volume.finish(taskId,token,result,{pause:kind==='release'}):null;
     if(volumeResult?.annualEvidence&&result)result.annualAcceptance=volumeResult.annualEvidence;
+    if(volumeResult?.searchExhaustionEvidence&&result)result.searchExhaustionAcceptance=volumeResult.searchExhaustionEvidence;
     if(volumeResult?.confirmation){confirmation=volumeResult.confirmation;Object.assign(result||{},
       ...(confirmation.acceptedByResetOnce?[{collectionError:result?.collectionError||result?.error||null,
        collectionSucceeded:confirmation.collectionSucceeded===true,dataImported:confirmation.dataImported===true,
        pendingImport:confirmation.pendingImport===true,businessCompleted:true}]:[]),
       {status:'completed',accepted:true,error:null,
+      ...(confirmation.acceptedBySearchExhaustion?{businessCompleted:true,searchExhaustionCompleted:true,
+       collectionError:result?.collectionError||result?.error||null,
+       missingCandidateIds:volumeResult.searchExhaustionEvidence.missingCandidateIds,
+       allItemsCollected:volumeResult.searchExhaustionEvidence.allItemsCollected,deletedConfirmed:false}:{}),
       quantityAccepted:confirmation.acceptedByVolume===true,retryExhaustedCompletion:confirmation.acceptedByExhaustion===true,
-      acceptedBy:confirmation.acceptedByResetOnce?'reset_once_recollection':confirmation.acceptedByExhaustion?'retry_exhausted_completion':confirmation.acceptedByAnnual?'verified_low_year_search':'keyword_post_count_p80',
+      acceptedBy:confirmation.acceptedBySearchExhaustion?'verified_search_exhaustion':confirmation.acceptedByResetOnce?'reset_once_recollection':confirmation.acceptedByExhaustion?'retry_exhausted_completion':confirmation.acceptedByAnnual?'verified_low_year_search':'keyword_post_count_p80',
       resetOnceCompletion:confirmation.acceptedByResetOnce===true,volumeAcceptance:volumeResult.decision});}
     else if(this.current.correctionPolicy&&['release','defer'].includes(kind)) confirmation=await pauseCorrection(this.queue,taskId,token,result);
     else if(this.volume&&kind==='complete')confirmation=await this.queue.fail(taskId,token,'VOLUME_BELOW_THRESHOLD',result);
@@ -204,6 +209,7 @@ export class RedisDispatcher {
     else if (kind === 'release') confirmation = await this.queue.release(taskId, token);
     else if (kind === 'defer') confirmation = await this.queue.defer(taskId, token, result);
     else confirmation = await this.queue.fail(taskId, token, result?.error || result?.status || 'Worker interrupted', result);
+    if(confirmation?.acceptedBySearchExhaustion)console.log(`[搜索耗尽结案] ${result?.keyword||taskId}：成功完成；入库${volumeResult.decision.posts}/${volumeResult.decision.threshold}篇，保留未解决候选${volumeResult.searchExhaustionEvidence.missingCandidateIds.length}条，非P80达标；继续后续任务`);
     this.current = null;
     try { await this.writeLease({ active: false, validUntil: 0 }); }
     catch (error) {

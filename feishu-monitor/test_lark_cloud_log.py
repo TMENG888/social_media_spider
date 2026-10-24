@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cloud_log import SyncError, TITLE, normalized
-from lark_cloud_log import (METRIC_DOC, METRIC_CITE, METRIC_PLACEHOLDER, Runner, body_xml,
+from lark_cloud_log import (METRIC_CITE, METRIC_PLACEHOLDER, Runner, body_xml,
                            parse_document, recognized, synchronize)
 from report_archive import archive_confirmed, recent_day_content
 
@@ -72,7 +72,7 @@ class CLILogTests(unittest.TestCase):
             self.assertTrue(result["metricLinkPreserved"])
             self.assertEqual(runner.fetch()["revision"], 9)
             self.assertEqual(normalized(runner.fetch()["body"]), normalized(recent_day_content(out, self.now + 10)[2]))
-            self.assertIn('doc-id="' + METRIC_DOC + '"', runner.doc["content"])
+            self.assertIn('doc-id="EXAMPLE_METRIC_DOCUMENT"', runner.doc["content"])
 
     def test_idempotency_does_not_rewrite_cloud(self):
         with tempfile.TemporaryDirectory() as out:

@@ -61,9 +61,20 @@ class NotificationTests(unittest.TestCase):
         snapshot={'keywordQueueCounts':{'states':{'completed':37,'running':3,'recollect_pending':236},
                                       'completedPendingImport':4,'resetOnceCompleted':4}}
         line=video_progress_line(snapshot,{'planned':276,'confirmed':3})
-        self.assertEqual(line,'视频号：完成✅ 33/276 · 重试 243 · 待领 0')
+        self.assertEqual(line,'视频号：完成✅ 37/276 · 重试 239 · 待领 0')
         self.assertEqual(snapshot['keywordQueueCounts']['states']['completed'],37)
         self.assertNotIn('重采结案',line)
+
+    def test_closed_video_import_debt_is_disclosed_not_fictional_retry_queue(self):
+        snapshot={'sources':{'redis':'ok'},'keywordQueueCounts':{
+            'states':{'completed':276},'completedPendingImport':47}}
+        self.assertEqual(video_progress_line(snapshot,{'planned':276}),
+                         '视频号：完成✅ 276/276 · 重试 0 · 待领 0')
+        issues=retry_task_issues(snapshot)
+        self.assertEqual(len(issues),1)
+        self.assertIn('47 个已结案词入库待确认',issues[0])
+        self.assertIn('不重复采集',issues[0])
+        self.assertNotIn('待重试',issues[0])
 
     def test_three_platform_buckets_merge_skips_without_double_counting_subsets(self):
         platform={'platform':'抖音','counts':{'total':279,'completed':14,'completed_with_skips':1,
@@ -144,6 +155,7 @@ class NotificationTests(unittest.TestCase):
         action=text.split(SECTION_TITLES[3],1)[1].split('\n\n',1)[0]
         self.assertEqual(len(issues),3)
         self.assertIn('视频号：待重试 6 个关键词',action)
+        self.assertIn('5 个已结案词入库待确认',action)
         self.assertIn('小红书：待重试 7 个关键词',action)
         self.assertIn('抖音：待重试 8 个关键词',action)
         for token in ('死信','待审核','核心字段','媒体类型','近期连接','机器异常'):

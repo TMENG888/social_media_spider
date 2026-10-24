@@ -14,3 +14,19 @@ export function collectionFailurePolicy(error) {
   if (/^STOP_FAILURE_THRESHOLD/.test(message)) return {status:'failure_threshold',stopNode:true,release:false};
   return {status:'partial_error',stopNode:false,release:false};
 }
+
+// Preserve node health independently of business/quantity completion. Queue
+// confirmation may replace status/error, so inspect the original evidence too.
+export function collectionNodeFailure(record = {}) {
+  record ||= {};
+  for (const error of [record.collectionError, record.error, record.previousCollectionError]) {
+    const failure = collectionFailurePolicy(error);
+    if (failure.stopNode) return failure;
+  }
+  const status = [record.collectionStatus, record.status].find(value =>
+    ['partial_stopped','risk_controlled','web_unavailable','login_required','lease_lost',
+      'sort_unconfirmed','context_lost','browser_closed','failure_threshold'].includes(value));
+  if (status) return {status,stopNode:true,release:
+    ['partial_stopped','risk_controlled','web_unavailable','login_required'].includes(status)};
+  return {status:'partial_error',stopNode:record.mustStopNode === true,release:false};
+}

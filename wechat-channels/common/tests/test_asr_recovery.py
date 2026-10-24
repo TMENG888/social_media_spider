@@ -406,19 +406,12 @@ class AsrRecoveryTests(unittest.TestCase):
         self.assertIn("sample_long_video_skipped", sample_block)
         self.assertNotIn("upsert_video_checkpoint", sample_block)
 
-    def test_detail_fields_are_collected_while_recorder_is_active(self):
-        events = []
-
-        class ActiveRecorder:
-            def poll(self):
-                return None
-
-        audit = collector.run_detail_collection_during_recording(
-            lambda: events.append("detail_collected"), ActiveRecorder()
-        )
-        self.assertEqual(events, ["detail_collected"])
-        self.assertTrue(audit["recording_active_before"])
-        self.assertTrue(audit["recording_active_after"])
+    def test_comment_callback_finishes_before_full_recorder_watchdog(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        capture = source[source.index('def capture_client_audio_asr('):source.index('def volume_export_local_target(')]
+        self.assertLess(capture.index('during_capture_callback()'), capture.index('process = subprocess.Popen('))
+        self.assertNotIn('run_detail_collection_during_recording', capture)
+        self.assertIn('detail_fields_collected_before_audio_capture', capture)
 
     def test_asr_enables_sound_from_stateful_search_card_before_detail(self):
         source = SOURCE.read_text(encoding="utf-8")

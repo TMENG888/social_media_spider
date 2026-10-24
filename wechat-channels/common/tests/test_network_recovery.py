@@ -228,6 +228,9 @@ $out=$env:RECOVERY_ROOT
 $state=Join-Path $out 'checkpoint.sqlite'
 [IO.File]::WriteAllText($state,'unchanged-sqlite-fixture')
 [IO.File]::WriteAllText((Join-Path $out 'mysql_import_status.json'),'{"status":"success","old":true}')
+if($env:RECOVERY_MODE -eq 'unknowncommit'){
+  [IO.File]::WriteAllText((Join-Path $out 'mysql_import_status.json'),'{"status":"failed","commitState":"unknown","retrySafe":false}')
+}
 function FixturePython {
   if($env:RECOVERY_MODE -eq 'exportfail'){$global:LASTEXITCODE=5;return}
   [IO.File]::WriteAllText((Join-Path $env:RECOVERY_ROOT 'ods_social_media_post_channels.jsonl'),'{}')
@@ -242,6 +245,12 @@ function FixtureNode {
     if($env:RECOVERY_MODE -eq 'postfail'){$global:LASTEXITCODE=5;return}
     [IO.File]::WriteAllText((Join-Path $env:RECOVERY_ROOT 'ods_social_media_post_channels_final.jsonl'),'{}')
   } elseif($args[0] -eq 'importer'){
+    if($env:RECOVERY_MODE -eq 'unknowncommit'){throw 'Must not replay an unknown commit'}
+    if($env:RECOVERY_MODE -eq 'newunknowncommit'){
+      $i=[array]::IndexOf($args,'--status')
+      [IO.File]::WriteAllText($args[$i+1],'{"status":"failed","commitState":"unknown","retrySafe":false}')
+      $global:LASTEXITCODE=2;return
+    }
     if($env:RECOVERY_MODE -eq 'importfail'){$global:LASTEXITCODE=5;return}
     if($env:RECOVERY_MODE -eq 'stalestatus'){return}
     $i=[array]::IndexOf($args,'--status')
@@ -294,6 +303,16 @@ $message=Get-KeywordRecoveryMessage $result
         self.assertTrue(report['result']['exportConfirmed'])
         self.assertFalse(report['result']['importConfirmed'])
         self.assertEqual(report['result']['mysql']['status'],'disabled')
+
+    def test_unknown_commit_receipt_blocks_salvage_import_replay(self):
+        for mode in ('unknowncommit','newunknowncommit'):
+            report,alias=self.run_fixture(mode)
+            self.assertFalse(report['result']['success'])
+            self.assertFalse(report['result']['importConfirmed'])
+            self.assertTrue(report['result']['requiresCommitReconciliation'])
+            self.assertEqual(report['result']['stage'],'commit_confirmation_required')
+            self.assertEqual(alias['commitState'],'unknown')
+            self.assertFalse(alias['retrySafe'])
 
 
 if __name__ == '__main__':

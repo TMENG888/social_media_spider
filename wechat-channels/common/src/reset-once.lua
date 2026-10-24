@@ -63,6 +63,7 @@ local function finish(record,stale)
   policy=s.policy,previousDataPreserved=true,attemptHistoryPreserved=true,
   preservation=s.preservation,lastVerifiedPosts=s.preservation.posts,
   outcome=record,staleLeaseClosed=stale or false}
+ result.recollectionOwner=s.owner
  local encoded=cjson.encode(result)
  s.state='completed';s.finishedAt=now;s.result=encoded
  archive('final', {previousStatus=old,previousResult=redis.call('HGET',KEYS[9],id),result=encoded,policy=s.policy})
@@ -112,9 +113,9 @@ if mode=='prepare' then
   local still_live=engine=='hash' and hot() or engine=='stream' and
    ((current_token and current_token~=s.token) or (#pending>0 and tonumber(pending[1][3])<idle))
   if still_live then return out({status='busy',changed=false}) end
-  -- An expired hash lease or idle original stream delivery is a failed replay.
-  -- Do not call this an import success: retained artifacts remain pending.
-  return finish({error='RECOLLECTION_LEASE_EXPIRED',importOk=false,collectionSucceeded=false},true)
+  -- A missing heartbeat does not prove that a content replay actually ran.
+  -- Keep evidence/ownership intact; never ACK or create a false completion.
+  return out({status='recovery_required',changed=false,reason='RECOLLECTION_LEASE_EXPIRED'})
  end
   if engine=='hash' then
    if hot() then return out({status='busy',changed=false}) end

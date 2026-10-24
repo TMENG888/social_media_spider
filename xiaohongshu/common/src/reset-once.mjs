@@ -1,8 +1,9 @@
 import {readFileSync} from 'node:fs';
+import {collectionNodeFailure} from './collection-failure.mjs';
 const SCRIPT=readFileSync(new URL('./reset-once.lua',import.meta.url),'utf8');
 export const RECOLLECTION_POLICY='reset-once-20261016-v1';
 export function protectedRecollection(record,pause=false){
- return pause||record?.stopped===true||record?.mustStopNode===true||/LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|CAPTCHA|STOP_REQUESTED|RATE_LIMIT|COOLDOWN|login_required|risk_controlled|partial_stopped/i.test(String(record?.error||'')+' '+String(record?.previousCollectionError||'')+' '+String(record?.status||''));
+ return pause||record?.stopped===true||collectionNodeFailure(record).stopNode||/LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|CAPTCHA|STOP_REQUESTED|RATE_LIMIT|COOLDOWN|login_required|risk_controlled|partial_stopped/i.test(String(record?.error||'')+' '+String(record?.previousCollectionError||'')+' '+String(record?.status||''));
 }
 export function recollectionOutcome(record={}){
  const importOk=record.importOk===true||record.importExitCode===0||record.mysql?.status==='success'||record.importSummary?.readbackVerified===true;

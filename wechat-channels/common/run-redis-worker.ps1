@@ -116,6 +116,16 @@ try {
   Write-Host $_.Exception.Message -ForegroundColor Red
   $ExitCode = 1
 } finally {
+  # Always record the launcher result inside the transcript. A zero exit only
+  # certifies this scheduling pass, not completion of the entire task pool.
+  Write-Host ('[Redis worker exit] ' + (@{
+    event = 'redis_worker_launcher_exit'
+    workerId = $WorkerId
+    exitCode = $ExitCode
+    allKeywordsComplete = $false
+    checkedAt = (Get-Date).ToString('o')
+    statusFile = (Join-Path $WorkerRoot '.state\redis_worker_status.json')
+  } | ConvertTo-Json -Compress))
   if ($TranscriptStarted) { try { Stop-Transcript | Out-Null } catch {} }
 }
 

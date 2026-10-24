@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
+import {assertPlatformAccess,guardedPlatformAction} from './platform-access.mjs';
 import { POST_FIELDS, COMMENT_FIELDS, blankRecord, canonicalXhsNoteUrl, extractId, normalizeXhsUrl, stableId } from "./schema.mjs";
 import { beijingDateTime, buildThreadContent, dedupeUrls, parseCount, parsePublishedText, threadLikeCount } from "./xhs-utils.mjs";
 import { cleanText, removeEmoji, splitDescriptionAndTags } from "./text-cleaner.mjs";
@@ -13,6 +14,7 @@ import {retrySnapshot} from './retry-no-change.mjs';
 import {assessKeywordScope,SearchExhaustion,assessSearchAcceptance,SCOPE_POLICY} from './search-acceptance.mjs';
 import {auditExistingScope,recordScope,scopeSummary} from './scope-audit.mjs';
 import { openCheckpoint, setMeta, saveCandidates, checkpointCandidates, markCompleted, markSkipped, markFailed, markNoteDeadLetter, markImported, importedStats, exportCheckpoint, repairCheckpointDataQuality, writeJsonAtomic,detailAttemptLimit,asrJobStats } from "./checkpoint.mjs";
+import { recordAsrMediaImport } from './asr-media-cleanup.mjs';
 import {currentMediaSnapshot,bindCurrentMedia} from './media-provenance.mjs';
 import { assessAsrAcceptance } from "./acceptance-gate.mjs";
 import { importRows,mysqlConnectionOptions } from "./import-mysql.mjs";
@@ -177,29 +179,14 @@ async function connectBrowser() {
 
 const SECURITY_CHALLENGE_PATTERN = /安全验证|安全限制|访问频繁|操作频繁|请完成验证|网络环境存在风险|300013/;
 
-async function securityChallengeMessage(page) {
-  const bodyText = await page.locator("body").innerText({ timeout: 2000 }).catch(() => "");
-  const match = SECURITY_CHALLENGE_PATTERN.exec(bodyText);
-  if (!match) return null;
-  // Report the actual warning, not the footer at the start of the page.
-  return bodyText.slice(Math.max(0, match.index - 30), match.index + 170).replace(/\s+/g, " ").trim()
-    || "检测到平台安全限制";
-}
-
 async function ensureLogin(page) {
   if (!page.url().includes("xiaohongshu.com")) {
     await page.goto("https://www.xiaohongshu.com/explore", { waitUntil: "domcontentloaded", timeout: cfg.timeout });
   }
   await page.waitForTimeout(1200);
+  // Release the collector/profile for the login recovery tool; do not keep
+  // working under an unresolved Redis manual hold after an inline login.
   await assertNoSecurityChallenge(page);
-  const deadline = Date.now() + cfg.loginWaitSeconds * 1000;
-  while (true) {
-    const loginVisible = await page.getByText(/登录后推荐更懂你的笔记|登录后查看搜索结果|扫码登录/).first().isVisible().catch(() => false);
-    if (!loginVisible) return;
-    await publishRestriction('STOP_LOGIN_REQUIRED：请在本机完成登录');
-    if (Date.now() >= deadline) throw new Error("STOP_LOGIN_REQUIRED：等待人工登录超时，请登录后重新运行");
-    await page.waitForTimeout(1000);
-  }
 }
 
 let cooldownPublication=null, cooldownPublicationPromise=null;
@@ -219,13 +206,8 @@ async function publishRestriction(message){
   await cooldownPublicationPromise;
 }
 async function assertNoSecurityChallenge(page,{allowWebUnavailable=false}={}) {
+  await assertPlatformAccess(page,'小红书',{report:publishRestriction});
   if (page.isClosed()) throw new Error("STOP_BROWSER_CLOSED：浏览器页签已关闭，保留断点后停止本节点");
-  const message = await securityChallengeMessage(page);
-  if (message) {
-    await publishRestriction(`STOP_SECURITY_CHALLENGE：${message}`);
-    await page.screenshot({ path: path.join(cfg.outputDir, `安全限制-${Date.now()}.png`), fullPage: false }).catch(() => {});
-    throw new Error(`STOP_SECURITY_CHALLENGE：${message}`);
-  }
   if(!allowWebUnavailable) await assertWebNoteAccessible(page).catch(async error => {
     await page.screenshot({path:path.join(cfg.outputDir, `网页不可访问-${Date.now()}.png`),fullPage:false}).catch(()=>{});
     throw error;
@@ -257,8 +239,10 @@ async function* collectSearchLinks(page, keyword, progress) {
   const searchUrl = `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}&source=web_explore_feed&type=51`;
   const input = page.locator('input#search-input:visible,input.search-input:visible,input[placeholder*="搜索"]:visible').first();
   if (await input.isVisible().catch(() => false)) {
-    await input.fill(keyword);
-    await input.press("Enter");
+    await guardedPlatformAction(page,'小红书',async()=>{
+      await input.fill(keyword,{timeout:4000});
+      await input.press("Enter",{timeout:4000});
+    },{report:publishRestriction});
     await page.waitForURL(url => isKeywordSearchUrl(url.toString(), keyword), { timeout: 10000 }).catch(() => {});
     if (!isKeywordSearchUrl(page.url(), keyword)) {
       await assertNoSecurityChallenge(page);
@@ -686,7 +670,7 @@ async function runIncrementalImport(keyword, batchId, batch) {
   }
   const startedAt = beijingDateTime();
   try {
-    const result = await importRows({ posts, comments });
+    const result = await importRows({ posts, comments, verify: true });
     incrementalBatches += 1;
     incrementalPosts += result.postResult.inserted + result.postResult.updated;
     incrementalComments += result.commentResult.inserted + result.commentResult.updated;
@@ -694,6 +678,11 @@ async function runIncrementalImport(keyword, batchId, batch) {
       { table: "ods_social_media_post", key: item.post["文章id"], noteId: item.noteId },
       ...(item.comments || []).map((comment) => ({ table: "ods_social_media_comment", key: comment["评论id"], noteId: item.noteId }))
     ]));
+    for (const item of batch) {
+      try { recordAsrMediaImport(checkpoint,{keyword,noteId:item.noteId || item.post['文章id']},item); }
+      catch { console.warn('[ASR媒体保留] 入库确认记录未保存；媒体暂留，不影响已提交文章'); }
+    }
+    await asrJobs?.cleanupMedia();
     await writeJsonAtomic(path.join(batchDir, "mysql_import_status.json"), { status: "success", postResult: result.postResult, commentResult: result.commentResult, batchId, keyword, committedAt: startedAt });
     console.log(`[增量入库] 批次${batchId}：${posts.length}篇帖子、${comments.length}条评论讨论串已入库（累计${incrementalBatches}批次 / ${incrementalPosts}篇）`);
   } catch (error) {
@@ -723,7 +712,8 @@ const asrJobs = cfg.asrEnabled ? new AsrJobProcessor({
   shouldStop: async () => signalStopRequested || Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false)),
   onCompleted: async (_job, _output, updated) => {
     if (cfg.skipImport || !process.env.MYSQL_USER || !process.env.MYSQL_PASSWORD) return;
-    await importRows({ posts: [updated.post], comments: [] });
+    await importRows({ posts: [updated.post], comments: [], verify: true });
+    return true; // Explicit commit/readback acknowledgment for media cleanup.
   }
 }) : null;
 asrJobs?.start();

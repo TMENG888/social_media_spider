@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { enqueueAsrJob, claimAsrJob, markAsrRunning, completeAsrJob, failAsrJob, deferAsrJob, asrJobStats } from "./checkpoint.mjs";
-import { cleanupCompletedAsrMedia } from "./asr-media-cleanup.mjs";
+import { cleanupCompletedAsrMedia, recordAsrMediaImport } from "./asr-media-cleanup.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const runtimeUnavailable = error => /mkl_malloc|failed to allocate memory|cannot allocate memory|not enough memory|paging file|std::bad_alloc|ASR模型初始化超时/i.test(String(error?.message || error));
@@ -84,11 +84,15 @@ export class AsrJobProcessor {
       }
       const updated = completeAsrJob(this.db, job, output);
       console.log(`[ASR回填] ${job.noteId}：${output.text ? `成功，${output.text.length}字` : `完成（${output.audit?.status || "no_speech"}）`}`);
+      let importConfirmed = false;
       if (this.onCompleted) {
-        try { await this.onCompleted(job, output, updated); }
+        try { importConfirmed = await this.onCompleted(job, output, updated) === true; }
         catch (error) { console.warn(`[ASR入库] ${job.noteId}：本地回填成功，MySQL增量回填稍后由全量收尾兜底：${String(error.message || error).split("\n")[0]}`); }
       }
-      await this.cleanupMedia(job);
+      if (importConfirmed) {
+        try { recordAsrMediaImport(this.db, job, updated); await this.cleanupMedia(job); }
+        catch { console.warn(`[ASR媒体保留] ${job.noteId}：入库确认记录未保存，媒体保留；ASR完成状态不变`); }
+      } else console.log(`[ASR媒体保留] ${job.noteId}：当前字幕入库未确认，媒体保留`);
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => {});
       if (runtimeUnavailable(error)) {

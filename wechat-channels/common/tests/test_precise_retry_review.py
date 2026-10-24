@@ -84,6 +84,7 @@ class ReviewTests(unittest.TestCase):
         adapter = SimpleNamespace(
             load_video_checkpoints=lambda *args: {'abc': {'row': {'url':'https://weixin.qq.com/sph/Test'}}},
             is_valid_channels_share_url=lambda _: True,
+            prepare_video_detail=lambda surface, *args, **kwargs: surface,
             return_to_search_results=closer)
         with patch('precise_video_retry.open_saved_video', return_value=object()), patch(
             'precise_video_retry.verify_target', side_effect=RuntimeError('wrong author')):
@@ -94,6 +95,7 @@ class ReviewTests(unittest.TestCase):
         adapter = SimpleNamespace(
             load_video_checkpoints=lambda *args: {'abc': {'row': {'url':'https://weixin.qq.com/sph/Test'}}},
             is_valid_channels_share_url=lambda _: True,
+            prepare_video_detail=lambda surface, *args, **kwargs: surface,
             return_to_search_results=Mock(side_effect=RuntimeError('cannot close detail')))
         with patch('precise_video_retry.open_saved_video', return_value=object()), patch(
             'precise_video_retry.verify_target', side_effect=RuntimeError('wrong author')):

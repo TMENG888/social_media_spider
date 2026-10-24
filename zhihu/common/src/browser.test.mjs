@@ -1,0 +1,24 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {ZhihuBrowser} from './browser.mjs';
+import {Checkpoint,canonical,postRow} from './core.mjs';
+const executable=process.env.ZHIHU_TEST_CHROME;
+test('real Chromium fixture: search sort, article, comment paging, login and risk gates',{skip:!executable},async t=>{
+ const root=process.env.ZHIHU_TEST_ROOT||'E:/Codex/work/zhihu-rpa-tests';await fs.mkdir(root,{recursive:true});const temp=await fs.mkdtemp(path.join(root,'browser-'));
+ const browser=await ZhihuBrowser.open(path.join(temp,'profile'),{headless:true,browserExecutable:executable,navigationTimeoutMs:5000,requireLatestSort:true,maxCommentPages:3});t.after(()=>browser.close());
+ const entity={id:'42',type:'article',title:'北京臻澐测评',content:'<p>完整正文</p>',created:1774702450,commentCount:1,voteupCount:3,author:{id:'a1',name:'作者',urlToken:'author-1'}};
+ const search='<div class="AppHeader-profile"></div><div class="SearchTabs-customFilter--tag tag-selected">最新发布</div><div class="SearchMain"><div class="SearchResult-Card"><h2><a href="https://zhuanlan.zhihu.com/p/42">北京臻澐测评</a></h2></div><p>没有更多内容</p></div>';
+ const detail=`<h1 class="Post-Title">北京臻澐测评</h1><div class="Post-RichTextContainer"><div class="RichText">完整正文</div></div><div class="ContentItem-time">发布于 2026-03-28 20:54</div><script id="js-initialData" type="application/json">${JSON.stringify({initialState:{entities:{articles:{42:entity}}}})}</script><button onclick="fetch('/api/v4/comment_v5/articles/42/root_comment').then(r=>r.json()).then(()=>document.body.dataset.loaded='1')">1 条评论</button>`;
+ await browser.context.route('**/*',async route=>{const u=route.request().url();if(u.includes('/root_comment'))await route.fulfill({contentType:'application/json',body:JSON.stringify({data:[{id:'c1',content:'评论正文',author:{member:{id:'u1',name:'评论者',url_token:'reader'}},created_time:1774702450,child_comment_count:0}],paging:{is_end:true}})});else await route.fulfill({contentType:'text/html; charset=utf-8',body:u.includes('/search?')?search:detail});});
+ await browser.startSearch('北京臻澐');const cards=await browser.candidates();assert.equal(cards.length,1);assert.equal(await browser.searchEnd(),true);
+ const d=await browser.detail(cards[0]);assert.equal(d.raw.content,'完整正文');assert.equal(d.raw.publishedDate,'2026-03-28');assert.equal(d.raw.authorName,'作者');
+ const cp=new Checkpoint(path.join(temp,'cp.sqlite'));t.after(()=>cp.close());const task={keyword:'北京臻澐',projectName:'北京臻澐项目口碑'};const row=postRow(d.raw,task);
+ assert.equal(await browser.comments(d.page,row,task,cp,async()=>{},async()=>d.page.waitForTimeout(30)),true);assert.equal(cp.rows('comment')[0]['评论内容'],'评论正文');
+ await browser.context.route('**/recovered',route=>route.fulfill({contentType:'text/html',body:search}));
+ await browser.context.route('**/initial403',route=>route.fulfill({status:403,contentType:'text/html',body:'<script>location.replace("/recovered")</script>'}));
+ await browser.navigate(d.page,'https://www.zhihu.com/initial403');assert.match(d.page.url(),/recovered$/);
+ await d.page.setContent('<div class="SignFlowModal">登录知乎</div>');await assert.rejects(browser.gate(d.page),/LOGIN_REQUIRED/);
+ await d.page.setContent('<div>请求过于频繁</div>');await assert.rejects(browser.gate(d.page),/RISK_CONTROLLED/);await d.page.close();
+});

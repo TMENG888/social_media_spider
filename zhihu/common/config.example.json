@@ -1,0 +1,38 @@
+{
+  "targetYear": 2026,
+  "headless": false,
+  "navigationTimeoutMs": 45000,
+  "detailDelayMs": [
+    12000,
+    25000
+  ],
+  "keywordDelayMs": [
+    45000,
+    90000
+  ],
+  "scrollDelayMs": [
+    2500,
+    4500
+  ],
+  "maxStagnantRounds": 15,
+  "searchStopWindow": 8,
+  "importBatchSize": 20,
+  "cycleMinutes": [
+    45,
+    60
+  ],
+  "restMinutes": [
+    30,
+    60
+  ],
+  "maxNotesPerKeyword": 0,
+  "maxSearchScrolls": 0,
+  "maxCommentPages": 0,
+  "requireLatestSort": true,
+  "collectAuthors": true,
+  "dataRoot": "E:/Codex/work/zhihu-rpa",
+  "outputRoot": "E:/Codex/outputs/zhihu-rpa",
+  "browserRoot": "E:/Codex/runtime/playwright",
+  "nodeMinimumMajor": 22,
+  "browserExecutable": ""
+}

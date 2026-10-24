@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { maySkipExhausted } from "./retry-disposition.mjs";
 import {COVERAGE_REDIS_GUARD} from './coverage-redis-guard.mjs';
+import {COOLDOWN_SCOPE_LUA} from './cooldown-scope.mjs';
 
 // All keys are explicit and share a Redis Cluster hash tag. Never construct keys in Lua.
 const KEY_NAMES = ["payloads", "statuses", "attempts", "tokens", "owners", "pending", "leases", "results", "errors", "failed", "deferrals"];
@@ -70,17 +71,27 @@ end
 return cjson.encode({added = added, existing = existing, total = redis.call('HLEN', KEYS[2])})
 `;
 
-const CLAIM = PRELUDE + `
+const CLAIM = PRELUDE + COOLDOWN_SCOPE_LUA + `
 local owner, token = ARGV[1], ARGV[2]
 local lease_ms, max_attempts, retry_delay = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
 local now = now_ms()
 -- Bounded recovery keeps a single claim from monopolizing Redis after a large outage.
 if KEYS[12] then
   local cooldown=redis.call('HGET',KEYS[12],'state')
-  if cooldown then
-    local s=cjson.decode(cooldown)
-    if s.manualRequired or (s.untilMs or 0)>now then
-      return redis.error_reply('RATE_LIMIT_COOLDOWN_ACTIVE')
+  if KEYS[13] and ARGV[7] and ARGV[7]~='' then
+    local s=cooldown_scope(cooldown,KEYS[13],ARGV[7],now,KEYS[12])
+    if s.active then return redis.error_reply('RATE_LIMIT_COOLDOWN_ACTIVE') end
+  else
+    local timed_raw=redis.call('HGET',KEYS[12],'timedState')
+    if timed_raw then
+      local timed=cjson.decode(timed_raw)
+      if timed.manualRequired or (timed.untilMs or 0)>now then return redis.error_reply('RATE_LIMIT_COOLDOWN_ACTIVE') end
+    end
+    if cooldown then
+      local s=cjson.decode(cooldown)
+      if s.manualRequired or (s.untilMs or 0)>now then
+        return redis.error_reply('RATE_LIMIT_COOLDOWN_ACTIVE')
+      end
     end
   end
 end
@@ -357,9 +368,10 @@ export class RedisTaskQueue {
   async claim(workerId, taskId = null) {
     // The extra guard key shares this queue's cluster tag; no cross-slot script.
     const keys=this.cooldownKey ? [...this.keys,this.cooldownKey] : [...this.keys];
+    if(this.cooldownKey&&this.cooldownIncidentKey&&this.cooldownNodeField)keys.push(this.cooldownIncidentKey);
     if(this.volumeBaselineKey){while(keys.length<13)keys.push(this.namespace+':volume-unused');keys.push(this.volumeBaselineKey);}
     let raw;
-    try{raw=await this.client.eval(CLAIM,{keys,arguments:[identity(workerId,"workerId"),randomUUID(),this.leaseMs,this.maxAttempts,this.retryDelayMs,taskId==null?'':identity(taskId,'taskId')].map(String)});}
+    try{raw=await this.client.eval(CLAIM,{keys,arguments:[identity(workerId,"workerId"),randomUUID(),this.leaseMs,this.maxAttempts,this.retryDelayMs,taskId==null?'':identity(taskId,'taskId'),this.cooldownNodeField||''].map(String)});}
     catch(error){
       if(/RATE_LIMIT_COOLDOWN_ACTIVE/.test(String(error.message)))error.code='RATE_LIMIT_COOLDOWN_ACTIVE';
       throw error;

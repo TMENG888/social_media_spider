@@ -1,14 +1,11 @@
 import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import {chromium} from 'playwright';
-import {existsSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {searchEndpointSnapshot,advanceSearchScroll} from './xhs-browser-state.mjs';
 let browser;
 before(async()=>{
-  const bundled=fileURLToPath(new URL('../runtime/browsers/chrome-win64/chrome.exe',import.meta.url));
-  const executablePath=process.env.XHS_TEST_BROWSER||(existsSync(bundled)?bundled:undefined);
-  browser=await chromium.launch({headless:true,...(executablePath?{executablePath}:{})});
+  browser=await chromium.launch({headless:true,executablePath:process.env.XHS_TEST_BROWSER||fileURLToPath(new URL('../runtime/browsers/chrome-win64/chrome.exe',import.meta.url))});
 });
 after(async()=>{await browser?.close();});
 

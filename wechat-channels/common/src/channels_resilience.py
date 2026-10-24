@@ -9,6 +9,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any
+from infrastructure_retry import retry_checkpoint
 
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -74,8 +75,17 @@ class RedisVideoCheckpointStore:
         # to the Redis scheduler module.
         from redis_task_queue import redis_command, RedisError
 
+        def operation():
+            try:
+                return redis_command(url, password, *parts, timeout=5)
+            except RedisError as error:
+                if 'closed the connection' in str(error):
+                    raise ConnectionResetError() from None
+                raise
         try:
-            return redis_command(url, password, *parts, timeout=5)
+            # This class only uses replay-safe checkpoint reads/merged writes.
+            # Scheduler claim/ACK/increment commands are NOT retried here.
+            return retry_checkpoint(operation)
         except OSError as error:
             raise RedisCheckpointUnavailable(type(error).__name__) from None
         except RedisError as error:

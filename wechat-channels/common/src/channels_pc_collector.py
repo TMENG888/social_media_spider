@@ -43,6 +43,7 @@ from subtitle_review import init_review_tables, stage_candidate, has_internal_pr
 from transcript_quality import transcript_artifact
 from search_scan_proof import POLICY as SEARCH_SCAN_POLICY, TERMINAL_TEXTS, SearchEndTracker, valid_origin
 from operational_gate import report_from_environment, classify_restriction
+from audio_process_guard import stop_owned_recorder, cleanup_audio_file
 
 # Windows consoles often default to GBK; force UTF-8 so real WeChat titles
 # containing Japanese punctuation/emoji cannot terminate a long collection.
@@ -59,6 +60,7 @@ STOP_REQUESTED = False
 SEARCH_LAYOUT: str | None = None
 LAST_MULTI_WINDOW_SIGNATURE: tuple | None = None
 _ASR_MODEL = None
+_AUDIO_SESSION_IMPORT_WARNING_EMITTED = False
 
 
 class SearchWindowUnavailableError(RuntimeError):
@@ -75,6 +77,14 @@ class VideoDetailIdentityMismatchError(RuntimeError):
 
 class ClientAudioCaptureError(RuntimeError):
     """The client playback could not yield a trustworthy audio recording."""
+
+
+class VideoPlaybackUnavailableError(RuntimeError):
+    """Bounded network-player reloads failed; retain the current video cursor."""
+
+
+class VideoDetailRecoveryBlockedError(ClientAudioCaptureError):
+    """A stop/login/security gate forbids further detail refreshes."""
 
 
 class AsrQualityRejectedError(RuntimeError):
@@ -880,6 +890,7 @@ def truncate_wav_duration(path: Path, keep_seconds: float) -> float:
 def ensure_wechat_audio_session_unmuted() -> dict:
     """Unmute Windows audio sessions owned by the WeChat web runtime."""
     audit = {"matched": 0, "sessions": [], "error": None}
+    global _AUDIO_SESSION_IMPORT_WARNING_EMITTED
     try:
         from pycaw.pycaw import AudioUtilities
 
@@ -910,6 +921,15 @@ def ensure_wechat_audio_session_unmuted() -> dict:
                 "afterMute": int(volume.GetMute()),
                 "afterVolume": round(float(volume.GetMasterVolume()), 4),
             })
+    except ImportError as exc:
+        audit['error'] = str(exc)
+        if not _AUDIO_SESSION_IMPORT_WARNING_EMITTED:
+            print(json.dumps({'event': 'audio_session_control_unavailable',
+                'errorCode': 'DEPENDENCY_MISSING', 'module': getattr(exc, 'name', 'pycaw'),
+                'pythonExecutable': sys.executable, 'waveformVerificationRequired': True},
+                ensure_ascii=False), flush=True)
+            _AUDIO_SESSION_IMPORT_WARNING_EMITTED = True
+        return audit
     except Exception as exc:
         audit["error"] = str(exc)
     print(json.dumps({
@@ -1003,6 +1023,7 @@ def verify_client_audio_before_full_capture(
     recorder = Path(__file__).with_name("loopback-recorder.py")
     attempts = []
     for probe_attempt in (1, 2):
+        ensure_capture_not_stopped(config)
         try:
             click_named_surface_control(active_video_root(surface), "暂停")
             seek_active_video_to_start(surface)
@@ -1072,13 +1093,8 @@ def verify_client_audio_before_full_capture(
             if probe_attempt == 2:
                 raise ClientAudioCaptureError(error)
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            probe_path.unlink(missing_ok=True)
+            stop_owned_recorder(process)
+            cleanup_audio_file(probe_path)
     raise ClientAudioCaptureError(
         "微信音频预检失败：" + json.dumps(attempts, ensure_ascii=False)
     )
@@ -1201,6 +1217,12 @@ def recorder_audio_coverage_is_suspicious(audit: dict, expected_seconds: float) 
     )
 
 
+def ensure_capture_not_stopped(config):
+    stop_path = config.get('_capture_stop_file')
+    if STOP_REQUESTED or (stop_path and Path(stop_path).exists()):
+        raise ClientAudioCaptureError('STOP_REQUESTED: audio capture/retry cancelled')
+
+
 def monitor_video_playback_during_capture(
     process: subprocess.Popen, expected_seconds: float, config: dict,
 ) -> dict:
@@ -1227,7 +1249,9 @@ def monitor_video_playback_during_capture(
     recoveries = 0
     identity = config.get('_capture_identity') or {}
     switched_after_end = False
+    recovery_pending = None
     while process.poll() is None:
+        ensure_capture_not_stopped(config)
         sample_time = time.monotonic()
         progress = None
         try:
@@ -1238,14 +1262,14 @@ def monitor_video_playback_during_capture(
                     active_video_records(current_surface))
                 if not matched:
                     if max_elapsed is None or max_elapsed < expected_seconds - tolerance:
-                        raise ClientAudioCaptureError('Video identity changed before full playback coverage')
+                        raise VideoDetailIdentityMismatchError('Video identity changed before full playback coverage')
                     # Once the target ended, pause the recommendation while
                     # the native writer finalizes its safety buffer.
                     pause_active_video_if_running(current_surface)
                     switched_after_end = True
             if not switched_after_end:
                 progress = read_active_video_progress(current_surface, expected_seconds=expected_seconds)
-        except ClientAudioCaptureError:
+        except (ClientAudioCaptureError, VideoDetailIdentityMismatchError):
             raise
         except Exception:
             progress = None
@@ -1257,6 +1281,18 @@ def monitor_video_playback_during_capture(
             if max_elapsed is None or elapsed > max_elapsed:
                 max_elapsed = elapsed
                 last_advance_at = sample_time
+            if recovery_pending is not None:
+                advanced = elapsed > recovery_pending['elapsed']
+                if advanced or sample_time - recovery_pending['at'] >= stall_seconds:
+                    print(json.dumps({
+                        'event': 'client_audio_playback_recovery_result',
+                        'attempt': recovery_pending['attempt'], 'recovered': advanced,
+                        'beforeElapsed': recovery_pending['elapsed'], 'afterElapsed': elapsed,
+                        'verification': 'timeline_advanced' if advanced else 'timeline_stalled',
+                    }, ensure_ascii=False), flush=True)
+                    recovery_pending = None
+                    if not advanced and recoveries >= maximum_recoveries:
+                        raise ClientAudioCaptureError('Playback stalled after bounded recovery attempts')
             samples.append({"elapsed": elapsed, "total": total})
             target = min(float(expected_seconds), float(total))
             if (
@@ -1264,15 +1300,18 @@ def monitor_video_playback_during_capture(
                 and sample_time - last_advance_at >= stall_seconds
                 and recoveries < maximum_recoveries
             ):
-                recovered, method = ensure_video_playing(get_video_detail_window())
+                control_ready, method = ensure_video_playing(get_video_detail_window())
                 recoveries += 1
                 last_advance_at = time.monotonic()
+                recovery_pending = {'elapsed': elapsed, 'at': last_advance_at, 'attempt': recoveries}
                 print(json.dumps({
                     "event": "client_audio_playback_stall_recovery",
                     "elapsed": elapsed,
                     "total": total,
                     "attempt": recoveries,
-                    "recovered": recovered,
+                    "controlReady": control_ready,
+                    "recovered": None,
+                    "verification": "awaiting_timeline_advance",
                     "method": method,
                 }, ensure_ascii=False), flush=True)
         time.sleep(interval)
@@ -1291,6 +1330,25 @@ def monitor_video_playback_during_capture(
 
 
 def seek_active_video_to_start(surface) -> bool:
+    """Verify the clock, including reloads already at zero without a slider."""
+    for attempt in range(1, 4):
+        current = surface if attempt == 1 else get_video_detail_window()
+        progress = read_active_video_progress(current)
+        if progress is not None and progress[0] <= 2:
+            return True
+        _seek_active_video_to_start_once(current)
+        time.sleep(0.25)
+        progress = read_active_video_progress(get_video_detail_window())
+        verified = progress is not None and progress[0] <= 2
+        print(json.dumps({'event': 'video_seek_start_verified', 'attempt': attempt,
+            'verified': verified, 'elapsed': progress[0] if progress else None},
+            ensure_ascii=False), flush=True)
+        if verified:
+            return True
+    return False
+
+
+def _seek_active_video_to_start_once(surface) -> bool:
     """Best-effort seek to 0 seconds before loopback recording starts."""
     root = active_video_root(surface)
     candidates = []
@@ -1427,12 +1485,34 @@ def capture_client_audio_asr(
     prompt_context: str | None = None,
     media_cache_before: dict | None = None,
     during_capture_callback=None,
+    stop_file=None,
 ) -> tuple[str | PendingClientAsr | None, int | None]:
     """Prefer a verified cache MP4; then capture the WeChat render process."""
     duration = duration_seconds or parse_video_duration_seconds(title)
     asr_enabled = config.get("enable_client_asr", True) and os.environ.get("WECHAT_CLIENT_ASR", "1") != "0"
     if not asr_enabled or not duration:
         return None, duration
+    config = {**config, '_capture_stop_file': stop_file or config.get('_capture_stop_file')}
+    ensure_capture_not_stopped(config)
+    surface = prepare_video_detail(surface, config)
+    # UIA is single-threaded: finish comments on a PAUSED target first. No
+    # comment scrolling may block the recording watchdog or change its surface.
+    if callable(during_capture_callback):
+        if not pause_active_video_if_running(surface):
+            raise ClientAudioCaptureError('Cannot confirm paused target before detail/comment collection')
+        started = time.monotonic()
+        during_capture_callback()
+        ensure_capture_not_stopped(config)
+        surface = get_video_detail_window()
+        identity = config.get('_capture_identity') or {}
+        if identity:
+            matched, _, _ = video_detail_identity_match(
+                identity.get('title'), identity.get('author_name'), active_video_records(surface))
+            if not matched:
+                raise VideoDetailIdentityMismatchError('Video identity changed during paused detail collection')
+        print(json.dumps({'event': 'detail_fields_collected_before_audio_capture',
+            'elapsed_seconds': round(time.monotonic() - started, 3),
+            'recordingActive': False}, ensure_ascii=False), flush=True)
     max_seconds = max(1, int(config.get("client_asr_max_seconds", 720)))
     capture_seconds = min(duration, max_seconds)
     capture_buffer = max(0, int(config.get("client_asr_capture_buffer_seconds", 8)))
@@ -1561,6 +1641,7 @@ def capture_client_audio_asr(
             recorder_process_id = None
             force_endpoint_loopback = False
             for audio_attempt in range(1, silence_retries + 2):
+                ensure_capture_not_stopped(config)
                 # Reload BEFORE launching the full recorder. A reload destroys
                 # the previous audibility proof; never blindly toggle 音量.
                 reloaded_from_start = audio_attempt > 1 or not seeked
@@ -1569,6 +1650,7 @@ def capture_client_audio_asr(
                     keyboard.send_keys("^r", pause=0.02)
                     time.sleep(max(0.5, float(config.get("client_asr_reload_wait_seconds", 1.0))))
                     surface = get_video_detail_window()
+                    surface = prepare_video_detail(surface, config)
                     preflight_audit = verify_client_audio_before_full_capture(
                         surface, config, temp_root, sample_rate,
                         max(3, preflight_seconds),
@@ -1646,17 +1728,6 @@ def capture_client_audio_asr(
                     "recorder_ready": recorder_ready,
                     "audio_preflight": preflight_audit,
                 }, ensure_ascii=False), flush=True)
-                if (
-                    callable(during_capture_callback)
-                    and config.get("client_asr_collect_detail_during_recording", True)
-                ):
-                    detail_audit = run_detail_collection_during_recording(
-                        during_capture_callback, process,
-                    )
-                    print(json.dumps({
-                        "event": "detail_fields_collected_during_audio_capture",
-                        **detail_audit,
-                    }, ensure_ascii=False), flush=True)
                 playback_audit = monitor_video_playback_during_capture(
                     process, capture_seconds, config,
                 )
@@ -1822,14 +1893,11 @@ def capture_client_audio_asr(
             }, ensure_ascii=False), flush=True)
             return text, duration
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            stop_owned_recorder(process)
             if not keep_wav:
-                wav_path.unlink(missing_ok=True)
+                cleanup_audio_file(wav_path)
+    except (VideoPlaybackUnavailableError, VideoDetailRecoveryBlockedError):
+        raise
     except Exception as exc:
         print(json.dumps({
             "event": "client_audio_asr_failed",
@@ -1864,7 +1932,7 @@ def capture_primary_audio_optional(*args, stop_file=None, **kwargs):
     or the caller's subsequent fresh detail-field validation.
     """
     try:
-        text, duration = capture_client_audio_asr(*args, **kwargs)
+        text, duration = capture_client_audio_asr(*args, stop_file=stop_file, **kwargs)
         return text, duration, None
     except ClientAudioCaptureError as error:
         if (os.environ.get('SOCIAL_VOLUME_ENABLED') != '1' or STOP_REQUESTED
@@ -1874,7 +1942,7 @@ def capture_primary_audio_optional(*args, stop_file=None, **kwargs):
         seen = set()
         while cause is not None and id(cause) not in seen:
             seen.add(id(cause))
-            if (isinstance(cause, (VideoDetailIdentityMismatchError, SearchWindowUnavailableError))
+            if (isinstance(cause, (VideoDetailIdentityMismatchError, SearchWindowUnavailableError, VideoPlaybackUnavailableError))
                     or re.search(r'LEASE_LOST|STOP_REQUESTED|STOP_SECURITY|STOP_LOGIN|验证码|安全验证|扫码|登录|访问频繁', str(cause), re.I)):
                 raise
             cause = cause.__cause__ or cause.__context__
@@ -1882,18 +1950,6 @@ def capture_primary_audio_optional(*args, stop_file=None, **kwargs):
             'error':str(error), 'qualityVerified':False,
             'audioCaptured':False, 'notEvidenceOfSilence':True},ensure_ascii=False),flush=True)
         return None, kwargs.get('duration_seconds'), str(error)
-
-
-def run_detail_collection_during_recording(callback, recorder_process) -> dict:
-    """Run lightweight metadata/comment parsing while loopback capture lives."""
-    started = time.monotonic()
-    active_before = recorder_process.poll() is None
-    callback()
-    return {
-        "elapsed_seconds": round(time.monotonic() - started, 3),
-        "recording_active_before": active_before,
-        "recording_active_after": recorder_process.poll() is None,
-    }
 
 
 def transcribe_pending_client_audio(
@@ -2037,6 +2093,7 @@ class BackgroundAsrQueue:
         self.config = dict(config)
         self.jobs: queue.Queue = queue.Queue()
         self.pending_keys: set[tuple[str, str]] = set()
+        self.infrastructure_error: RedisCheckpointUnavailable | None = None
         self.thread = threading.Thread(
             target=self._run, name="channels-asr-background", daemon=True
         )
@@ -2122,6 +2179,7 @@ class BackgroundAsrQueue:
         project: str,
         remote_store: RedisVideoCheckpointStore | None = None,
     ) -> None:
+        self.raise_if_infrastructure_failed()
         key = (article_key, keyword)
         if key in self.pending_keys:
             job.wav_path.unlink(missing_ok=True)
@@ -2169,6 +2227,9 @@ class BackgroundAsrQueue:
                 try:
                     if item is None:
                         return
+                    if self.infrastructure_error is not None:
+                        # Keep durable pending jobs untouched after the fuse.
+                        continue
                     article_key, keyword, job, payload = item
                     now = datetime.now().isoformat(timespec="seconds")
                     disposition = connection.execute(
@@ -2264,6 +2325,10 @@ class BackgroundAsrQueue:
                         )
                     if text and not needs_review:
                         job.wav_path.unlink(missing_ok=True)
+                except RedisCheckpointUnavailable as exc:
+                    # Decoding/local commit may already have succeeded. A
+                    # transport outage is not another ASR/content attempt.
+                    self.pause_for_infrastructure(exc)
                 except Exception as exc:
                     if item is not None:
                         article_key, keyword, job, payload = item
@@ -2302,19 +2367,25 @@ class BackgroundAsrQueue:
                             allowed = ResultRow.__dataclass_fields__.keys()
                             row = ResultRow(**{key: value for key, value in row_data.items() if key in allowed})
                             comments = json.loads(checkpoint[1]) if checkpoint[1] else []
-                        checkpoint_payload = upsert_video_checkpoint(
-                            connection,
-                            keyword=keyword,
-                            project=payload.get("project") or "",
-                            fingerprint=payload.get("fingerprint") or article_key,
-                            status="dead_letter" if asr_job_status == "dead_letter" else "retry_pending",
-                            retry_count=max(attempts, int(checkpoint[2] or 0) if checkpoint else 0),
-                            row=row,
-                            comments=comments,
-                            asr_status=asr_job_status,
-                            last_error=str(exc),
-                            remote_store=RedisVideoCheckpointStore(),
-                        )
+                        try:
+                            checkpoint_payload = upsert_video_checkpoint(
+                                connection,
+                                keyword=keyword,
+                                project=payload.get("project") or "",
+                                fingerprint=payload.get("fingerprint") or article_key,
+                                status="dead_letter" if asr_job_status == "dead_letter" else "retry_pending",
+                                retry_count=max(attempts, int(checkpoint[2] or 0) if checkpoint else 0),
+                                row=row,
+                                comments=comments,
+                                asr_status=asr_job_status,
+                                last_error=str(exc),
+                                remote_store=RedisVideoCheckpointStore(),
+                            )
+                        except RedisCheckpointUnavailable as network_error:
+                            # A failure while saving failure evidence must not
+                            # kill the queue thread and hang jobs.join().
+                            self.pause_for_infrastructure(network_error)
+                            continue
                         if asr_job_status == "dead_letter":
                             dead_letter_time = datetime.now().isoformat(timespec="seconds")
                             connection.execute(
@@ -2348,10 +2419,14 @@ class BackgroundAsrQueue:
                                 "raw_card_text": "ASR persistent job",
                                 "result_index": None,
                             })
-                            RedisVideoCheckpointStore().put(
-                                payload.get("fingerprint") or article_key,
-                                checkpoint_payload,
-                            )
+                            try:
+                                RedisVideoCheckpointStore().put(
+                                    payload.get("fingerprint") or article_key,
+                                    checkpoint_payload,
+                                )
+                            except RedisCheckpointUnavailable as network_error:
+                                self.pause_for_infrastructure(network_error)
+                                continue
                         print(json.dumps({
                             "event": "client_audio_asr_job_persisted_failure",
                             "article_key": article_key,
@@ -2367,6 +2442,16 @@ class BackgroundAsrQueue:
         finally:
             connection.close()
 
+    def pause_for_infrastructure(self, error: RedisCheckpointUnavailable) -> None:
+        self.infrastructure_error = error
+        print(json.dumps({'event': 'client_audio_asr_remote_sync_paused',
+            'localCheckpointRetained': True, 'remoteSyncConfirmed': False,
+            'asrRetryCharged': False, 'exitCode': 75}), flush=True)
+
+    def raise_if_infrastructure_failed(self) -> None:
+        if self.infrastructure_error is not None:
+            raise self.infrastructure_error
+
     def close_and_wait(self) -> None:
         pending = self.jobs.qsize()
         print(json.dumps({
@@ -2376,6 +2461,7 @@ class BackgroundAsrQueue:
         self.jobs.join()
         self.jobs.put(None)
         self.thread.join()
+        self.raise_if_infrastructure_failed()
 
 
 def _wechat_main_window_candidates():
@@ -3251,6 +3337,139 @@ def require_video_detail_identity(
         f"视频详情已自动跳转或打开错位：卡片={card.get('title')!r}，"
         f"详情候选={detail_text!r}，相似度={score:.3f}"
     )
+
+
+def video_player_failure_state(surface) -> tuple[bool, str | None]:
+    """Inspect visible player labels, not hidden feed items or caption substrings."""
+    root = active_video_root(surface)
+    unavailable = False
+    # Access dialogs may be siblings of the active feed item. Inspect them at
+    # surface scope, but keep the network-error label scoped to the player.
+    for container, check_network in ((surface, False), (root, True)):
+        viewport = container.rectangle()
+        for control in container.descendants():
+            try:
+                info = control.element_info
+                if info.control_type not in {'Text', 'Button', 'Pane'} or not control.is_visible():
+                    continue
+                rect = control.rectangle()
+                if (min(rect.bottom, viewport.bottom) <= max(rect.top, viewport.top)
+                        or min(rect.right, viewport.right) <= max(rect.left, viewport.left)):
+                    continue
+                name = re.sub(r'\s+', '', control.window_text() or '')
+                if check_network and re.fullmatch(r'(?:暂无法|暂时无法|无法)观看此视频(?:[，,。].*)?', name):
+                    unavailable = True
+                # Only standalone UI prompts qualify, not caption substrings.
+                if re.fullmatch(r'(?:请先登录|请登录微信|扫码登录(?:微信)?|请在手机上确认登录|'
+                                r'请完成安全验证|安全验证|验证码|请完成拼图验证|'
+                                r'操作频繁|访问频繁|网络环境存在风险)(?:[。！!，,].*)?', name):
+                    return unavailable, name
+            except Exception:
+                continue
+    return unavailable, None
+
+
+def prepare_video_detail(surface, config: dict, card: dict | None = None,
+                         *, keyword: str = '', result_index: int = -1):
+    """Reload the SAME detail tab only after an explicit unwatchable label.
+
+    No recorder is active here. Reacquire UIA after every reload and verify the
+    target again before returning; disappearance of the error alone is not
+    success. Actual audio/playback coverage is still verified by the recorder.
+    """
+    max_refreshes = max(0, min(10, int(config.get('video_unavailable_refresh_attempts', 4))))
+    wait_seconds = max(1.0, min(60.0, float(config.get('wait_video_detail_ready_seconds', 15))))
+    backoff = max(0.5, min(30.0, float(config.get('video_unavailable_refresh_backoff_seconds', 2))))
+    deadline = time.monotonic() + wait_seconds
+    refreshes = 0
+    observed = False
+    def check_stop():
+        try:
+            ensure_capture_not_stopped(config)
+        except ClientAudioCaptureError as exc:
+            raise VideoDetailRecoveryBlockedError(str(exc)) from exc
+    while True:
+        check_stop()
+        unavailable, restriction = video_player_failure_state(surface) if surface is not None else (False, None)
+        if restriction:
+            if '登录' in restriction:
+                restriction = 'STOP_LOGIN_REQUIRED：' + restriction
+            else:
+                restriction = 'STOP_PLATFORM_RESTRICTION：' + restriction
+            report_from_environment(restriction)
+            raise VideoDetailRecoveryBlockedError(restriction)
+        if unavailable:
+            observed = True
+        if surface is not None and not unavailable:
+            root = active_video_root(surface)
+            # Pause as soon as possible, including while metadata hydrates, to
+            # prevent short videos auto-advancing during the readiness wait.
+            paused = pause_active_video_if_running(surface)
+            actions = [b for b in root.descendants(control_type='Button')
+                       if 'op-item' in (b.element_info.class_name or '') and b.is_visible()]
+            if len(actions) >= 4:
+                identity = card or config.get('_capture_identity')
+                if refreshes and not identity:
+                    raise VideoDetailIdentityMismatchError('Cannot verify target identity after video refresh')
+                if identity:
+                    require_video_detail_identity(identity, active_video_records(surface),
+                                                  keyword=keyword, result_index=result_index)
+                if refreshes:
+                    print(json.dumps({'event': 'video_unavailable_refresh_recovered',
+                        'policy': 'channels-video-refresh-20261023-v1',
+                        'keyword': keyword, 'index': result_index, 'refreshes': refreshes,
+                        'identityVerified': bool(identity), 'paused': paused,
+                        'audioCoverageVerified': False}, ensure_ascii=False), flush=True)
+                return surface
+        expired = time.monotonic() >= deadline
+        if observed and (refreshes == 0 or expired):
+            if refreshes >= max_refreshes:
+                print(json.dumps({'event': 'video_unavailable_refresh_exhausted',
+                    'keyword': keyword, 'index': result_index, 'refreshes': refreshes,
+                    'localCheckpointRetained': True, 'contentAttemptCharged': False},
+                    ensure_ascii=False), flush=True)
+                raise VideoPlaybackUnavailableError('VIDEO_PLAYBACK_UNAVAILABLE：刷新耗尽，当前视频及断点保留，未标记采集成功')
+            if surface is None or not is_video_detail_page(surface):
+                raise VideoPlaybackUnavailableError('VIDEO_PLAYBACK_UNAVAILABLE：详情窗口不可确认，停止刷新并保留断点')
+            delay = min(30.0, backoff * (refreshes + 1))
+            print(json.dumps({'event': 'video_unavailable_refresh_retry',
+                'keyword': keyword, 'index': result_index, 'attempt': refreshes + 1,
+                'maxAttempts': max_refreshes, 'waitSeconds': delay}, ensure_ascii=False), flush=True)
+            # Check both process signals and the worker stop file in slices.
+            wait_until = time.monotonic() + delay
+            while time.monotonic() < wait_until:
+                check_stop()
+                interruptible_wait(min(0.25, wait_until - time.monotonic()))
+            check_stop()
+            # A user may have switched tabs during backoff. Never send Ctrl+R
+            # to the cached handle without reacquiring its detail role.
+            try:
+                surface = get_video_detail_window()
+            except SearchWindowUnavailableError as exc:
+                raise VideoPlaybackUnavailableError('VIDEO_PLAYBACK_UNAVAILABLE：刷新前详情窗口已消失，保留断点') from exc
+            still_unavailable, restriction = video_player_failure_state(surface)
+            if restriction:
+                continue  # report the gate at the top, without refreshing
+            if not still_unavailable and len([
+                b for b in active_video_root(surface).descendants(control_type='Button')
+                if 'op-item' in (b.element_info.class_name or '') and b.is_visible()
+            ]) >= 4:
+                continue  # it recovered during backoff; avoid an extra reload
+            surface.set_focus()
+            keyboard.send_keys('^r', pause=0.02)
+            refreshes += 1
+            # Old UIA controls can survive briefly during navigation.
+            if not interruptible_wait(0.8):
+                check_stop()
+            deadline = time.monotonic() + wait_seconds
+        elif expired:
+            raise RuntimeError('视频详情页已打开，但互动栏未在时限内完成加载')
+        check_stop()
+        interruptible_wait(0.25)
+        try:
+            surface = get_video_detail_window(wait_seconds=0)
+        except SearchWindowUnavailableError:
+            surface = None  # navigation gap: never refresh an unverified tab
 
 
 def article_key_for_row(row: ResultRow) -> str:
@@ -5687,7 +5906,12 @@ def pause_active_video_if_running(web) -> bool:
                 int((pause_rect.top + pause_rect.bottom) / 2),
             ))
             time.sleep(0.15)
-    return True
+    paused = bool(visible_controls(active_video_root(get_video_detail_window()),
+                                   name='播放', control_type='Button'))
+    if not paused:
+        print(json.dumps({'event': 'video_pause_unverified',
+            'reason': 'play_control_not_observed_after_pause_action'}, ensure_ascii=False), flush=True)
+    return paused
 
 
 def parse_article_details(records: list[tuple[str, str, str]]) -> dict:
@@ -6168,6 +6392,27 @@ def filter_actual_comment_entries(
     ]
 
 
+def record_comment_capture_result(config, *, status, expected, actual, reason):
+    audit = {'event': 'comment_capture_result', 'status': status,
+             'expectedCount': expected, 'actualEntries': actual, 'reason': reason,
+             'emptyConfirmed': status == 'confirmed_empty'}
+    config['_comment_capture_audit'] = audit
+    print(json.dumps(audit, ensure_ascii=False), flush=True)
+
+
+def comment_panel_empty_confirmed(surface):
+    # Never infer empty from a timeout, a zero parsed count, or whole-window text.
+    for group in surface.descendants(control_type='Group'):
+        if not group.is_visible() or 'comment' not in (group.element_info.class_name or '').lower():
+            continue
+        for text in group.descendants(control_type='Text'):
+            if text.is_visible() and (text.window_text() or '').strip() in {
+                '暂无评论', '暂时没有评论', '还没有评论', '暂无评论，快来抢沙发吧',
+            }:
+                return True
+    return False
+
+
 def collect_video_comments(
     web,
     config: dict,
@@ -6175,7 +6420,26 @@ def collect_video_comments(
     article_title: str | None = None,
 ) -> list[dict]:
     """Open and exhaust the visible comment pane with bounded scrolling."""
-    if not open_video_comments_panel(web, config):
+    config.pop('_comment_capture_audit', None)
+    opened = False
+    attempts = min(3, max(1, int(config.get('comment_panel_open_attempts', 2))))
+    for attempt in range(1, attempts + 1):
+        ensure_capture_not_stopped(config)
+        current = get_video_detail_window()
+        opened = open_video_comments_panel(current, config)
+        if comment_panel_empty_confirmed(get_video_detail_window()):
+            # A positive page count conflicts with an empty placeholder.
+            status = 'incomplete' if expected_count and expected_count > 0 else 'confirmed_empty'
+            record_comment_capture_result(config, status=status, expected=expected_count,
+                actual=0, reason='page_count_conflicts_with_empty' if status == 'incomplete' else 'explicit_empty_panel')
+            return []
+        if opened:
+            break
+        print(json.dumps({'event': 'comment_panel_retry', 'attempt': attempt,
+            'maxAttempts': attempts, 'ready': False}, ensure_ascii=False), flush=True)
+    if not opened:
+        record_comment_capture_result(config, status='unavailable', expected=expected_count,
+            actual=0, reason='panel_not_ready_after_bounded_retry')
         return []
     max_rounds = max(1, int(config.get("comment_scroll_rounds", 20)))
     stable_required = max(1, int(config.get("comment_stable_rounds", 3)))
@@ -6185,6 +6449,7 @@ def collect_video_comments(
     last_root_id = None
     sequence = 0
     for round_index in range(1, max_rounds + 1):
+        ensure_capture_not_stopped(config)
         surface = get_video_detail_window()
         new_comments, panel_left = parse_new_comment_panel(surface)
         expanded_replies = expand_visible_comment_replies(surface, panel_left)
@@ -6290,6 +6555,9 @@ def collect_video_comments(
             "event": "comment_scroll_pass",
             "round": round_index,
             "visible_cards": len(new_comments) + len(candidates),
+            "structuredEntries": len(new_comments),
+            "fallbackCandidates": len(candidates),
+            "candidateCountsMayOverlap": True,
             "unique_comments": len(found),
             "expanded_reply_groups": expanded_replies,
             "stable_rounds": stable_rounds,
@@ -6319,6 +6587,10 @@ def collect_video_comments(
         rect = target.rectangle()
         mouse.scroll(coords=(int((rect.left + rect.right) / 2), max(rect.top + 40, rect.bottom - 60)), wheel_dist=-8)
         time.sleep(wait_seconds)
+    incomplete = (not found or (expected_count is not None and len(found) < expected_count))
+    record_comment_capture_result(config,
+        status='incomplete' if incomplete else 'collected', expected=expected_count,
+        actual=len(found), reason='expected_comments_not_fully_observed' if incomplete else 'visible_entries_collected')
     return merge_parent_child_comments(list(found.values()))
 
 
@@ -6397,7 +6669,7 @@ def open_video_comments_panel(web, config: dict) -> bool:
             and item.is_visible()
         ]),
     }, ensure_ascii=False), flush=True)
-    return True
+    return panel_ready
 
 
 def is_search_results_page(web) -> bool:
@@ -6597,6 +6869,7 @@ def collect_live_keyword(
     stop_file: Path | None = None,
 ) -> dict:
     config = dict(config)
+    config['_capture_stop_file'] = stop_file
     config['force_asr'] = bool(config.get('force_asr')) or os.environ.get('WECHAT_FORCE_ASR') == '1'
     asr_backfill_mode = bool(config.get("asr_backfill_mode", False))
     retry_fingerprint = str(
@@ -6853,6 +7126,8 @@ def collect_live_keyword(
             int(os.environ['SOCIAL_VOLUME_TARGET_POSTS']))
 
     while max_results <= 0 or processed_this_run < max_results:
+        if asr_queue is not None:
+            asr_queue.raise_if_infrastructure_failed()
         if os.environ.get('SOCIAL_VOLUME_ENABLED') == '1' and not os.environ.get('WECHAT_RECOLLECT_ONCE'):
             target = int(os.environ['SOCIAL_VOLUME_TARGET_POSTS'])
             local_posts = connection.execute(
@@ -7308,6 +7583,8 @@ def collect_live_keyword(
                     )
                 except Exception as exc:
                     raise RuntimeError("视频详情页未在时限内打开") from exc
+                web = prepare_video_detail(get_video_detail_window(), config, card,
+                                           keyword=keyword, result_index=result_index)
                 try:
                     wait_for(
                         lambda: pause_active_video_if_running(get_video_detail_window()),
@@ -7471,6 +7748,9 @@ def collect_live_keyword(
                 def collect_detail_fields_while_recording():
                     nonlocal comments, details
                     nonlocal like_count, comment_count, favorite_count, share_count
+                    config['_capture_stop_file'] = stop_file
+                    config.pop('_comment_capture_audit', None)
+                    ensure_capture_not_stopped(config)
                     current_web = get_video_detail_window()
                     current_records = active_video_records(current_web)
                     require_video_detail_identity(
@@ -7567,6 +7847,11 @@ def collect_live_keyword(
                             optional_audio_error, card_fingerprint)
                     if collect_comments:
                         save_comments(connection, saved_row, comments)
+                        comment_audit = config.get('_comment_capture_audit') or {}
+                        if comment_audit.get('status') in {'unavailable', 'incomplete'}:
+                            save_collection_issue(connection, keyword, result_index,
+                                'comments_not_fully_observed', title,
+                                json.dumps(comment_audit, ensure_ascii=False), card_fingerprint)
                     if asr_backfill_mode:
                         asr_status = (
                             "pending" if pending_asr is not None
@@ -7652,6 +7937,33 @@ def collect_live_keyword(
                         f"视频指纹 {retry_fingerprint} 精准补采完成",
                     )
                 break
+            except (VideoPlaybackUnavailableError, VideoDetailRecoveryBlockedError) as exc:
+                last_item_exception = exc
+                status = 'partial_stopped' if 'STOP_REQUESTED' in str(exc) else 'partial_error'
+                save_collection_issue(connection, keyword, result_index,
+                    'video_playback_unavailable', title, str(exc), card_fingerprint)
+                update_task_state(connection, keyword, project, result_index,
+                                  old_streak, status, str(exc))
+                # Infrastructure/player readiness is not a malformed video:
+                # do not advance, spend content retries or create a dead letter.
+                try:
+                    return_to_search_results(config)
+                except Exception:
+                    pass
+                break
+            except RedisCheckpointUnavailable:
+                # Transport exhaustion is not a failed video. The local
+                # checkpoint was already committed: preserve its retry count
+                # and cursor and let the outer salvage/exit-75 path handle it.
+                print(json.dumps({
+                    "event": "article_infrastructure_paused",
+                    "keyword": keyword,
+                    "index": result_index,
+                    "contentAttemptCharged": False,
+                    "nextItemAllowed": False,
+                    "localCheckpointRetained": True,
+                }, ensure_ascii=False), flush=True)
+                raise
             except Exception as exc:
                 last_item_exception = exc
                 failed += 1
@@ -7728,6 +8040,8 @@ def collect_live_keyword(
                         except Exception:
                             pass
                     break
+        if isinstance(last_item_exception, (VideoPlaybackUnavailableError, VideoDetailRecoveryBlockedError)):
+            break
         if not item_success:
             failed_index = result_index
             safe_keyword = re.sub(r"[^\w-]+", "_", keyword)

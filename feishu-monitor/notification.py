@@ -28,9 +28,11 @@ def video_progress_line(snapshot, total):
                'coverage_below_threshold', 'scan_completed_pending_verification', 'partial')
     closed = sum(states.get(state, 0) for state in terminal)
     pending_import = queue.get('completedPendingImport', 0)
-    completed = max(0, closed - pending_import)
+    # Business closure is not import confirmation. Disclose outstanding imports
+    # in the action block, not as collection retries with no dispatch entry.
+    completed = closed
     pending = sum(states.get(state, 0) for state in new)
-    retry = sum(states.get(state, 0) for state in ongoing) + pending_import
+    retry = sum(states.get(state, 0) for state in ongoing)
     if (set(states) - set(terminal + new + ongoing) or pending_import > closed
             or sum(states.values()) != total['planned']):
         retry = None
@@ -54,7 +56,7 @@ def platform_progress_line(platform):
 
 
 def retry_task_issues(snapshot):
-    """Only explicit retry/recollection queues, not content flags or active leases."""
+    """Explicit retries and separate import debt, not historical quality flags."""
     issues = []
     if snapshot.get('sources', {}).get('redis') == 'ok':
         queue = snapshot.get('keywordQueueCounts') or {}
@@ -64,7 +66,12 @@ def retry_task_issues(snapshot):
                         ('retry_pending', 'recollect_pending', 'completed_with_deferred_retries'))
         else:
             retry = sum(queue.get(key, 0) for key in ('retryPending', 'recollectPending', 'deferred'))
-        if retry:issues.append(f'视频号：待重试 {retry} 个关键词 → 按现有策略重试')
+        video_issue = f'视频号：待重试 {retry} 个关键词 → 按现有策略重试' if retry else ''
+        pending_import = queue.get('completedPendingImport', 0)
+        if pending_import:
+            import_issue = f'{pending_import} 个已结案词入库待确认 → 原机器启动后离线补入库，不重复采集'
+            video_issue = video_issue + '；' + import_issue if video_issue else '视频号：' + import_issue
+        if video_issue:issues.append(video_issue)
     for platform in snapshot.get('platformTasks', []):
         counts = platform.get('counts')
         if platform.get('source') == 'ok' and counts is not None and counts.get('retryPending'):
@@ -217,7 +224,7 @@ def brief_notification(snapshot, db, *, include_diagnostics=False):
     generated = stamp(snapshot.get('generatedAt'))
     when = generated.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M') if generated else '时间未确认'
     headline = f"{when}（北京）｜{str(len(all_issues))+'项需关注' if all_issues else '未观察到失败待重试任务'}"
-    notes = ['完成含跳过结案，非全量采齐；重试含执行中、补采/重采及待入库；待领为未尝试', '入库历史累计；字段非空≠合格；视频内容仅视频行；净增≠新增']
+    notes = ['完成含跳过结案，非全量采齐或入库确认；视频号待入库见异常项，不计采集重试；待领为未尝试', '入库历史累计；字段非空≠合格；视频内容仅视频行；净增≠新增']
     if platforms:
         notes += ['有效租约不等于确认在线', '百度资讯/公众号未接入']
     if any(w.get('observation') in ('heartbeat_stale', 'registration_unobserved') for w in workers):

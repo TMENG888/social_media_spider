@@ -5,7 +5,7 @@ export function volumeQueueConfirmed(confirmation) {
 }
 
 export function keywordQueueConfirmed(confirmation) {
- return volumeQueueConfirmed(confirmation)||confirmation?.status==='completed'&&(confirmation?.acceptedByAnnual===true||confirmation?.acceptedByExhaustion===true||confirmation?.acceptedByResetOnce===true);
+ return volumeQueueConfirmed(confirmation)||confirmation?.status==='completed'&&(confirmation?.acceptedBySearchExhaustion===true||confirmation?.acceptedByAnnual===true||confirmation?.acceptedByExhaustion===true||confirmation?.acceptedByResetOnce===true);
 }
 
 export function reconcileVolumeCompletion(record,confirmation) {
@@ -14,6 +14,7 @@ export function reconcileVolumeCompletion(record,confirmation) {
   redisConfirmed:confirmed,redisDisposition:String(confirmation?.status||'unconfirmed'),
   quantityAccepted:volumeQueueConfirmed(confirmation),annualLowVolumeAccepted:confirmed&&confirmation?.acceptedByAnnual===true,
   retryExhaustedCompletion:confirmed&&confirmation?.acceptedByExhaustion===true,
+  searchExhaustionCompleted:confirmed&&confirmation?.acceptedBySearchExhaustion===true,
   resetOnceCompletion:confirmed&&confirmation?.acceptedByResetOnce===true,
   ...(confirmation?.acceptedByResetOnce?{collectionSucceeded:confirmation.collectionSucceeded===true,
    dataImported:confirmation.dataImported===true,businessCompleted:true,collectionError:record.collectionError||record.error||null}:{}),

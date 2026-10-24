@@ -62,7 +62,7 @@ catch(e){if(e.code!=='EEXIST')throw e;let old;try{old=await readJson(lockFile);}
 const status={workerId,startedAt:new Date().toISOString(),phase,tasks:[],completed:0,failed:0,status:'running',fatalError:null};
 try{
  if(!test&&commit){remoteControl=await RemoteStopControl.open(common,worker);await remoteControl.gate();remoteControl.watch();}
- if(!test&&commit){operations=await OperationalGate.open({root:common,workerId,platform:'抖音'});if(!(await operations.wait({shouldStop})).ready){requested=true;throw new Error('STOP_REQUESTED');}}
+ if(!test&&commit){operations=await OperationalGate.open({root:common,workerId,platform:'抖音'});await operations.assertReady();}
  if(operations)setAccessIncidentReporter(message=>operations.record(message,{taskId:dispatcher?.current?.taskId||'',keyword:status.currentKeyword||''}));
  try{await cleanupWorkerAsrMedia({stateRoot,mediaName:'media',keepMedia:config.asrKeepMedia===true,dryRun:false});}
  catch(e){console.warn(`[ASR媒体清理] 跳过本轮清理，不影响采集：${e.message}`);}
@@ -102,12 +102,12 @@ try{
     else if(result.disposition==='no_change')status.noChangeCompleted=(status.noChangeCompleted||0)+1;
     else if(result.status==='completed_with_skips')status.completedWithSkips=(status.completedWithSkips||0)+1;
     else status.completed++;
-    if(result.mustStopNode){requested=true;break;}
+    if(result.mustStopNode){const restriction=classifyRestriction(result.error);if(restriction)status.operationalHold=restriction;requested=true;break;}
     // A verified sample is not an annual keyword completion. Keep all saved
     // rows/checkpoints, return the real lease, and leave production pending.
    }catch(e){
     const restriction=classifyRestriction(e);
-    if(restriction&&operations){await operations.record(e,{taskId:task.redisTaskId||task.id,keyword:task.keyword});}
+    if(restriction&&operations){await operations.record(e,{taskId:task.redisTaskId||task.id,keyword:task.keyword});status.operationalHold={kind:restriction.kind,requiresHuman:restriction.requiresHuman};}
     let action=collectionFailureAction(e,{test:test||Boolean(verificationSample)});status.tasks.push(e.collectionSummary||{keyword:task.keyword,error:e.message});
     if(restriction&&operations)action='stop';
     const boundedContentRetry=!test&&!verificationSample&&maySkipExhausted(e.collectionSummary);
@@ -151,7 +151,16 @@ try{
   if(status.tasks.length!==String(args.keywords||'中海 住宅|北京臻澐').split('|').length||status.tasks.some(t=>t.status!=='sample_completed'||t.posts!==Number(args.limit||10))||results.some(r=>r.matches!==1||!String(r.row.文章时间地点).startsWith('2026')||r.row.分类!==null))throw new Error('LIVE_TEST_READBACK_FAILED');
   console.log(`[入库回读验证] ${results.length}篇，业务键各1条，2026日期及分类NULL通过`);
  }
-}catch(e){fatal=e;status.status='failed';status.fatalError=String(e.message||e);console.error(`[节点停止] ${status.fatalError}`);}
+}catch(e){
+ const restriction=classifyRestriction(e);
+ if(e.code==='OPERATIONAL_HOLD'||restriction&&operations){
+  try{
+   if(restriction)await operations.record(e,{keyword:status.currentKeyword||''});
+   requested=true;status.status='operational_hold';status.operationalHold=restriction||{kind:e.state.kind,requiresHuman:e.state.requiresHuman};
+  }catch(monitorError){fatal=monitorError;status.status='failed';status.fatalError='MONITOR_STATE_UNAVAILABLE';}
+  console.warn('[平台等待] 保护仍有效；已退出采集进程并释放浏览器与节点锁，等待登录恢复工具确认。');
+ }else{fatal=e;status.status='failed';status.fatalError=String(e.message||e);console.error(`[节点停止] ${status.fatalError}`);}
+}
 finally{
  await context?.close().catch(e=>{fatal ||= e;});await dispatcher?.close({stopped:await shouldStop()}).catch(e=>{fatal ||= e;console.error(`[Redis收尾] ${e.code||'ERROR'}`);});
  await remoteControl?.close(fatal?'exit_unconfirmed':'collector_stopped').catch(()=>{fatal ||= new Error('REMOTE_CONTROL_FINAL_ACK_UNAVAILABLE');});

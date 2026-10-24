@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { stableId } from './schema.mjs';
-import { visibleAny } from './xhs-browser-state.mjs';
+import {assertPlatformAccess} from './platform-access.mjs';
 
 export function postsReady(counts, expectedTotal) {
   return Number(expectedTotal) > 0 && counts?.total === expectedTotal
@@ -46,11 +46,8 @@ export function parseAuthorMetrics(body) {
 }
 
 export async function assertAuthorAccessible(page, authorId = null) {
+  await assertPlatformAccess(page,'小红书');
   if (page.isClosed()) throw new Error('STOP_BROWSER_CLOSED：作者采集页已关闭');
-  const body=await page.locator('body').innerText({timeout:5000});
-  if (/安全验证|滑块验证|安全限制|访问频率过快|访问频繁|操作频繁|请完成验证|网络环境存在风险|300013/.test(body))
-    throw new Error('STOP_SECURITY_CHALLENGE：'+body.slice(Math.max(0,body.search(/安全验证|滑块验证|安全限制|访问频率过快|访问频繁|操作频繁|请完成验证|网络环境存在风险|300013/)-60),body.search(/安全验证|滑块验证|安全限制|访问频率过快|访问频繁|操作频繁|请完成验证|网络环境存在风险|300013/)+300));
-  if (await visibleAny(page,'.login-container,.login-modal')) throw new Error('STOP_LOGIN_REQUIRED：作者阶段需要人工登录');
   if (await page.getByText('当前笔记暂时无法浏览',{exact:true}).isVisible().catch(()=>false))
     throw new Error('STOP_AUTHOR_UNAVAILABLE：作者页访问受限；停止本节点，不影响帖子状态');
   if(authorId && !validAuthorUrl(page.url(),authorId))

@@ -164,7 +164,7 @@ foreach ($task in $queue.tasks) {
     $ks = [ordered]@{keyword=$allowedKeyword;status='running';completionSchemaVersion=$CompletionSchemaVersion;startedAt=(Get-Date).ToString('o');outputDir=$outDir;mysql=[ordered]@{status='pending'}}
     $salvage = $null
     $salvageAttempted = $false
-    $salvageParameters = @{Python=$python;Node=$node;Collector=$collector;Enricher=$enricher;Postprocessor=$post;Importer=$importer;OutputDir=$outDir;StateDb=$stateDb;Keyword=$allowedKeyword;CollectComments=[bool]$task.collectComments;DatabaseEnabled=$dbEnabled}
+    $salvageParameters = @{Python=$python;Node=$node;Collector=$collector;Enricher=$enricher;Postprocessor=$post;Importer=$importer;OutputDir=$outDir;StateDb=$stateDb;Keyword=$allowedKeyword;CollectComments=[bool]$task.collectComments;DatabaseEnabled=$dbEnabled;StopFile=$stopFile}
     Write-JsonAtomic $ks $keywordStatusPath 8
     try {
       $raw=Join-Path $outDir 'ods_social_media_post_channels.jsonl'; $enrich=Join-Path $outDir 'browser_enrichment.jsonl'; $final=Join-Path $outDir 'ods_social_media_post_channels_final.jsonl'
@@ -175,17 +175,14 @@ foreach ($task in $queue.tasks) {
         Write-Host "[$($task.id)] Previous graceful stop was already imported; resuming directly from SQLite checkpoint." -ForegroundColor Green
       } elseif ($oldKeyword -and (Test-Path $stateDb)) {
         Write-Host "[$($task.id)] Recovering committed rows from the previous interrupted run..." -ForegroundColor Yellow
-        & $python $collector export-ods --output-dir $outDir --state-db $stateDb --keyword $allowedKeyword; if ($LASTEXITCODE -ne 0) { throw "recovery export exit $LASTEXITCODE" }
-        if ((Test-Path $raw) -and (Get-Item $raw).Length -gt 0) {
-          $recoverEnrichArgs=@($enricher,$raw,$enrich); if ($task.collectComments) {$recoverEnrichArgs += '--comments'}; & $node @recoverEnrichArgs; if ($LASTEXITCODE -ne 0) {throw "recovery enricher exit $LASTEXITCODE"}
-          $recoverPostArgs=@($post,$raw,$enrich,$final); if ($task.collectComments) {$recoverPostArgs += '--comments'}; & $node @recoverPostArgs; if ($LASTEXITCODE -ne 0) {throw "recovery postprocess exit $LASTEXITCODE"}
-          if ($dbEnabled) {
-            $recoverCommentFile=Join-Path $outDir 'ods_social_media_comment_channels_final.jsonl'; $recoverImportArgs=@($importer,'--posts',$final,'--status',(Join-Path $outDir 'mysql_import_status.json')); if ($task.collectComments -and (Test-Path $recoverCommentFile)) {$recoverImportArgs += @('--comments',$recoverCommentFile)}
-            & $node @recoverImportArgs; if ($LASTEXITCODE -ne 0) {throw "recovery mysql import exit $LASTEXITCODE"}
-            $ks.mysql=Get-Content (Join-Path $outDir 'mysql_import_status.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-          }
-          Write-Host "[$($task.id)] Previous committed rows recovered. Resuming collection." -ForegroundColor Green
-        }
+        # Reuse the same bounded import path. Its failure must not fall through
+        # to a second salvage/import (and another complete standby window).
+        $salvageAttempted=$true
+        $salvage=Invoke-KeywordCheckpointSalvage @salvageParameters
+        $ks.salvage=$salvage;$ks.mysql=$salvage.mysql
+        if(-not $salvage.success){throw "Previous checkpoint recovery failed at $($salvage.stage); existing data retained."}
+        $salvageAttempted=$false
+        Write-Host "[$($task.id)] Previous committed rows recovered. Resuming collection." -ForegroundColor Green
       }
       $collectArgs=@('collect-live','--input',$taskFile,'--config',$config,'--cutoff',$queue.cutoff,'--max-results',[string]$effectiveMaxResults,'--state-db',$stateDb,'--screenshots',$screens,'--keyword',$allowedKeyword,'--stop-file',$stopFile)
       if ($task.collectComments) { $collectArgs += '--comments' }

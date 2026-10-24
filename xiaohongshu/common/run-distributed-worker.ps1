@@ -65,9 +65,8 @@ try {
   $env:XHS_DISPATCH=$Dispatch
   $env:XHS_SKIP_IMPORT=if($ExportOnly){'true'}else{'false'}
   $env:XHS_SUPERVISOR_STOP_FILE=$SupervisorStop
-  # Clear a previous run's manual stop before preflight, not afterwards.
-  # A new stop requested during preflight/authentication must remain effective.
-  if($Mode -ne 'check'){Remove-Item -LiteralPath $SupervisorStop -Force -ErrorAction SilentlyContinue}
+  # Preserve manual/remote/protection stops. The authenticated gate below may
+  # archive only an idle node's verified control-channel failure latch.
   & $Node 'src\run-worker.mjs' '--mode' 'check' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase
   if($LASTEXITCODE -ne 0){throw 'Environment preflight failed; collection not started.'}
   if($Mode -eq 'check'){exit 0}
@@ -114,7 +113,7 @@ try {
     if(-not $env:MYSQL_USER -or -not $env:MYSQL_PASSWORD){throw 'MySQL credentials are required.'}
   }
   if($Dispatch -eq 'redis' -and -not $ExportOnly){
-    & $Node (Join-Path $Common 'src\remote-stop-control.mjs') --action gate --root $Common --worker-root $Worker
+    & $Node (Join-Path $Common 'src\remote-stop-control.mjs') --action gate --root $Common --worker-root $Worker --recover-control-failure yes
     if($LASTEXITCODE -ne 0){throw 'Remote stop hold or control unavailable. Collection not started.'}
     Start-MonitorSupervisor
   }

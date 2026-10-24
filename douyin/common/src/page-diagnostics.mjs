@@ -3,7 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import os from 'node:os';
-export const DIAGNOSTIC_VERSION='page-diagnostics-20261019-v1';
+import {inspectPlatformAccess} from './platform-access.mjs';
+export const DIAGNOSTIC_VERSION='page-diagnostics-20261021-search-v2';
 
 export function safeUrl(value) {
   try {
@@ -55,7 +56,11 @@ export function diagnosticReasons(evidence) {
   const layoutFailure=/^layout_(?:click_failed|not_confirmed)$/.test(evidence.stage||'')
     || evidence.errors?.some(error=>/STOP_SEARCH_LAYOUT_UNCONFIRMED/.test(error.message||''));
   if(evidence.closed)reasons.push('browser_page_closed');
+  if(evidence.access?.kind)reasons.push('platform_'+evidence.access.kind+'_required');
   if(evidence.context?.matches===false)reasons.push('search_url_keyword_mismatch');
+  if(evidence.errors?.some(error=>/SEARCH_INITIAL_RESULTS_NOT_READY/.test(error.message||'')))reasons.push('search_initial_results_not_ready');
+  if(evidence.errors?.some(error=>/SEARCH_INITIAL_RESPONSE_FAILED/.test(error.message||'')))reasons.push('search_initial_response_failed');
+  if(evidence.details?.searchReadiness?.dom?.visibleFrames?.length)reasons.push('visible_frame_present_not_classified');
   const controls=evidence.dom?.singleColumnControls;
   if(evidence.platform==='抖音'&&layoutFailure&&Array.isArray(controls)){
     if(!controls.length)reasons.push('single_column_control_not_found');
@@ -73,10 +78,11 @@ export function diagnosticReasons(evidence) {
 function contextFor(url,platform,keyword) {
   try{
     const u=new URL(url);
+    const douyinRoute=u.pathname.match(/^\/(?:jingxuan\/)?search\/(.+)$/);
     const current=platform==='小红书'?u.searchParams.get('keyword'):
-      u.pathname.startsWith('/search/')?decodeURIComponent(u.pathname.slice(8)):null;
+      douyinRoute?decodeURIComponent(douyinRoute[1]):null;
     const route=platform==='小红书'?/(^|\.)xiaohongshu\.com$/i.test(u.hostname)&&/^\/search_result\/?$/.test(u.pathname):
-      /(^|\.)douyin\.com$/i.test(u.hostname)&&u.pathname.startsWith('/search/')&&!u.searchParams.has('modal_id');
+      /(^|\.)douyin\.com$/i.test(u.hostname)&&Boolean(douyinRoute)&&!u.searchParams.has('modal_id');
     return {matches:Boolean(route&&current===keyword),observedKeyword:safeText(current),expectedKeyword:safeText(keyword)};
   }catch{return {matches:false,observedKeyword:null,expectedKeyword:safeText(keyword)};}
 }
@@ -103,6 +109,7 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
         computer:os.hostname(),pid:process.pid,stage,url:safeUrl(rawUrl),closed:!page||page.isClosed(),
         context:contextFor(rawUrl,platform,keyword),errors:diagnosticError(error),details:safeValue(details)};
       if(!evidence.closed){
+        try{evidence.access=await bounded(()=>inspectPlatformAccess(page,platform));}catch{}
         try{
           evidence.dom=await bounded(()=>page.evaluate(()=>{
             const visible=el=>{
@@ -125,6 +132,10 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
               cards:{mounted:cards.length,visible:cards.filter(visible).length,uniqueIdCards,xhsMounted:xhs.length,xhsVisible:xhs.filter(visible).length},
               detailVisible:[...document.querySelectorAll('#noteContainer,.note-container,[data-e2e="modal-video-container"]')].some(visible),
               verificationFrameVisible:[...document.querySelectorAll('iframe#nocaptcha-container,iframe[src*="rc-verifycenter"]')].some(visible),
+              visibleFrames:[...document.querySelectorAll('iframe')].filter(visible).slice(0,8).map(el=>{
+                const b=el.getBoundingClientRect();let origin='unknown';try{origin=new URL(el.getAttribute('src')||'about:blank',location.href).origin;}catch{}
+                return {origin,width:Math.round(b.width),height:Math.round(b.height)};
+              }),
               visibleDialogs:[...document.querySelectorAll('[role="dialog"]')].filter(visible).slice(0,8).map(summary)};
           }));
           evidence.dom.singleColumnControls=await bounded(()=>page.getByText('单列',{exact:true}).evaluateAll(nodes=>nodes.slice(-30).map((el,index)=>{

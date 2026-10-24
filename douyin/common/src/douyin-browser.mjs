@@ -2,6 +2,7 @@ import {extractId} from './schema.mjs';
 import {commentPause,waitForPacing} from './collection-pacing.mjs';
 import {aggregateCommentThreads,commentNodesFromResult} from './comment-threads.mjs';
 import {searchScrollDom} from './search-scroll.mjs';
+import {assertPlatformAccess,guardedPlatformAction} from './platform-access.mjs';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function searchCard(page,id){
  if(!/^\d{15,22}$/.test(id||''))throw new Error('SEARCH_CARD_ID_INVALID');
@@ -57,60 +58,188 @@ export async function clickCommentControl(page,scope,{timeoutMs=4000}={}) {
  throw new Error('COMMENTS_CONTROL_NOT_FOUND：未定位当前帖子的评论入口，不等待错误面板');
 }
 export const searchUrl=keyword=>`https://www.douyin.com/search/${encodeURIComponent(keyword)}`;
-export async function navigateSearch(page,keyword,{shouldStop,timeoutMs=45000,settleMs=2500,retryDelaysMs=[15000,30000],allowManualLogin=false,onObservation=()=>{}}={}) {
- // Only retry the same ordinary search navigation, within this existing lease.
- // No direct article requests, proxy changes, retry-budget refunds or CAPTCHA retries.
+export function searchPageKeyword(url){
+ try{
+  const u=new URL(url),route=u.pathname.match(/^\/(?:jingxuan\/)?search\/(.+)$/);
+  return /(^|\.)douyin\.com$/.test(u.hostname)&&route&&!u.searchParams.has('modal_id')?decodeURIComponent(route[1]):null;
+ }catch{return null;}
+}
+function searchPageMatches(url,keyword){
+ return searchPageKeyword(url)===keyword;
+}
+function searchRequestKind(request,keyword){
+ try{
+  const u=new URL(request.url());if(!/(^|\.)douyin\.com$/.test(u.hostname))return null;
+  if(request.isNavigationRequest()&&searchPageMatches(u.href,keyword))return 'search_document';
+  if(!/\/general\/search(?:\/|$)/.test(u.pathname))return null;
+  let value=u.searchParams.get('keyword');
+  if(value==null){const body=request.postData()||'';try{value=JSON.parse(body).keyword;}catch{value=new URLSearchParams(body).get('keyword');}}
+  return value===keyword?'search_api':null;
+ }catch{return null;}
+}
+async function visibleSearchControl(groups,{shouldStop,timeoutMs,errorCode}){
+ const deadline=Date.now()+timeoutMs;
+ do{
+  await waitForPacing(0,{shouldStop});
+  for(const group of groups){
+   const visible=[];
+   for(let i=0;i<await group.count();i++){const control=group.nth(i);if(await control.isVisible()&&await control.isEnabled())visible.push(control);}
+   if(visible.length===1)return visible[0];
+   if(visible.length>1)throw new Error(`${errorCode}：存在多个可见控件，禁止猜测点击`);
+  }
+  await waitForPacing(Math.min(200,Math.max(0,deadline-Date.now())),{shouldStop});
+ }while(Date.now()<deadline);
+ throw new Error(`${errorCode}：未找到唯一可见的搜索控件，保留断点`);
+}
+export async function dismissRememberLoginPrompt(page,{shouldStop,observation}={}){
+ await waitForPacing(0,{shouldStop});await assertAccess(page);
+ // This optional site prompt is not a login/CAPTCHA gate. Only cancel the
+ // specifically observed prompt; never save credentials or remove a mask.
+ const dialog=page.locator('#trust-logout-dialog');
+ if(await dialog.count()!==1||!await dialog.isVisible())return false;
+ if(!/是否保存登录信息/.test(await dialog.innerText()))return false;
+ const cancel=dialog.getByText('取消',{exact:true});
+ if(await cancel.count()!==1||!await cancel.isVisible()||!await cancel.isEnabled())return false;
+ await cancel.click({timeout:4000,noWaitAfter:true});
+ await dialog.waitFor({state:'hidden',timeout:4000});
+ await waitForPacing(0,{shouldStop});await assertAccess(page);
+ if(observation)observation.optionalLoginPromptCancelled=true;
+ console.log('[搜索弹窗] 已正常点击“取消”关闭保存登录信息提示；未操作登录或安全验证');
+ return true;
+}
+async function searchUiAction(page,action,options){
+ await dismissRememberLoginPrompt(page,options);
+ try{return await guardedPlatformAction(page,'抖音',action,{report:accessIncidentReporter});}
+ catch(error){
+  // Handle a prompt mounted between the precheck and the ordinary click.
+  // Unknown overlays and genuine security gates remain intact.
+  if(await dismissRememberLoginPrompt(page,options))return guardedPlatformAction(page,'抖音',action,{report:accessIncidentReporter});
+  throw error;
+ }
+}
+async function searchFromInput(page,keyword,{shouldStop,timeoutMs,settleMs,typingDelayMs,observation}){
+ await waitForPacing(0,{shouldStop});
+ if(page.isClosed())throw new Error('STOP_BROWSER_CLOSED');
+ let bootstrap=false;
+ try{bootstrap=!/(^|\.)douyin\.com$/.test(new URL(page.url()).hostname);}catch{bootstrap=true;}
+ if(!bootstrap){
+  try{await assertAccess(page);}catch(error){
+   if(!/^STOP_SEARCH_GATEWAY_ERROR/.test(error.message))throw error;
+   bootstrap=true;observation.bootstrapReason='gateway_document';
+  }
+ }
+ if(bootstrap){
+  // Only bootstrap the normal site home. Search URLs are NEVER opened here,
+  // including gateway recovery. Login/verification protections stay intact.
+  observation.stage='home';
+  const response=await page.goto('https://www.douyin.com/',{waitUntil:'domcontentloaded',timeout:timeoutMs});
+  observation.homeHttpStatus=response?.status()??null;
+  await waitForPacing(settleMs,{shouldStop});
+  await assertAccess(page);
+  if([502,503,504].includes(observation.homeHttpStatus))throw new Error('STOP_SEARCH_GATEWAY_ERROR：网站首页网关响应异常');
+ }
+ await assertAccess(page);observation.stage='search_input';
+ let inputVerified=false;observation.inputAttempts=[];
+ // The real home page can hydrate/remount after its input becomes visible.
+ // Re-resolve and retype at most once if hydration dropped characters. Never
+ // click search with a truncated word, and never turn this into submit retries.
+ for(let attempt=0;attempt<2;attempt++){
+  const input=await visibleSearchControl([
+   page.locator('[data-e2e="searchbar-input"]'),
+   page.locator('input[name="keyword"],input[placeholder*="搜索"]'),
+  ],{shouldStop,timeoutMs,errorCode:'STOP_SEARCH_INPUT_UNAVAILABLE'});
+  await searchUiAction(page,async()=>{
+   await input.click({timeout:Math.min(timeoutMs,4000)});await input.fill('',{timeout:Math.min(timeoutMs,4000)});
+  },{shouldStop,observation});
+  if(await input.inputValue()!=='')throw new Error('STOP_SEARCH_INPUT_NOT_CLEARED');
+  observation.inputCleared=true;
+  await waitForPacing(120,{shouldStop});
+  await input.pressSequentially(keyword,{delay:typingDelayMs,timeout:timeoutMs});
+  await waitForPacing(250,{shouldStop});await assertAccess(page);
+  inputVerified=await input.inputValue()===keyword;
+  observation.inputAttempts.push({attempt:attempt+1,matched:inputVerified});
+  if(inputVerified)break;
+  if(attempt===0)await waitForPacing(500,{shouldStop});
+ }
+ if(!inputVerified)throw new Error('STOP_SEARCH_INPUT_MISMATCH');
+ const button=await visibleSearchControl([
+  page.locator('[data-e2e="searchbar-button"]'),
+  page.getByRole('button',{name:'搜索',exact:true}),
+  page.getByText('搜索',{exact:true}),
+ ],{shouldStop,timeoutMs,errorCode:'STOP_SEARCH_SUBMIT_UNAVAILABLE'});
+ const requests=new Map();let responseEvidence=null,gatewayStatus=null;
+ // Track requests created AFTER input and before the normal search click.
+ // A late response from a previous keyword (even the same word) is not proof.
+ const onRequest=request=>{const kind=searchRequestKind(request,keyword);if(kind)requests.set(request,kind);};
+ const onResponse=response=>{
+  const kind=requests.get(response.request());if(!kind)return;
+  const status=response.status();observation.httpStatus=status;
+  if([502,503,504].includes(status))gatewayStatus=status;
+  if(status>=200&&status<300)responseEvidence={kind,httpStatus:status};
+ };
+ page.on('request',onRequest);page.on('response',onResponse);
+ try{
+  observation.stage='search_submit';observation.submittedAt=new Date().toISOString();
+  await waitForPacing(0,{shouldStop});
+  await searchUiAction(page,()=>button.click({timeout:Math.min(timeoutMs,4000),noWaitAfter:true}),{shouldStop,observation});
+  const deadline=Date.now()+timeoutMs;
+  do{
+   await waitForPacing(0,{shouldStop});await assertAccess(page);
+   if(gatewayStatus){observation.httpStatus=gatewayStatus;throw new Error('STOP_SEARCH_GATEWAY_ERROR：本次搜索响应网关异常');}
+   if(responseEvidence&&searchPageMatches(page.url(),keyword)){
+    // Re-resolve the input: a normal full document navigation may remount it.
+    const current=page.locator('[data-e2e="searchbar-input"],input[name="keyword"],input[placeholder*="搜索"]').filter({visible:true});
+    if(await current.count()===1&&await current.inputValue()===keyword){
+     await waitForPacing(settleMs,{shouldStop});await assertAccess(page);
+     if(gatewayStatus)throw new Error('STOP_SEARCH_GATEWAY_ERROR：本次搜索响应网关异常');
+     if(!searchPageMatches(page.url(),keyword))throw new Error('STOP_SEARCH_CONTEXT_LOST');
+     observation.response=responseEvidence;observation.httpStatus=responseEvidence.httpStatus;observation.stage='verified';return;
+    }
+   }
+   await waitForPacing(Math.min(200,Math.max(0,deadline-Date.now())),{shouldStop});
+  }while(Date.now()<deadline);
+  throw new Error('STOP_SEARCH_SUBMIT_UNCONFIRMED：未确认新词搜索框、结果页和本次搜索响应，禁止沿用旧结果');
+ }finally{page.off('request',onRequest);page.off('response',onResponse);}
+}
+export async function navigateSearch(page,keyword,{shouldStop,timeoutMs=45000,settleMs=2500,typingDelayMs=65,retryDelaysMs=[15000,30000],allowManualLogin=false,onObservation=()=>{}}={}) {
+ // Ordinary UI search only, within the existing lease and bounded retry budget.
+ // No direct search/article requests, proxy changes or CAPTCHA retries.
  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>2||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>60000))throw new Error('SEARCH_GATEWAY_RETRY_BUDGET_INVALID');
- const audit={keyword,attempts:[],maxRetries:retryDelaysMs.length};
+ if(typeof keyword!=='string'||!keyword.trim())throw new Error('SEARCH_KEYWORD_INVALID');
+ if(!Number.isFinite(timeoutMs)||timeoutMs<=0||!Number.isFinite(typingDelayMs)||typingDelayMs<0||typingDelayMs>1000)throw new Error('SEARCH_UI_OPTIONS_INVALID');
+ const audit={keyword,method:'search_box',attempts:[],maxRetries:retryDelaysMs.length};
  for(let attempt=0;attempt<=retryDelaysMs.length;attempt++){
   await waitForPacing(0,{shouldStop});
-  const observation={attempt:attempt+1,at:new Date().toISOString(),httpStatus:null};
+  const observation={attempt:attempt+1,at:new Date().toISOString(),httpStatus:null,method:'search_box'};
   try{
-   const response=await page.goto(searchUrl(keyword),{waitUntil:'domcontentloaded',timeout:timeoutMs});
-   observation.httpStatus=response?.status()??null;
-   await waitForPacing(settleMs,{shouldStop});
-   await assertAccess(page);
-   if([502,503,504].includes(observation.httpStatus))throw new Error('STOP_SEARCH_GATEWAY_ERROR：搜索主文档网关响应异常');
-   observation.status='ready';audit.attempts.push(observation);onObservation(audit);return audit;
+   await searchFromInput(page,keyword,{shouldStop,timeoutMs,settleMs,typingDelayMs,observation});
+   console.log(`[搜索框检索] ${keyword}：已清空输入并点击搜索，结果页与本次HTTP响应已确认；数据和排序另行核验`);
+   observation.status='ready';observation.readiness='transport_only';audit.attempts.push(observation);onObservation(audit);return audit;
   }catch(error){
    if(allowManualLogin&&/^STOP_LOGIN_REQUIRED(?:：|:|$)/.test(String(error.message))){
-    observation.status='awaiting_manual_login';audit.attempts.push(observation);onObservation(audit);return audit;
+    observation.status='awaiting_manual_login';audit.awaitingManualLogin=true;audit.attempts.push(observation);onObservation(audit);return audit;
    }
    const gateway=/^STOP_SEARCH_GATEWAY_ERROR(?:：|:|$)/.test(String(error.message));
-   observation.status=gateway?'gateway_error':'stopped';observation.error=String(error.message);
+   const uiTimeout=error.name==='TimeoutError'&&['search_input','search_submit'].includes(observation.stage);
+   observation.status=gateway?'gateway_error':uiTimeout?'ui_timeout':'stopped';observation.error=String(error.message);
    audit.attempts.push(observation);onObservation(audit);
-   if(!gateway||attempt===retryDelaysMs.length)throw Object.assign(error,{searchNavigation:audit});
-   console.warn(`[搜索网关退避] ${keyword}：第${attempt+1}次网关错误，等待${retryDelaysMs[attempt]/1000}秒后仅重试原搜索；最多${retryDelaysMs.length}次`);
+   if((!gateway&&!uiTimeout)||attempt===retryDelaysMs.length)throw Object.assign(error,{searchNavigation:audit});
+   console.warn(`[搜索有限退避] ${keyword}：第${attempt+1}次${gateway?'网关错误':'控件超时'}，等待${retryDelaysMs[attempt]/1000}秒后通过搜索框重试原词；最多${retryDelaysMs.length}次，不强制穿透遮挡`);
    await waitForPacing(retryDelaysMs[attempt],{shouldStop});
   }
  }
 }
 let accessIncidentReporter=null;
 export function setAccessIncidentReporter(reporter){accessIncidentReporter=reporter;}
-async function stopForRestriction(message){
- if(accessIncidentReporter)await accessIncidentReporter(message);
- throw new Error(message);
-}
 export async function assertAccess(page) {
- if(page.isClosed())throw new Error('STOP_BROWSER_CLOSED');
- // The verification UI lives in a cross-origin iframe: body.innerText alone
- // cannot see it. A hidden, preloaded frame is not an active challenge.
- const verification=page.locator('iframe#nocaptcha-container,iframe[src*="rc-verifycenter"]');
- for(let i=0;i<await verification.count();i++)if(await verification.nth(i).isVisible())await stopForRestriction('STOP_PLATFORM_RESTRICTION：出现验证弹窗，请人工处理，不自动重试');
- const text=await page.locator('body').innerText({timeout:5000});
- if(/(?:502\s+Bad Gateway|503\s+Service Unavailable|504\s+Gateway Time-out)/i.test(text))throw new Error('STOP_SEARCH_GATEWAY_ERROR：网站网关暂时不可用，保留断点，不冒充搜索无结果');
- if(/请完成.*验证|拖动.*滑块|安全验证|验证码验证/.test(text))await stopForRestriction('STOP_PLATFORM_RESTRICTION：出现验证码或安全验证，请人工处理');
- if(/操作频繁|访问过于频繁|暂时无法浏览/.test(text))await stopForRestriction('STOP_PLATFORM_RESTRICTION：访问频繁，自动冷却等待');
- if(/登录后即可搜索|登录后查看更多|登录后查看评论/.test(text))await stopForRestriction('STOP_LOGIN_REQUIRED：请人工登录');
+ await assertPlatformAccess(page,'抖音',{report:accessIncidentReporter});
 }
 async function searchCheck(page,shouldStop){
  if(await shouldStop?.())throw new Error('STOP_REQUESTED：搜索列表准备期间已安全停止');
  await assertAccess(page);
 }
 export async function searchEndUi(page,keyword){
- const url=new URL(page.url());
- if(url.pathname!==`/search/${encodeURIComponent(keyword)}`&&decodeURIComponent(url.pathname)!==`/search/${keyword}`)return {visible:false};
- if(url.searchParams.has('modal_id'))return {visible:false};
+ if(!searchPageMatches(page.url(),keyword))return {visible:false};
  const markers=page.getByText(/^(?:暂时没有更多了|没有更多了|暂无搜索结果|没有找到相关结果)$/,{exact:true});
  for(let i=0;i<await markers.count();i++){
   const marker=markers.nth(i);if(!await marker.isVisible())continue;
@@ -125,9 +254,8 @@ export async function searchEndUi(page,keyword){
  return {visible:false};
 }
 export async function scrollSearchResults(page,{keyword}={}){
- const url=new URL(page.url());
- if(!url.pathname.startsWith('/search/')||url.searchParams.has('modal_id')
-  ||(keyword!=null&&decodeURIComponent(url.pathname.slice('/search/'.length))!==keyword))throw new Error('STOP_SEARCH_SCROLL_CONTEXT_LOST');
+ const current=searchPageKeyword(page.url());
+ if(current===null||(keyword!=null&&current!==keyword))throw new Error('STOP_SEARCH_SCROLL_CONTEXT_LOST');
  await assertAccess(page);
  let state=await page.evaluate(searchScrollDom);
  if(state.reason==='detail_modal_open')throw new Error('STOP_SEARCH_SCROLL_MODAL_OPEN');
@@ -144,17 +272,51 @@ export async function scrollSearchResults(page,{keyword}={}){
  // These are movement diagnostics, never independent search-end evidence.
  return state;
 }
-export async function waitForInitialSearch(page,observer,{shouldStop,timeoutMs=20000,pollMs=500}={}){
+export async function waitForInitialSearch(page,observer,{shouldStop,timeoutMs=45000,pollMs=500,after=0,keyword:expectedKeyword,documentVerified=false}={}){
  // During hydration the layout controls can accept a click yet do nothing.
  // Observe actual search data before attempting the layout switch.
- const deadline=Date.now()+timeoutMs;
+ const started=Date.now(),deadline=started+timeoutMs;let waitingLogged=false;
+ const current=p=>p.keyword===searchPageKeyword(page.url())&&(!after||p.requestStartedAt>=after);
+ const diagnostic=async()=>({keyword:searchPageKeyword(page.url()),elapsedMs:Date.now()-started,
+  timeoutMs,parsedPosts:observer.awemes.size,
+  matchingSearchPages:(observer.searchPages||[]).filter(current).length,
+  matchingSearchItems:(observer.searchPages||[]).filter(current).reduce((n,p)=>n+p.noteIds.length,0),
+  observerErrorCodes:(observer.failures||[]).slice(-3).map(e=>/^[A-Z_]{3,80}$/.test(e)?e:'OBSERVER_ERROR_REDACTED'),
+  responseFailures:(observer.searchFailures||[]).filter(current).map(p=>({
+   http:p.http??null,statusCode:p.statusCode??null,error:p.error??null,
+  })).slice(-3),
+  // Counts and iframe origins only: no cookies, body text, query or QR data.
+  dom:await page.evaluate(()=>{
+   const shown=el=>{const b=el.getBoundingClientRect();return b.width>0&&b.height>0&&getComputedStyle(el).visibility!=='hidden'&&getComputedStyle(el).display!=='none';};
+   const cards=[...document.querySelectorAll('.search-result-card')];
+   return {readyState:document.readyState,mountedCards:cards.length,visibleCards:cards.filter(shown).length,
+    visibleFrames:[...document.querySelectorAll('iframe')].filter(shown).slice(0,8).map(el=>{
+     const b=el.getBoundingClientRect();let origin='unknown';try{origin=new URL(el.getAttribute('src')||'about:blank',location.href).origin;}catch{}
+     return {origin,width:Math.round(b.width),height:Math.round(b.height)};
+    })};
+  }).catch(()=>({unavailable:true}))});
  do{
   await searchCheck(page,shouldStop);await observer.flush();
-  if(observer.awemes.size||(await visibleCards(page)).length)return;
-  if(observer.searchPages?.some(p=>p.hasMore===false&&p.noteIds.length===0)&&(await searchEndUi(page,decodeURIComponent(new URL(page.url()).pathname.slice('/search/'.length)))).visible)return;
+  const keyword=searchPageKeyword(page.url());
+  if(expectedKeyword!=null&&keyword!==expectedKeyword)throw new Error('STOP_SEARCH_CONTEXT_LOST：搜索准备期间关键词改变');
+  const failure=(observer.searchFailures||[]).filter(current).at(-1);
+  const pages=(observer.searchPages||[]).filter(current),success=pages.at(-1);
+  if(failure&&(!success||failure.at>success.at)){
+   const details=await diagnostic();
+   console.warn('[搜索响应失败] '+JSON.stringify(details));
+   throw Object.assign(new Error('SEARCH_INITIAL_RESPONSE_FAILED：搜索响应失败，非空结果结束；保留断点'),{searchReadiness:details});
+  }
+  const hasPosts=after?pages.some(p=>p.noteIds.length>0):observer.awemes.size>0;
+  const cards=(await visibleCards(page)).length;
+  if((hasPosts||cards)&&(!after||success||(documentVerified&&cards)))return {hasPosts:true};
+  if(keyword!==null&&pages.some(p=>p.hasMore===false&&p.noteIds.length===0)&&(await searchEndUi(page,keyword)).visible)return {hasPosts:false};
+  if(!waitingLogged&&Date.now()-started>=20000){
+   waitingLogged=true;console.log('[搜索加载等待] '+JSON.stringify(await diagnostic()));
+  }
   await pause(pollMs);
  }while(Date.now()<deadline);
- throw new Error('SEARCH_INITIAL_RESULTS_NOT_READY：搜索内容尚未加载，禁止把空DOM当年度完成');
+ const details=await diagnostic();console.warn('[搜索加载超时] '+JSON.stringify(details));
+ throw Object.assign(new Error('SEARCH_INITIAL_RESULTS_NOT_READY：搜索内容尚未加载，禁止把空DOM当年度完成'),{searchReadiness:details});
 }
 export async function ensureSingleColumn(page,{shouldStop,timeoutMs=10000,pollMs=500,onDiagnostic}={}){
  const observe=async(stage,details={},error=null)=>{try{await onDiagnostic?.({stage,details,error});}catch{/* Diagnostics never change the collection decision. */}};
@@ -187,8 +349,8 @@ export async function ensureSingleColumn(page,{shouldStop,timeoutMs=10000,pollMs
  throw error;
 }
 export async function selectLatest(page,observer,keyword,options={}) {
- await waitForInitialSearch(page,observer,options);
- if(!(await searchEndUi(page,keyword)).visible||observer.awemes.size)await ensureSingleColumn(page,options);
+ const readiness=await waitForInitialSearch(page,observer,{...options,keyword});
+ if(!(await searchEndUi(page,keyword)).visible||readiness.hasPosts)await ensureSingleColumn(page,options);
  const start=Date.now();
  const filter=page.getByText('筛选',{exact:true});
  await filter.last().hover({timeout:10000});
@@ -212,6 +374,47 @@ export async function selectLatest(page,observer,keyword,options={}) {
   await pause(500);
  }
  throw new Error('STOP_LATEST_SORT_UNCONFIRMED：未观察到最新排序请求，保留断点');
+}
+
+export const SEARCH_PREPARATION_VERSION='douyin-search-readiness-20261021-v1';
+function retryableInitialSearch(error){
+ if(/^SEARCH_INITIAL_RESULTS_NOT_READY(?:：|:|$)/.test(error.message))return true;
+ if(!/^SEARCH_INITIAL_RESPONSE_FAILED(?:：|:|$)/.test(error.message))return false;
+ const failure=error.searchReadiness?.responseFailures?.at(-1);
+ // HTTP200 with a nonzero application code may be a platform restriction.
+ // Never repeatedly submit it as an ordinary loading/transport failure.
+ return failure?.statusCode==null&&([502,503,504].includes(failure?.http)||['DOUYIN_RESPONSE_BODY_TIMEOUT'].includes(failure?.error));
+}
+export async function selectLatestWithRecovery(page,observer,keyword,{after=0,documentVerified=false,shouldStop,
+ timeoutMs=45000,pollMs=500,navigationOptions={},retryDelaysMs=[15000,30000],onRecovery=()=>{},onDiagnostic}={}){
+ if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>2||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>60000))throw new Error('SEARCH_READINESS_RETRY_BUDGET_INVALID');
+ const audit={version:SEARCH_PREPARATION_VERSION,keyword,maxRetries:retryDelaysMs.length,attempts:[]};
+ for(let attempt=0;attempt<=retryDelaysMs.length;attempt++){
+  await searchCheck(page,shouldStop);
+  const row={attempt:attempt+1,startedAt:new Date().toISOString()};
+  try{
+   if(attempt){
+    // Start a fresh UI submission of this same word. No direct URL, forced
+    // click, cookie clearing, profile restart or task reset.
+    const navigation=await navigateSearch(page,keyword,{...navigationOptions,shouldStop,retryDelaysMs:[]});
+    after=Date.parse(navigation.attempts.at(-1).submittedAt);row.navigation=navigation;
+    documentVerified=navigation.attempts.at(-1).response?.kind==='search_document';
+   }
+   const prepared=await selectLatest(page,observer,keyword,{after,documentVerified,shouldStop,timeoutMs,pollMs,onDiagnostic});
+   row.status='ready';audit.attempts.push(row);audit.exhausted=false;onRecovery(audit);return prepared;
+  }catch(error){
+   row.status='failed';row.errorCode=String(error.message).split(/[：:]/)[0];
+   if(error.searchReadiness)row.readiness=error.searchReadiness;
+   audit.attempts.push(row);
+   const retry=retryableInitialSearch(error)&&attempt<retryDelaysMs.length;
+   audit.exhausted=retryableInitialSearch(error)&&!retry;onRecovery(audit);
+   try{await onDiagnostic?.({stage:retry?'search_readiness_retry':'search_preparation_failed',
+    details:{version:SEARCH_PREPARATION_VERSION,attempt:attempt+1,retrying:retry,readiness:error.searchReadiness},error});}catch{}
+   if(!retry)throw Object.assign(error,{searchPreparationRecovery:audit});
+   console.warn(`[搜索加载重试] ${keyword}：第${attempt+1}次未就绪，等待${retryDelaysMs[attempt]/1000}秒后清空搜索框重搜原词；最多${retryDelaysMs.length}次，不把空DOM当完成`);
+   await waitForPacing(retryDelaysMs[attempt],{shouldStop});
+  }
+ }
 }
 export async function visibleCards(page) {
  const snapshot=await page.locator('.search-result-card').evaluateAll(cards=>{
@@ -307,8 +510,7 @@ export async function restoreSearch(page,keyword,noteId=null) {
  await assertSearchContext(page,keyword);
 }
 export async function assertSearchContext(page,keyword){
- const url=new URL(page.url());
- if(!url.pathname.startsWith('/search/')||decodeURIComponent(url.pathname.slice('/search/'.length))!==keyword||url.searchParams.has('modal_id'))throw new Error('STOP_SEARCH_CONTEXT_LOST：详情关闭未恢复原检索页');
+ if(!searchPageMatches(page.url(),keyword))throw new Error('STOP_SEARCH_CONTEXT_LOST：详情关闭未恢复原检索页');
  if(!(await visibleCards(page)).length)throw new Error('STOP_SEARCH_CONTEXT_LOST：原检索列表不可见');
 }
 export function commentRepairPlan(prior,post){

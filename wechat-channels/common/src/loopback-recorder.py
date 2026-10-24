@@ -15,6 +15,7 @@ import numpy as np
 import soundcard as sc
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audio_capture_guard import growing_wav_peak
+from audio_process_guard import NativeRecorderJob, stop_owned_recorder, cleanup_audio_file
 
 
 MIN_AUDIBLE_PEAK = 0.0005
@@ -94,6 +95,11 @@ def analyze_and_normalize_wav(path: Path, expected_duration: int) -> dict:
 
 
 def record_process_loopback(args) -> int:
+    with NativeRecorderJob() as job:
+        return _record_process_loopback(args, job)
+
+
+def _record_process_loopback(args, job) -> int:
     """Capture the WeChat render process independent of its output endpoint."""
     helper = Path(__file__).with_name("process-loopback-recorder.exe")
     if not helper.exists():
@@ -102,7 +108,7 @@ def record_process_loopback(args) -> int:
         str(helper), str(args.process_id), "includetree", str(Path(args.output).resolve()),
         str(max(1, args.duration) * 1000),
     ]
-    process = subprocess.Popen(
+    process = job.spawn(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -111,13 +117,13 @@ def record_process_loopback(args) -> int:
     try:
         ready_payload = json.loads((ready_line or "").strip())
     except Exception as exc:
-        process.terminate()
+        stop_owned_recorder(process)
         stderr = process.stderr.read() if process.stderr else ""
         raise ProcessLoopbackUnavailable(
             f"微信进程音频回采组件未就绪：{ready_line!r}; {stderr[-1000:]}"
         ) from exc
     if not ready_payload.get("ready"):
-        process.terminate()
+        stop_owned_recorder(process)
         raise ProcessLoopbackUnavailable(f"微信进程音频回采组件初始化失败：{ready_payload}")
     print(json.dumps({
         "event": "loopback_recorder_ready",
@@ -140,7 +146,7 @@ def record_process_loopback(args) -> int:
             fd, probe_name = tempfile.mkstemp(prefix='audio-watchdog-', suffix='.wav', dir=Path(args.output).parent)
             os.close(fd)
             probe_path = Path(probe_name)
-            probe = subprocess.Popen(
+            probe = job.spawn(
                 [str(helper), str(args.process_id), 'includetree', str(probe_path.resolve()), str(int(limit * 1000))],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
@@ -163,18 +169,10 @@ def record_process_loopback(args) -> int:
             time.sleep(0.25)
         stdout, stderr = process.communicate(timeout=5)
     finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate(timeout=3)
-        if probe is not None and probe.poll() is None:
-            probe.terminate()
-            probe.wait(timeout=3)
+        stop_owned_recorder(process)
+        stop_owned_recorder(probe)
         if probe_path is not None:
-            probe_path.unlink(missing_ok=True)
+            cleanup_audio_file(probe_path)
     if process.returncode != 0:
         raise RuntimeError(
             "微信进程音频回采失败："

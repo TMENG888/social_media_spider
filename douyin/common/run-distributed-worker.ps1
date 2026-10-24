@@ -66,6 +66,10 @@ try {
     if($LASTEXITCODE -ne 0){throw 'Worker exited abnormally. Automatic restart is disabled.'}
     if($SingleCycle -or $Test -or (Test-Path -LiteralPath $SupervisorStop)){break}
     $Status=Get-Content -LiteralPath (Join-Path $Worker 'runs\worker_status.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if($Status.operationalHold){
+      Write-Host '[Cycle supervisor] Platform protection recorded; waiting for verified login/recovery before another cycle. No task is acquired while waiting.'
+      continue
+    }
     if($Status.status -eq 'completed' -and $Status.authors.status -eq 'completed'){Write-Host 'All post and author tasks completed.';break}
     $Rest=Get-Random -Minimum 30 -Maximum 61
     $Resume=(Get-Date).AddMinutes($Rest)

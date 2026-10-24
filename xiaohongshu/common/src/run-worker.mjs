@@ -14,7 +14,7 @@ import { loadTaskManifest } from "./redis-task-manifest.mjs";
 import { repairCategoryNull } from "./category-repair.mjs";
 import { repairInvalidArticleLinks } from "./link-repair.mjs";
 import { summarizeWorkerTasks } from "./worker-status.mjs";
-import { collectionFailurePolicy } from "./collection-failure.mjs";
+import { collectionFailurePolicy, collectionNodeFailure } from "./collection-failure.mjs";
 import { runAuthorPhase } from "./run-author-phase.mjs";
 import { verifyTable, mysqlConnectionOptions } from "./import-mysql.mjs";
 import { POST_FIELDS, COMMENT_FIELDS } from "./schema.mjs";
@@ -23,6 +23,7 @@ import { RateLimitCooldown, restrictionKind, cooldownWorkerExit } from "./rate-l
 import { cleanupWorkerAsrMedia } from "./cleanup-worker-asr-media.mjs";
 import {unchangedRetry} from './retry-no-change.mjs';
 import {writeRuntimeStop, recoverOrphanRuntimeStop} from './runtime-stop.mjs';
+import {recoverLocalStorageStop,verifyLocalStorage,isStorageFull} from './local-storage-stop.mjs';
 import {appendDiagnosticEvent} from './page-diagnostics.mjs';
 
 const root = path.resolve(process.env.XHS_WORKER_ROOT || ".");
@@ -222,8 +223,8 @@ const stopFile = path.join(stateRoot, "stop.requested");
 const {RemoteStopControl}=await import('./remote-stop-control.mjs');
 const supervisorStopFile = process.env.XHS_SUPERVISOR_STOP_FILE ? path.resolve(process.env.XHS_SUPERVISOR_STOP_FILE) : null;
 // A launch is not authorization to erase a human, remote, or safety hold.
-// Only a verified timer whose owning process has exited can be archived on
-// startup. Human/remote/safety stops and newer requests remain authoritative.
+// Only verified timer or recovered local-disk markers may be archived under
+// the worker lock. Human/remote/unknown stops remain authoritative.
 let stopSignalCount = 0;
 const requestStop = async (signal) => {
   stopSignalCount += 1;
@@ -306,6 +307,14 @@ function markLifecycle(stage,details={}) {
 }
 await markLifecycle('worker_started');
 try {
+  status.storageStopRecovery=await recoverLocalStorageStop({stopFile,supervisorStopFile,
+    workerId,lockFile,storagePaths:[stateRoot,runsRoot]});
+  if(status.storageStopRecovery.reason!=='not_local_storage_marker'){
+    console.log('[本机存储恢复] '+JSON.stringify(status.storageStopRecovery));
+    await markLifecycle('startup_storage_recovery',status.storageStopRecovery);
+  }
+  if(!status.storageStopRecovery.ready)
+    throw Object.assign(new Error('STOP_REQUESTED：本节点停止保护保留，原因='+status.storageStopRecovery.reason),{code:'STOP_REQUESTED'});
   status.startupStopRecovery = await recoverOrphanRuntimeStop({stopFile,
     supervisorStopFile, workerId, cycleId});
   if (status.startupStopRecovery.reason !== 'no_stop_marker') {
@@ -317,6 +326,9 @@ try {
       + '；未领取任务或访问平台'), {code:'STOP_REQUESTED'});
   if(await exists(stopFile) || supervisorStopFile && await exists(supervisorStopFile))
     throw Object.assign(new Error('STOP_REQUESTED：已有停止标记，未领取任务或访问平台'),{code:'STOP_REQUESTED'});
+  status.storagePreflight=await verifyLocalStorage([stateRoot,runsRoot]);
+  if(!status.storagePreflight.ready)
+    throw Object.assign(new Error('本机磁盘预检失败：'+status.storagePreflight.reason+'；请释放至少2GiB空间并确认目录可写，未领取任务'),{code:'LOCAL_STORAGE_UNAVAILABLE'});
   if(dispatchMode==='redis' && !skipImport){
     remoteControl=await RemoteStopControl.open(root,path.dirname(stateRoot));
     await remoteControl.gate();remoteControl.watch();
@@ -331,7 +343,9 @@ try {
     await cooldown.assertReady();
     stopCooldownMonitor=cooldown.monitor(stopFile,{onStop:error=>{
       cooldownMonitorError=error;
-      console.warn('[共享冷却] 同组节点已暂停或状态不可确认；当前数据收尾后停止');
+      console.warn(isStorageFull(error)?
+        '[本机存储保护] ENOSPC：本节点磁盘空间不足或无法写入状态文件；仅本节点收尾停止，不发布共享冷却':
+        '[平台保护] '+(error.code||'COOLDOWN_STATE_UNAVAILABLE')+'：本节点需人工处理、共享冷却生效或状态不可确认；当前数据收尾后停止');
     }});
   }
   if (dispatchMode === "redis") {
@@ -339,7 +353,7 @@ try {
     status.campaign = dispatcher.campaign;
     if(cooldown){
       dispatcher.cooldown=cooldown;
-      dispatcher.queue.cooldownKey=cooldown.key;
+      cooldown.bindQueue(dispatcher.queue);
     }
   }
   if (!skipImport) {
@@ -500,8 +514,12 @@ try {
       await markLifecycle('preservation_import_finished',{runId,importExitCode:importResult.code});
       console.log(`[数据保全入库] ${workerId}：${task.keyword}，${importResult.code === 0 ? "成功" : `失败（退出码${importResult.code}）`}`);
     }
+    const collectorFailure = collectionNodeFailure(collector);
+    const collectionStatus = collector.status;
+    const collectionError = collector.error || null;
     let taskState = collector.status || (result.code === 0 ? "completed" : "partial_error");
-    if (!skipImport) taskState = importTaskState(taskState, importResult?.code, collectionFailurePolicy(collector.error));
+    if (collectorFailure.stopNode) taskState = collectorFailure.status;
+    if (!skipImport) taskState = importTaskState(taskState, importResult?.code, collectorFailure);
     if (dispatcher?.lost) taskState = "lease_lost";
     const stopping = stopSignalCount > 0 || await exists(stopFile);
     const observation=collector.retryObservation;
@@ -511,7 +529,7 @@ try {
       pendingAsr:collector.asrJobs?.pendingTotal||0});
     let coverage={ok:false,reason:'DB_READBACK_NOT_PERFORMED'};
     if(dispatcher?.volume&&!dispatcher.lost&&!stopping){
-      try{coverage=await dispatcher.volume.read(task.redisTaskId||task.id);if(coverage.ok)taskState='completed';}
+      try{coverage=await dispatcher.volume.read(task.redisTaskId||task.id);if(coverage.ok&&!collectorFailure.stopNode)taskState='completed';}
       catch(error){coverage={ok:false,reason:'DB_READBACK_FAILED',errorCode:error.code||'READBACK_ERROR'};}
     }else if(!skipImport&&importResult?.code===0&&!dispatcher?.lost&&!stopping){
       try{coverage=await verifyCheckpointCoverage({checkpointDb,keyword:task.keyword,scanComplete:collector.searchAcceptance?.ok===true,year:Number(cutoff.slice(0,4)),cutoff,strictMedia:true});}
@@ -524,7 +542,8 @@ try {
     }
     let completed = ["completed","completed_with_skips"].includes(taskState) && (dispatcher?.volume ? coverage.ok===true : skipImport || importResult?.code === 0);
     const record = { workerId, runId, policyVersion: POLICY_VERSION, searchSummaries: collector.searchSummaries || [], taskId: task.id || null, topic: task.topic || null, keyword: task.keyword, projectName: task.projectName || null, collectComments: task.collectComments !== false, startedAt, finishedAt: now(), status: completed ? "completed" : taskState, exitCode: result.code, importExitCode: importResult?.code ?? null, outputDir: taskDir, stateDir, checkpointDb, posts: collector.posts ?? null, commentThreads: collector.commentThreads ?? null, error: collector.error || null };
-    Object.assign(record,{deadLetterNotes:collector.deadLetterNotes||0,collectionCompleteness:collector.collectionCompleteness||null,asrJobs:collector.asrJobs||null,
+    Object.assign(record,{collectionStatus,collectionError,mustStopNode:collectorFailure.stopNode,
+      deadLetterNotes:collector.deadLetterNotes||0,collectionCompleteness:collector.collectionCompleteness||null,asrJobs:collector.asrJobs||null,
       searchAcceptance:collector.searchAcceptance||null,scopeAcceptance:collector.scopeAcceptance||null,coverage,
       firstFailureAt:collector.firstFailureAt||null,pageDiagnostics:collector.pageDiagnostics||null});
     if(completed && taskState==='completed_with_skips')record.status=taskState;
@@ -560,6 +579,15 @@ try {
       console.warn("[安全停止] 已请求安全停止；剩余关键词将在下次启动后继续");
       break;
     }
+    // Do not let reset-once/P80 business completion hide the collector's node
+    // stop decision. Data import and fenced queue disposition have finished.
+    if (collectorFailure.stopNode) {
+      console.warn(`[节点健康停止] ${workerId}：原采集状态=${collectionStatus}，业务状态=${record.status}；已保留原始故障，不领取下一词`);
+      if (!collectorFailure.release) {
+        throw Object.assign(new Error(`NODE_STOP_AFTER_COLLECTION_FAILURE：${collectionError || collectionStatus}；已停止领取后续任务`), {code:'COLLECTION_CONTEXT_FAILURE'});
+      }
+      break;
+    }
     if (!completed) {
       console.warn(`[工作节点进度] 关键词“${task.keyword}”未通过验收（状态=${record.status}），数据已保全；Redis处置=${record.redisDisposition||'未使用Redis'}`);
       const failure = collectionFailurePolicy(record.error);
@@ -570,7 +598,7 @@ try {
     }
     if (task.transitionDelaySeconds) await sleep(Number(task.transitionDelaySeconds) * 1000);
   }
-  if(dispatcher && !skipImport && phase!=='posts' && !await exists(stopFile) && !status.tasks.some(task => ['import_pending','import_failed','risk_controlled','login_required','web_unavailable','lease_lost','confirmation_failed'].includes(task.status))){
+  if(dispatcher && !skipImport && phase!=='posts' && !await exists(stopFile) && !status.tasks.some(task => task.mustStopNode || ['import_pending','import_failed','risk_controlled','login_required','web_unavailable','lease_lost','confirmation_failed'].includes(task.status))){
     await cooldown?.assertReady();
     status.authorPhase=await runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher:dispatcher,cdpUrl:childEnv.XHS_CDP_URL,cooldown});
     console.log(`[采集阶段] 作者阶段=${status.authorPhase.status}，本机回填${status.authorPhase.completed}位作者`);
@@ -586,7 +614,8 @@ try {
     try{status.cooldown=await cooldown.read();}
     catch(error){fatalError ||= error;}
   }
-  if(cooldownMonitorError?.code==='COOLDOWN_STATE_UNAVAILABLE')fatalError ||= cooldownMonitorError;
+  if(cooldownMonitorError?.code==='COOLDOWN_STATE_UNAVAILABLE'||isStorageFull(cooldownMonitorError))
+    fatalError ||= cooldownMonitorError;
   clearTimeout(runtimeTimer);
   await runtimeStopRequest;
   await dispatcher?.close({ stopped: stopSignalCount > 0 || await exists(stopFile) }).catch(error => {

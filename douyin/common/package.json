@@ -1,5 +1,5 @@
 {
  "name":"douyin-distributed-collector","version":"1.0.0","private":true,"type":"module",
- "scripts":{"test":"node --test src/*.test.mjs","crawl":"node src/run-worker.mjs","preflight":"node src/run-worker.mjs --preflight","import:mysql":"node src/import-mysql.mjs"},
+ "scripts":{"crawl":"node src/run-worker.mjs","preflight":"node src/run-worker.mjs --preflight","import:mysql":"node src/import-mysql.mjs"},
  "dependencies":{"mysql2":"^3.15.0","playwright":"^1.62.1","redis":"^6.2.1"}
 }

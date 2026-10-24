@@ -3,10 +3,14 @@ import mysql from 'mysql2/promise';
 import {mysqlConnectionOptions} from './mysql-connection-options.mjs';
 import {readVolumeSnapshot,readTaskVolume,validateVolumeSnapshot} from './volume-acceptance.mjs';
 import {assessChannelsAnnual} from './channels-annual-acceptance.mjs';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+import {retryInfrastructure} from './infrastructure-retry.mjs';
 let stage='validation';
-try{
- const input=JSON.parse(fs.readFileSync(0,'utf8'));
- const connect=async()=>{stage='connect';const c=await mysql.createConnection(mysqlConnectionOptions());stage='query';return c;};
+export async function executeReadback(input,{createConnection=options=>mysql.createConnection(options),retryOptions={}}={}){
+ return retryInfrastructure(async()=>{
+ stage='validation';
+ const connect=async()=>{stage='connect';const c=await createConnection(mysqlConnectionOptions());stage='query';return c;};
  let result;
  if(input.operation==='probe'){
   const connection=await connect();
@@ -33,7 +37,11 @@ try{
   finally{await connection.end();}
  }
  else throw new Error('VOLUME_OPERATION_INVALID');
- console.log(JSON.stringify(result));
+ return result;
+ },{operation:'database_readback',...retryOptions});
+}
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))try{
+ console.log(JSON.stringify(await executeReadback(JSON.parse(fs.readFileSync(0,'utf8')))));
 }catch(error){
  const configurationErrors=new Set(['MYSQL_CREDENTIALS_MISSING','MYSQL_TARGET_INVALID']);
  const errorCode=error.code||(configurationErrors.has(error.message)?error.message:stage==='validation'?'VOLUME_VALIDATION_FAILED':'VOLUME_READBACK_FAILED');

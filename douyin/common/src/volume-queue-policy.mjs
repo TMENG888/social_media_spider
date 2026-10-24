@@ -3,10 +3,12 @@ import {isDeepStrictEqual} from 'node:util';
 import {EXHAUSTION_COMPLETION} from './retry-exhaustion.mjs';
 import {USER_SEARCH_CLOSURE_GUARD} from './user-search-closure.mjs';
 import {ANNUAL_COMPLETION_GUARD} from './annual-queue-policy.mjs';
+import {SEARCH_EXHAUSTION_GUARD} from './search-exhaustion-completion.mjs';
 
 const SCRIPT=`
 ${USER_SEARCH_CLOSURE_GUARD}
 ${ANNUAL_COMPLETION_GUARD}
+${SEARCH_EXHAUSTION_GUARD}
 local id,encoded,snapshot_id,generation,token=ARGV[1],ARGV[2],ARGV[3],ARGV[4],ARGV[5]
 local types={'hash','hash','hash','hash','hash','zset','zset','hash','hash','zset','hash','hash','hash'}
 for i,want in ipairs(types) do
@@ -48,6 +50,9 @@ local archive={policy=d.policy,generation=generation,snapshotId=snapshot_id,task
  originalPending=redis.call('ZSCORE',KEYS[6],id) or cjson.null,
  originalFailed=redis.call('ZSCORE',KEYS[10],id) or cjson.null}
 local encoded_archive=cjson.encode(archive)
+if exhausted_search_closed(id,generation,snapshot_id,status) then
+ return cjson.encode({status='completed',taskId=id,changed=false,acceptedByVolume=false,acceptedBySearchExhaustion=true})
+end
 if annual_search_closed(id,generation,snapshot_id,status) then
  return cjson.encode({status='completed',taskId=id,changed=false,acceptedByVolume=false,acceptedByAnnual=true})
 end

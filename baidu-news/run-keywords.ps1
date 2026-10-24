@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$KeywordsFile = "keywords.txt",
   [string]$OutputDir = "",
   [int]$MaxPages = 20,

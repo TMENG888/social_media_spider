@@ -5,6 +5,8 @@
   "wait_article": 3.0,
   "wait_video_detail_open_seconds": 8.0,
   "wait_video_detail_ready_seconds": 15.0,
+  "video_unavailable_refresh_attempts": 4,
+  "video_unavailable_refresh_backoff_seconds": 2.0,
   "wait_load_more": 1.5,
   "jitter_enabled": true,
   "jitter_search_submit_seconds": [5, 12],

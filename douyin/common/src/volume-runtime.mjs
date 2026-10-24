@@ -8,6 +8,7 @@ import {annualInputFromCollector} from './annual-runtime-evidence.mjs';
 import {completeAnnualKeyword} from './annual-queue-policy.mjs';
 import {operationalFailure} from './retry-exhaustion.mjs';
 import {ResetOncePolicy} from './reset-once.mjs';
+import {completeExhaustedSearch} from './search-exhaustion-completion.mjs';
 
 export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}){
  let config;
@@ -47,6 +48,9 @@ export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}
    const decision=await this.read(taskId);
    if(decision.ok)return {decision,confirmation:await this.apply(decision,{token,commit:true})};
    const task=manifest.tasks.find(t=>(t.redisTaskId||t.id)===taskId);
+   const exhausted=await completeExhaustedSearch(queue,snapshot,decision,task,record,
+    {generation:config.generation,token,commit:true});
+   if(exhausted.confirmation)return {decision,searchExhaustionEvidence:exhausted.evidence,confirmation:exhausted.confirmation};
    const input=await annualInputFromCollector({decision,task,record,stateRoot,connect});
    if(input){
     const {evidence,confirmation}=await completeAnnualKeyword(queue,snapshot,decision,input,

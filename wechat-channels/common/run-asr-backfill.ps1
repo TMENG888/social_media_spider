@@ -64,6 +64,7 @@ if ($dbEnabled) {
 
 $status = [ordered]@{workerId=(Split-Path $WorkerRoot -Leaf);phase='asr-backfill';retryRunId=$env:WECHAT_RETRY_OBSERVATION_RUN_ID;startedAt=(Get-Date).ToString('o');keywords=@()}
 $failedKeywords = 0
+$infrastructureBlocked = $false
 $stopFile = Join-Path $WorkerRoot '.state\stop.requested'
 $exactFingerprint = [string]$env:WECHAT_REDIS_VIDEO_FINGERPRINT
 $exactArticleKey = [string]$env:WECHAT_REDIS_VIDEO_ARTICLE_KEY
@@ -162,11 +163,11 @@ foreach ($task in @($queue.tasks)) {
       & $node @postArgs
       if ($LASTEXITCODE -ne 0) { throw "ASR postprocess failed: $keyword" }
       if ($dbEnabled) {
-        $importArgs = @($importer,'--posts',$final,'--status',(Join-Path $outDir 'mysql_asr_import_status.json'))
+        $importArgs = @($importer,'--posts',$final,'--status',(Join-Path $outDir 'mysql_asr_import_status.json'),'--stop-file',$stopFile)
         $commentFile = Join-Path $outDir 'ods_social_media_comment_channels_final.jsonl'
         if ($task.collectComments -and (Test-Path $commentFile)) { $importArgs += @('--comments',$commentFile) }
         & $node @importArgs
-        if ($LASTEXITCODE -ne 0) { throw "ASR MySQL import failed: $keyword" }
+        if ($LASTEXITCODE -ne 0) { $infrastructureBlocked=$true; throw "ASR MySQL import failed: $keyword" }
         $keywordState.databaseImported=$true
       }
       if ($collectorExit -eq 0) {
@@ -181,15 +182,22 @@ foreach ($task in @($queue.tasks)) {
       $keywordState.status='failed'
       $keywordState.error=$_.Exception.Message
       $failedKeywords++
-      Write-Host "[$($task.id)] ASR keyword failed but later keywords will continue: $keyword - $($keywordState.error)" -ForegroundColor Red
+      if($infrastructureBlocked){
+        Write-Host "[$($task.id)] MySQL import unconfirmed; local data retained; no next keyword will start." -ForegroundColor Yellow
+      }else{
+        Write-Host "[$($task.id)] ASR keyword failed but later keywords will continue: $keyword - $($keywordState.error)" -ForegroundColor Red
+      }
     }
     $keywordState.finishedAt=(Get-Date).ToString('o')
     $status.keywords += [pscustomobject]$keywordState
     Write-JsonAtomic $status (Join-Path $WorkerRoot '.state\asr_backfill_status.json') 8
+    if($infrastructureBlocked){break}
   }
+  if($infrastructureBlocked){break}
 }
 $status.finishedAt = (Get-Date).ToString('o')
 Write-JsonAtomic $status (Join-Path $WorkerRoot '.state\asr_backfill_status.json') 8
+if($infrastructureBlocked){exit 75}
 if ($failedKeywords -gt 0) {
   Write-Host "ASR phase finished with $failedKeywords partial/failed keyword(s); other keywords were still processed." -ForegroundColor Yellow
   exit 4

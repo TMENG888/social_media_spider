@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { needsAsrQualityRetry } from "./checkpoint.mjs";
 
 const noSpeech = new Set(["no_speech", "no_audio_track", "empty_audio_track", "silent_audio"]);
@@ -8,18 +9,42 @@ const inside = (root, file) => {
   const relative = path.relative(root, file);
   return Boolean(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 };
-const readRows = db => db.prepare(`
+const importFingerprint = result => createHash('sha256').update(JSON.stringify({
+  articleId: result?.post?.['文章id'] ?? null, platform: result?.post?.['平台'] ?? null,
+  project: result?.post?.['项目'] ?? null, transcript: result?.post?.['文章视频内容'] ?? null,
+  subtitle: result?.postTextAudit ?? null
+})).digest('hex');
+
+// Called only after the current transcript's MySQL commit/readback succeeded.
+// No media deletion or ASR state change if this small local receipt cannot save.
+export function recordAsrMediaImport(db, job, result) {
+  db.exec(`CREATE TABLE IF NOT EXISTS asr_media_import_receipt (
+    keyword TEXT NOT NULL,note_id TEXT NOT NULL,result_hash TEXT NOT NULL,
+    confirmed_at TEXT NOT NULL,PRIMARY KEY(keyword,note_id))`);
+  db.prepare(`INSERT INTO asr_media_import_receipt VALUES(?,?,?,?)
+    ON CONFLICT(keyword,note_id) DO UPDATE SET result_hash=excluded.result_hash,confirmed_at=excluded.confirmed_at`)
+    .run(job.keyword,job.noteId,importFingerprint(result),new Date().toISOString());
+}
+const readRows = db => {
+  const hasReceipts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='asr_media_import_receipt'").get();
+  const receipt = hasReceipts ? db.prepare('SELECT result_hash FROM asr_media_import_receipt WHERE keyword=? AND note_id=?') : null;
+  return db.prepare(`
   SELECT j.keyword,j.note_id,j.status,j.media_path,j.transcript,j.audit_json,
          c.status AS candidate_status,c.result_json
   FROM asr_job j LEFT JOIN candidate c
     ON c.keyword=j.keyword AND c.note_id=j.note_id
   WHERE j.media_path IS NOT NULL
-`).all();
+`).all().map(row => {
+    let confirmed = false;
+    try { confirmed = receipt?.get(row.keyword,row.note_id)?.result_hash === importFingerprint(JSON.parse(row.result_json)); } catch {}
+    return {...row,import_confirmed:confirmed};
+  });
+};
 
 // A local FULL-synchronous transaction has saved both transcript and article.
 // SQL backfill can be replayed from this checkpoint without the original media.
 export function canDeleteAsrMedia(row) {
-  if (row.status !== "completed" || row.candidate_status !== "completed") return false;
+  if (row.status !== "completed" || row.candidate_status !== "completed" || row.import_confirmed !== true) return false;
   try {
     const result = JSON.parse(row.result_json);
     const audit = JSON.parse(row.audit_json);

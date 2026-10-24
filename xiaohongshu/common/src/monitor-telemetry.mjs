@@ -7,6 +7,7 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createClient} from 'redis';
 import {redisSettings} from './redis-connection.mjs';
 import {RemoteStopControl} from './remote-stop-control.mjs';
+import {markControlFailure} from './remote-control-recovery.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const platformDirectory=path.basename(path.dirname(root));
@@ -181,8 +182,9 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
             await control.poll({terminal:['stopped','exit_unconfirmed'].includes(state.state)?state.state:null});
           }catch(error){
             // No restart if the control channel cannot be checked while resting.
-            for(const name of ['supervisor.stop','stop.requested'])await writeJson(path.join(ctx.worker,'.state',name),{source:'remote_control',reason:'REMOTE_CONTROL_UNAVAILABLE'});
-            if(control){await control.flags({reason:'REMOTE_CONTROL_UNAVAILABLE'});await control.close().catch(()=>{});control=null;}
+            const code=await markControlFailure({workerRoot:ctx.worker,platform:ctx.platform,campaign:ctx.campaign,target:ctx.computer.toUpperCase()+'/'+ctx.workerId},error);
+            console.warn('[Remote control unavailable] '+code+'; safe stop retained.');
+            if(control){await control.close().catch(()=>{});control=null;}
             throw error;
           }
         }

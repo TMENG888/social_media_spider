@@ -4,7 +4,7 @@ $Root = Resolve-Path (Join-Path $Common '..')
 $WorkerRoot = if ($env:WECHAT_WORKER_ROOT) { Resolve-Path $env:WECHAT_WORKER_ROOT } else { $Root }
 $checks = @()
 function Add-Check($name, $ok, $detail) {
-  $optionalAudio = $env:SOCIAL_VOLUME_ENABLED -eq '1' -and $name -in @('asr_python_modules','audio_loopback','asr_worker','loopback_recorder','process_loopback_recorder','asr_model')
+  $optionalAudio = $name -eq 'audio_session_control' -or ($env:SOCIAL_VOLUME_ENABLED -eq '1' -and $name -in @('asr_python_modules','audio_loopback','asr_worker','loopback_recorder','process_loopback_recorder','asr_model'))
   $script:checks += [pscustomobject]@{name=$name; ok=[bool]$ok; required=(-not $optionalAudio); detail=[string]$detail}
 }
 $node = if ($env:WECHAT_NODE) { $env:WECHAT_NODE } else { (Get-Command node -ErrorAction SilentlyContinue).Source }
@@ -18,6 +18,10 @@ if ($python -and (Test-Path -LiteralPath $python)) {
   # pywinauto's COM apartment, just like the production loopback subprocess.
   $moduleProbe = & $python -c "import openpyxl, PIL, pywinauto, win32clipboard" 2>&1
   Add-Check 'python_modules' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {'openpyxl/PIL/pywinauto/pywin32'} else {[string]$moduleProbe}))
+  # Optional recovery capability, not proof that actual audio is audible.
+  # Probe the SAME interpreter as the collector; never auto-install in a run.
+  $sessionProbe = & $python -c "from pycaw.pycaw import AudioUtilities; print('pycaw available')" 2>&1
+  Add-Check 'audio_session_control' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {'pycaw available; waveform verification still required'} else {'pycaw unavailable in collector Python; Windows audio-session recovery degraded. Install common/requirements.txt with this interpreter while stopped.'}))
   $asrModuleProbe = & $python -c "import faster_whisper" 2>&1
   Add-Check 'asr_python_modules' ($LASTEXITCODE -eq 0) ($(if ($LASTEXITCODE -eq 0) {'faster-whisper'} else {[string]$asrModuleProbe}))
   $audioProbe = & $python -c "import soundcard as sc; s=sc.default_speaker(); assert s is not None; print(s.name)" 2>&1
@@ -30,6 +34,7 @@ Add-Check 'mysql_check' (Test-Path "$Root\common\src\mysql-check.mjs") "$Root\co
 Add-Check 'playwright_module' (Test-Path "$Root\common\node_modules\playwright\package.json") "$Root\common\node_modules\playwright\package.json"
 Add-Check 'asr_worker' (Test-Path "$Root\common\src\asr-worker.py") "$Root\common\src\asr-worker.py"
 Add-Check 'loopback_recorder' (Test-Path "$Root\common\src\loopback-recorder.py") "$Root\common\src\loopback-recorder.py"
+Add-Check 'audio_process_guard' (Test-Path "$Root\common\src\audio_process_guard.py") "$Root\common\src\audio_process_guard.py"
 Add-Check 'process_loopback_recorder' (Test-Path "$Root\common\src\process-loopback-recorder.exe") "$Root\common\src\process-loopback-recorder.exe"
 Add-Check 'asr_model' ((Test-Path "$Root\common\.state\asr-models") -and @((Get-ChildItem "$Root\common\.state\asr-models" -Recurse -File -ErrorAction SilentlyContinue)).Count -gt 0) "$Root\common\.state\asr-models"
 Add-Check 'edge_or_chrome' ((Test-Path "$Root\common\runtime\browsers\chrome-win64\chrome.exe") -or (Test-Path "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe") -or (Test-Path "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") -or (Test-Path "$env:ProgramFiles\Google\Chrome\Application\chrome.exe")) 'bundled Edge/Chrome or system browser'

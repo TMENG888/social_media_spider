@@ -6,6 +6,7 @@ import {mysqlConnectionOptions} from './mysql-connection-options.mjs';
 import {ProductionOutputRecorder,meaningfulHint,finishOutput,recoverCommittedOutputs} from './production-output.mjs';
 import {acquireImportLocks} from './mysql-import-locks.mjs';
 import {subtitleDedupeEnabled} from './channels-subtitle-policy.mjs';
+import {safeInfrastructureCode} from './infrastructure-retry.mjs';
 
 const args = {};
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -43,7 +44,7 @@ const videoSimilarity = (left, right) => {
   for (const token of sa) if (sb.has(token)) overlap += 1;
   return overlap / Math.min(sa.size, sb.size);
 };
-const conn = await mysql.createConnection({...connectionOptions,supportBigNumbers:true,bigNumberStrings:true});
+let conn=null,stage='connect',commitAttempted=false,committed=false;
 let insertedPosts=0, updatedPosts=0, insertedComments=0, updatedComments=0, duplicatePostsSkipped=0, duplicateCommentsSkipped=0;
 let compatibilitySanitizedValues=0;
 const subtitleBackups = [];
@@ -51,9 +52,14 @@ const outputRecorder=new ProductionOutputRecorder();
 const subtitleBackupPath = path.join(path.dirname(statusFile), `subtitle-backup-${Date.now()}-${process.pid}.json`);
 let releaseImportLocks=null;
 try {
+  // Connection failure must produce a structured receipt too; the wrapper
+  // must not guess transaction safety from an uncaught stack trace.
+  atomicWriteFileSync(statusFile,JSON.stringify({status:'running',host,database,stage}), 'utf8');
+  conn=await mysql.createConnection({...connectionOptions,supportBigNumbers:true,bigNumberStrings:true});
+  stage='import_lock';
   releaseImportLocks=await acquireImportLocks(conn);
   try {await recoverCommittedOutputs(conn,outputRecorder.root);} catch {}
-  await conn.beginTransaction();
+  stage='transaction';await conn.beginTransaction();
   // Existing production ODS tables were originally created with a mixture of
   // utf8mb3 and utf8mb4 columns.  Keep the connection at utf8mb4, inspect the
   // real target schema, and remove only non-BMP code points for legacy columns
@@ -179,19 +185,24 @@ try {
   }
   outputRecorder.prepare();
   outputRecorder.commitAttempted=true;
+  stage='commit';commitAttempted=true;
   await conn.commit();
+  committed=true;stage='post_commit';
   const outputTelemetry=await finishOutput(outputRecorder,conn);
   const status = {status:'success',host,database,subtitleDedupeEnabled:subtitleDedupe,posts:posts.length,comments:comments.length,insertedPosts,updatedPosts,duplicatePostsSkipped,insertedComments,updatedComments,duplicateCommentsSkipped,compatibilitySanitizedValues,subtitleBackupCount:subtitleBackups.length,subtitleBackupPath:subtitleBackups.length ? subtitleBackupPath : null,completedAt:new Date().toISOString(),outputTelemetry};
   atomicWriteFileSync(statusFile, JSON.stringify(status,null,2), 'utf8');
   console.log(JSON.stringify(status,null,2));
 } catch (error) {
-  await conn.rollback().catch(() => {});
+  await conn?.rollback().catch(() => {});
   try {outputRecorder.abort();} catch {}
-  const status = {status:'failed',host,database,error:String(error?.message || error),errorCode:error?.code||null,failedAt:new Date().toISOString()};
+  const errorCode=safeInfrastructureCode(error);
+  const status = {status:'failed',host,database,error:errorCode,errorCode,stage,
+    retrySafe:!commitAttempted,commitState:committed?'committed':commitAttempted?'unknown':'not_attempted',
+    localDataRetained:true,failedAt:new Date().toISOString()};
   atomicWriteFileSync(statusFile, JSON.stringify(status,null,2), 'utf8');
-  console.error(JSON.stringify(status,null,2));
+  console.error(JSON.stringify(status));
   process.exitCode = 2;
 } finally {
   await releaseImportLocks?.();
-  await conn.end();
+  await conn?.end().catch(() => {});
 }

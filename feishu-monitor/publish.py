@@ -9,6 +9,7 @@ from worker_visibility import reporting_snapshot, current_worker_rows
 from report_archive import archive_confirmed, render_recent_day
 from notification import brief_notification, SECTION_TITLES, FOOTER_PREFIX
 from collection_efficiency import observe_efficiency
+from feishu_delivery import send, DeliveryError
 
 def display_time(value):
     dt=parse_time(value)
@@ -162,20 +163,6 @@ def should_send(previous,snapshot,db,now_seconds,alerts_only=False,watch=False):
     if previous.get('sourceSignature')!=alert_signature(snapshot,db):return True
     return watch and now_seconds-previous.get('deliveredAt',0)>=900 and previous.get('progressSignature')!=progress_signature(snapshot)
 
-def send(payload,webhook,secret=''):
-    u=urlparse(webhook)
-    if u.scheme!='https' or u.hostname!='open.feishu.cn' or not u.path.startswith('/open-apis/bot/v2/hook/') or u.username or u.password:
-        raise ValueError('Expected official HTTPS Feishu custom-bot webhook')
-    if secret:
-        stamp=str(int(time.time()));payload={**payload,'timestamp':stamp,'sign':base64.b64encode(hmac.new((stamp+'\n'+secret).encode(),b'',hashlib.sha256).digest()).decode()}
-    req=urllib.request.Request(webhook,json.dumps(payload,ensure_ascii=False).encode(),{'Content-Type':'application/json'},method='POST')
-    with urllib.request.urlopen(req,timeout=15) as response:result=json.load(response)
-    code=result.get('code',result.get('StatusCode'))
-    if code!=0:
-        safe_code=str(code) if isinstance(code,(int,float)) else 'unknown'
-        raise RuntimeError('Feishu rejected payload; status code '+safe_code+'; delivery not confirmed')
-    return True
-
 def build(snapshot,db,config,out):
     snapshot=reporting_snapshot(snapshot)
     short,issues=brief_notification(snapshot,db)
@@ -203,7 +190,7 @@ def build(snapshot,db,config,out):
     return payload
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--send',action='store_true');p.add_argument('--alerts-only',action='store_true');p.add_argument('--watch',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--send',action='store_true');p.add_argument('--alerts-only',action='store_true');p.add_argument('--watch',action='store_true');p.add_argument('--run-id',default='');a=p.parse_args()
     out=ROOT/'output';config=json.loads((ROOT/'config.json').read_text(encoding='utf-8'))
     snapshot=json.loads((out/'redis.json').read_text(encoding='utf-8'));db=json.loads((out/'database.json').read_text(encoding='utf-8'))
     snapshot['platformTasks']=[]
@@ -222,13 +209,21 @@ if __name__=='__main__':
     previous=json.loads(statefile.read_text(encoding='utf-8')) if statefile.exists() else {}
     if a.send and should_send(previous,snapshot,db,int(time.time()),a.alerts_only,a.watch):
         webhook=os.environ.get('FEISHU_WEBHOOK','');secret=os.environ.get('FEISHU_SIGN_SECRET','')
-        if not webhook:raise SystemExit('Webhook absent; no message sent')
-        try:send(payload,webhook,secret)
-        except Exception as e:
-            detail=str(e) if isinstance(e,RuntimeError) and str(e).startswith('Feishu rejected payload; status code ') else type(e).__name__
-            raise SystemExit('Push failed: '+detail+' (credential-bearing URL omitted)')
+        attemptfile=out/'delivery-attempt.json'
+        attempt={'runId':a.run_id,'startedAt':int(time.time()),'status':'sending','deliveryConfirmed':False}
+        atomic_json(attemptfile,attempt)
+        try:
+            if not webhook:raise DeliveryError('FEISHU_WEBHOOK_ABSENT',outcome='not_attempted')
+            send(payload,webhook,secret,on_retry=lambda row:print(json.dumps(row),flush=True))
+        except DeliveryError as e:
+            attempt.update(status='failed',finishedAt=int(time.time()),**e.record())
+            atomic_json(attemptfile,attempt)
+            raise SystemExit('Push failed: '+e.code+' (credential-bearing URL omitted)')
         delivered_at=int(time.time())
-        atomic_json(statefile,{'sourceSignature':sig,'progressSignature':progress_signature(snapshot),'deliveredAt':delivered_at});print('Feishu delivery confirmed',flush=True)
+        print('Feishu delivery confirmed',flush=True)
+        attempt.update(status='confirmed',deliveryConfirmed=True,deliveredAt=delivered_at,finishedAt=delivered_at)
+        atomic_json(attemptfile,attempt)
+        atomic_json(statefile,{'sourceSignature':sig,'progressSignature':progress_signature(snapshot),'deliveredAt':delivered_at})
         try:
             archive_confirmed(out,snapshot,db,payload,push_summary(snapshot,db),delivered_at)
         except Exception as e:

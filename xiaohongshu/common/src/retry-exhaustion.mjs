@@ -1,7 +1,8 @@
 // Business closure is deliberately distinct from quantity/quality acceptance.
+import {collectionNodeFailure} from './collection-failure.mjs';
 export function operationalFailure(record) {
- const text=String(record?.error||record?.status||'');
- return /LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|STOP_REQUESTED|LEASE_LOST|IMPORT|MYSQL|DATABASE|CONNECTION|CONTEXT_LOST|BROWSER|RATE_LIMIT|COOLDOWN|CONFIRMATION_FAILED/i.test(text);
+ const text=[record?.error,record?.status,record?.collectionError,record?.collectionStatus,record?.previousCollectionError].filter(Boolean).join(' ');
+ return collectionNodeFailure(record).stopNode||/LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|STOP_REQUESTED|LEASE_LOST|IMPORT|MYSQL|DATABASE|CONNECTION|CONTEXT_LOST|BROWSER|RATE_LIMIT|COOLDOWN|CONFIRMATION_FAILED/i.test(text);
 }
 export const EXHAUSTION_COMPLETION=`
 local exhausted_field=field..'|retry-exhausted-completion'
@@ -18,7 +19,7 @@ if d.posts<d.threshold and old_ledger and baseline and attempts-baseline>=tonumb
  local blocked=false
  if token=='' then
   local previous=string.upper((redis.call('HGET',KEYS[9],id) or '')..(current_result or ''))
-  for _,p in ipairs({'LOGIN_REQUIRED','SECURITY_CHALLENGE','PLATFORM_RESTRICTION','STOP_REQUESTED','LEASE_LOST','IMPORT_FAILED','MYSQL','DATABASE','CONNECTION_ERROR','CONTEXT_LOST','RATE_LIMIT','COOLDOWN','CONFIRMATION_FAILED'}) do
+  for _,p in ipairs({'LOGIN_REQUIRED','SECURITY_CHALLENGE','PLATFORM_RESTRICTION','STOP_REQUESTED','LEASE_LOST','IMPORT_FAILED','MYSQL','DATABASE','CONNECTION_ERROR','CONTEXT_LOST','BROWSER_CLOSED','SORT_NOT_CONFIRMED','SORT_UNCONFIRMED','FAILURE_THRESHOLD','WEB_UNAVAILABLE','WEB_NOTE_UNAVAILABLE','RATE_LIMIT','COOLDOWN','CONFIRMATION_FAILED'}) do
    if string.find(previous,p,1,true) then blocked=true end
   end
  end

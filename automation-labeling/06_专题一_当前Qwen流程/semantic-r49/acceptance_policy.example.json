@@ -1,0 +1,14 @@
+{
+  "version": "user-confirmed-80pct-20261021",
+  "authority": "Example of an earlier batch contract; obtain explicit approval for each new batch",
+  "scope": "当前先完成专题一Qwen自动化切片打标对照Codex参考集回归，300篇不提前启动",
+  "source_tag_precision_min": 0.8,
+  "source_tag_recall_min": 0.8,
+  "critical_object_or_negation_errors": 0,
+  "structural_errors": 0,
+  "duplicate_slices": 0,
+  "empty_practice": 0,
+  "semantic_review_required": true,
+  "span_overlap_metric": "保留诊断，不将字符边界重叠代理指标当作文字或切片必须完全一致的验收条件",
+  "field_identity_policy": "品牌、经营主体、城市须有正确对象的原文证据；无法确定留空，不因参考空值禁止合法补全"
+}

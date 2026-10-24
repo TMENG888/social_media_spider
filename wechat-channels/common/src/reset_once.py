@@ -8,7 +8,10 @@ POLICY='reset-once-20261016-v1'
 SCRIPT=Path(__file__).with_name('reset-once.lua').read_text(encoding='utf-8')
 
 def protected(record):
-    return bool(record.get('stopped') or re.search(
+    return bool(record.get('stopped') or record.get('infrastructureBlocked')
+        or record.get('exitCode') in (75, -1)
+        or record.get('error') in ('Operational incident state unavailable; no inner retry.',
+                                    'RECOLLECTION_LEASE_EXPIRED') or re.search(
         r'LOGIN|CAPTCHA|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|COOLDOWN|RATE_LIMIT|STOP_REQUESTED|partial_stopped|risk_controlled|验证码|登录|人工停止',
         str(record.get('error',''))+' '+str(record.get('status','')),re.I))
 
