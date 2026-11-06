@@ -1,0 +1,13 @@
+import fs from 'node:fs/promises';import assert from 'node:assert/strict';
+const src=await fs.readFile(new URL('./src/recovery-login-check.mjs',import.meta.url),'utf8');
+const from=src.indexOf('export function recoveryState('),to=src.indexOf('export async function openRecovery',from);
+const {recoveryState}=await import('data:text/javascript;base64,'+Buffer.from(src.slice(from,to)).toString('base64'));
+const base={status:'cooling',kind:'security',requiresHuman:false,cooldownUntil:900};
+const snapshot=(incident,shared=null)=>({incidentRaw:JSON.stringify(incident),sharedRaw:shared?JSON.stringify(shared):'',serverTime:1000});
+assert.equal(recoveryState(snapshot(base)).incident.kind,'security');
+for(const incident of [{...base,cooldownUntil:1001},{...base,requiresHuman:true},{...base,cooldownUntil:null},{...base,cooldownUntil:0},{...base,kind:'unexpected'},{...base,cooldownUntil:'900'}])assert.throws(()=>recoveryState(snapshot(incident)),/NOT_LOGIN_OR_CAPTCHA/);
+assert.throws(()=>recoveryState(snapshot(base,{manualRequired:false,untilMs:1001})),/TIMED_COOLDOWN_PRESERVED/);
+assert.equal(recoveryState(snapshot(base,{manualRequired:true,untilMs:2000})).needsShared,true);
+assert.equal(recoveryState(snapshot({...base,kind:'login',requiresHuman:true})).incident.kind,'login');
+assert.equal(recoveryState(snapshot({...base,kind:'captcha',requiresHuman:true})).incident.kind,'captcha');
+console.log(JSON.stringify({checks:11,expiredAutomaticSecurityAllowed:true,activeManualUnknownProtected:true,sharedProtectionPreserved:true}));

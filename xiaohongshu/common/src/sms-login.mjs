@@ -48,7 +48,9 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
     // The current title is also “接收短信验证码”. Continue to the actual
     // form; a title is never a clickable receive-SMS option.
     if(input&&await submitButton(region)){entry={frame,region,option:null,input};break;}
-    if(option&&await anyVisible(region.getByText('手机刷脸验证',{exact:true}))
+    // Douyin can show only the two SMS methods. Face verification is optional;
+    // bind the receive option to this visible identity-method selector instead.
+    if(option&&await anyVisible(region.getByText('身份验证',{exact:true}))
        &&await anyVisible(region.getByText('发送短信验证',{exact:true})))choice={frame,region,option,input:null};
    }
    if(entry||choice)results.push(entry||choice);

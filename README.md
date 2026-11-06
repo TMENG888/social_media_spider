@@ -11,6 +11,7 @@
 - `xiaohongshu`：小红书 Playwright 采集
 - `zhihu`：知乎回答/专栏采集（隔离测试阶段，尚未完成正式采集验收）
 - `feishu-monitor`：独立的三平台只读监控、飞书日报及云日志归档
+- `feishu-login-bot`：登录二维码、人工验证码与短信验证的飞书运维通知和定向指令
 - `automation-labeling`：广告、发布者角色、两专题语义切片/标签/评分和指标导出
 
 ## 仓库范围

@@ -37,8 +37,10 @@ if ir~=ARGV[2] or sr~=ARGV[3] then return cjson.encode({ok=false,reason='INCIDEN
 local i=ir~='' and cjson.decode(ir) or nil
 local s=sr~='' and cjson.decode(sr) or nil
 local t=redis.call('TIME');local now=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000)
+local expiredSecurity=false
 if i and i.status~='resolved' and i.status~='ready' and i.kind~='login' and i.kind~='captcha' then
- return cjson.encode({ok=false,reason='NOT_LOGIN_OR_CAPTCHA'})
+ expiredSecurity=i.kind=='security' and i.requiresHuman==false and type(i.cooldownUntil)=='number' and i.cooldownUntil>0 and i.cooldownUntil<=now
+ if not expiredSecurity then return cjson.encode({ok=false,reason='NOT_LOGIN_OR_CAPTCHA'}) end
 end
 if s and not s.manualRequired and (s.untilMs or 0)>now then
  return cjson.encode({ok=false,reason='TIMED_COOLDOWN_PRESERVED'})
@@ -46,6 +48,9 @@ end
 if s and s.manualRequired and ARGV[4]~='shared_confirmed' and ARGV[4]~='local_confirmed' then
  return cjson.encode({ok=false,reason='SHARED_CONFIRMATION_REQUIRED'})
 end
+-- The original collection gate already permits an expired automatic cooldown.
+-- A login check may proceed, but must not rewrite that historical incident.
+if expiredSecurity then return cjson.encode({ok=true,status='ready',sharedReset=false,preservedExpiredIncident=true}) end
 -- Type-check every write target before writing: Lua errors do not roll back.
 redis.call('HGET',KEYS[2],'__recovery_probe__')
 local sharedReset=false
@@ -66,7 +71,9 @@ return cjson.encode({ok=true,status='resolved',sharedReset=sharedReset})
 export function recoveryState(snapshot) {
  const incident=snapshot.incidentRaw?JSON.parse(snapshot.incidentRaw):null;
  const shared=snapshot.sharedRaw?JSON.parse(snapshot.sharedRaw):null;
- if(incident&&!['resolved','ready'].includes(incident.status)&&!['login','captcha'].includes(incident.kind))
+ const expiredSecurity=incident?.kind==='security'&&incident.requiresHuman===false
+  &&Number.isFinite(incident.cooldownUntil)&&incident.cooldownUntil>0&&incident.cooldownUntil<=snapshot.serverTime;
+ if(incident&&!['resolved','ready'].includes(incident.status)&&!['login','captcha'].includes(incident.kind)&&!expiredSecurity)
   throw new Error('NOT_LOGIN_OR_CAPTCHA：安全限流事件不通过登录工具解除，请保留冷却。');
  if(shared&&!shared.manualRequired&&shared.untilMs>snapshot.serverTime)
   throw new Error('TIMED_COOLDOWN_PRESERVED：定时冷却由原启动脚本等待，不在登录工具中重置。');

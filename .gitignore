@@ -82,3 +82,5 @@ automation-labeling/**/results*.json
 automation-labeling/**/frozen_version.json
 automation-labeling/**/scope_control.json
 automation-labeling/**/status.json
+
+feishu-login-bot/config.json
