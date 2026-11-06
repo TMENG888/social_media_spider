@@ -10,7 +10,8 @@ export function validateFieldValue(field,value,identity=''){
  if(!allowed)throw Error('Unknown categorical field '+field);
  const parts=typeof value==='string'?value.split(';'):[];
  if(!parts.length||parts.some(p=>!allowed.includes(p))||new Set(parts).size!==parts.length||
-    (field==='发布者角色'&&parts.length!==1))
+    (['发布者角色','情绪态度'].includes(field)&&parts.length!==1)||
+    (field==='表达类型'&&parts.filter(p=>['正向评价','负向评价','中性评价'].includes(p)).length>1))
   throw Error(`Invalid ${field} for ${identity}: ${JSON.stringify(value)}; allowed: ${allowed.join(' / ')}`);
  return true;
 }

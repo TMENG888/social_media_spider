@@ -75,6 +75,35 @@ test('UTC commit bucket is invariant under timezone notation',()=>{
  assert.equal(commitBucket({committedAt:'2026-10-13T12:10:00+08:00'}),'commits:2026101304');
  assert.equal(commitBucket({committedAt:'2026-10-13T04:10:00Z'}),'commits:2026101304');
 });
+
+test('helper records session replacement and parent loss without connecting or acknowledging a stop',async()=>{
+ const ctx={namespace:'xhs:{fixture}',worker:'unused-fixture'};
+ for(const mode of ['parent','session']){
+  const events=[];
+  await heartbeatLoop('unused',123,'session',{context:async()=>ctx,
+   parentAlive:()=>mode!=='parent',
+   readState:async()=>({supervisorPid:123,sessionId:'different-session'}),
+   onLifecycle:async event=>events.push(event),
+   connect:async()=>assert.fail('identity failure must not connect')});
+  assert.equal(events.at(-1).reason,'exited');
+  assert.equal(events.at(-1).exitReason,mode==='parent'?'parent_not_alive':'supervisor_identity_changed');
+ }
+});
+
+test('a transient telemetry connection failure retries and logs recovery rather than exiting',async()=>{
+ const ctx={namespace:'xhs:{fixture}',worker:'unused-fixture'};
+ const events=[];let connects=0;
+ const client={isReady:true,isOpen:true,sendCommand:async args=>args[0]==='TIME'?['1791864000','0']:1,destroy(){this.isOpen=false;}};
+ await heartbeatLoop('unused',123,'session',{context:async()=>ctx,parentAlive:()=>true,
+  readState:async()=>({supervisorPid:123,sessionId:'session',state:'stopped'}),
+  connect:async()=>{if(++connects===1)throw Object.assign(new Error('password=not-for-log'),{code:'ECONNRESET'});return client;},
+  sleep:async()=>{},flushOutbox:async()=>{},onLifecycle:async event=>events.push(event)});
+ assert.equal(connects,2);
+ assert.ok(events.some(e=>e.reason==='frame_failed'&&e.code==='ECONNRESET'));
+ assert.ok(events.some(e=>e.reason==='connection_recovered'));
+ assert.equal(events.at(-1).exitReason,'supervisor_stopped');
+ assert.equal(JSON.stringify(events).includes('not-for-log'),false);
+});
 test('malformed and old campaign outbox records cannot starve valid current commits',async()=>{
  const fs=await import('node:fs/promises'),os=await import('node:os'),path=await import('node:path');
  const temporary=await fs.mkdtemp(path.join(os.tmpdir(),'monitor-outbox-test-'));

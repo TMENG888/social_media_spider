@@ -1,8 +1,10 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { enqueueAsrJob, claimAsrJob, markAsrRunning, completeAsrJob, failAsrJob, deferAsrJob, asrJobStats } from "./checkpoint.mjs";
 import { cleanupCompletedAsrMedia, recordAsrMediaImport } from "./asr-media-cleanup.mjs";
+import { transientDownloadError } from "./asr.mjs";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const runtimeUnavailable = error => /mkl_malloc|failed to allocate memory|cannot allocate memory|not enough memory|paging file|std::bad_alloc|ASR模型初始化超时/i.test(String(error?.message || error));
@@ -14,7 +16,7 @@ const extensionFor = url => {
 };
 
 export class AsrJobProcessor {
-  constructor({ db, service, mediaDir, maxAttempts = 3, retryDelayMs = 3000, keepMedia = false, onCompleted = null, shouldStop = async () => false }) {
+  constructor({ db, service, mediaDir, maxAttempts = 3, retryDelayMs = 3000, downloadAttempts = 4, downloadBaseDelayMs = 3000, downloadMaxDelayMs = 60000, keepMedia = false, onCompleted = null, shouldStop = async () => false }) {
     this.db = db;
     this.service = service;
     this.mediaDir = path.resolve(mediaDir);
@@ -28,10 +30,25 @@ export class AsrJobProcessor {
     this.stopping = false;
     this.drainRequested = false;
     this.haltedReason = null;
+    this.downloadAttempts=Math.min(8,Math.max(1,Number(downloadAttempts)||4));
+    this.downloadBaseDelayMs=Math.max(0,Number(downloadBaseDelayMs)||0);
+    this.downloadMaxDelayMs=Math.max(0,Number(downloadMaxDelayMs)||0);
+    this.haltedKind=null;
+    this.loopError=null;
   }
 
   start() {
-    if (!this.loopPromise) this.loopPromise = this.loop();
+    if (!this.loopPromise) {
+      this.loopPromise = this.loop();
+      // enqueue() starts this in the background. Observe rejection immediately,
+      // without hiding it from drain() or turning a failure into success.
+      this.loopPromise.catch(error=>{
+        this.loopError=error;
+        this.haltedKind='processor';
+        this.haltedReason='ASR_BACKGROUND_FAILED';
+        console.warn('[ASR后台异常] ASR_BACKGROUND_FAILED；作业保留，收尾将报告失败');
+      });
+    }
     this.wake();
     return this.loopPromise;
   }
@@ -57,7 +74,31 @@ export class AsrJobProcessor {
     return path.join(this.mediaDir, `${key}${extensionFor(job.mediaUrl)}`);
   }
 
-  async process(job) {
+  async downloadMedia(job,temporary) {
+    for(let attempt=1;attempt<=this.downloadAttempts;attempt++){
+      try {
+        await fs.rm(temporary,{force:true});
+        await this.service.download(job.mediaUrl,temporary,job.referer||"https://www.douyin.com/");
+        return;
+      } catch(error) {
+        if(!transientDownloadError(error))throw error;
+        const requestedDelay=Math.max(this.downloadBaseDelayMs*2**(attempt-1),Number(error.retryAfterMs)||0);
+        console.warn(`[ASR下载重试] ${job.noteId}：${attempt}/${this.downloadAttempts}，${error.httpStatus||'NETWORK'}；不消耗识别重试次数`);
+        if(attempt===this.downloadAttempts||requestedDelay>this.downloadMaxDelayMs){
+          throw Object.assign(new Error('MEDIA_DOWNLOAD_RETRY_EXHAUSTED'),{downloadDeferred:true});
+        }
+        // Check for a stop during backoff, instead of sleeping uninterruptibly.
+        const until=Date.now()+requestedDelay;
+        do {
+          if(this.stopping||await this.shouldStop())throw Object.assign(new Error('MEDIA_DOWNLOAD_STOPPED'),{downloadDeferred:true});
+          await sleep(Math.min(250,Math.max(0,until-Date.now())));
+        }while(Date.now()<until);
+      }
+    }
+  }
+
+  async process(job) {return timed('asr_job',()=>this.processTimingImpl(job),{keyword:job.keyword,articleId:job.noteId,lane:'asr',attempt:job.attempts});}
+  async processTimingImpl(job) {
     const mediaPath = this.mediaPath(job);
     const temporary = `${mediaPath}.part`;
     try {
@@ -68,7 +109,7 @@ export class AsrJobProcessor {
         await fs.mkdir(path.dirname(mediaPath), { recursive: true });
         await fs.rm(mediaPath, { force: true }).catch(() => {});
         await fs.rm(temporary, { force: true }).catch(() => {});
-        await this.service.download(job.mediaUrl, temporary, job.referer || "https://www.douyin.com/");
+        await timed('media_download',()=>this.downloadMedia(job,temporary));
         await fs.rm(mediaPath, { force: true }).catch(() => {});
         await fs.rename(temporary, mediaPath);
       }
@@ -76,7 +117,7 @@ export class AsrJobProcessor {
       console.log(`[ASR后台] ${job.noteId}：第${job.attempts}/${job.maxAttempts}次识别`);
       // The first pass uses the note context. A quality retry drops the prompt
       // so a bad title/tag hint cannot be echoed into the transcript again.
-      const output = await this.service.transcribePath(mediaPath, job.articleId || job.noteId, job.attempts === 1 ? job.prompt : null);
+      const output = await timed('asr_inference',()=>this.service.transcribePath(mediaPath, job.articleId || job.noteId, job.attempts === 1 ? job.prompt : null));
       if (!output.text && output.audit?.status === "quality_rejected") {
         const qualityError = new Error(`ASR_QUALITY_REJECTED：${output.audit?.quality?.reason || "字幕完整性或幻觉检测未通过"}`);
         qualityError.audit = output.audit;
@@ -95,7 +136,15 @@ export class AsrJobProcessor {
       } else console.log(`[ASR媒体保留] ${job.noteId}：当前字幕入库未确认，媒体保留`);
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => {});
+      if(error.downloadDeferred){
+        deferAsrJob(this.db,job,error);
+        this.haltedKind='download';
+        this.haltedReason=error.message;
+        console.warn(`[ASR下载待补] ${job.noteId}：${error.message}；已退回识别计数，本轮停止后台下载，文章采集继续，下轮重试`);
+        return false;
+      }
       if (runtimeUnavailable(error)) {
+        this.haltedKind='runtime';
         deferAsrJob(this.db, job, error);
         this.haltedReason = String(error.message || error).split("\n")[0];
         console.warn(`[ASR后台降级] ${job.noteId}：运行资源暂不可用；任务保留为retry_pending，本轮文章采集继续`);
@@ -139,14 +188,15 @@ export class AsrJobProcessor {
     }
   }
 
-  async drain() {
+  async drain() {return timed('asr_drain',()=>this.drainDetailedImpl(),{lane:'persistence'});}
+  async drainDetailedImpl() {
     this.drainRequested = true;
     this.start();
     this.wake();
     await this.loopPromise;
     const stats = asrJobStats(this.db);
     console.log(`[ASR队列] 本轮收尾：完成${stats.completed || 0}，死信${stats.dead_letter || 0}，待处理${stats.pendingTotal}`);
-    return { ...stats, runtimeUnavailable: Boolean(this.haltedReason), runtimeError: this.haltedReason };
+    return { ...stats, runtimeUnavailable: Boolean(this.haltedReason), runtimeError: this.haltedReason, haltedKind:this.haltedKind,downloadDeferred:this.haltedKind==='download' };
   }
 
   async close() {
@@ -155,4 +205,3 @@ export class AsrJobProcessor {
     await this.loopPromise?.catch(() => {});
   }
 }
-

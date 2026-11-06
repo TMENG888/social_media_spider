@@ -11,6 +11,7 @@ local old=redis.call('HGET',KEYS[3],id)
 local function out(v) return cjson.encode(v) end
 local function completed()
  local result=cjson.decode(s.result or '{}')
+ if result.riskVolumeAccepted==true then return out({status='completed',changed=false,acceptedByVolume=true,acceptedByRiskVolume=true,businessCompleted=true,quantityAccepted=true,pendingImport=false,dataImported=true,collectionSucceeded=false}) end
  return out({status='completed',changed=false,acceptedByResetOnce=true,businessCompleted=true,quantityAccepted=false,
   pendingImport=result.pendingImport==true,collectionSucceeded=result.collectionSucceeded==true,
   dataImported=result.dataImported==true})

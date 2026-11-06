@@ -7,6 +7,7 @@ import { redisSettings, connectRedis } from './redis-connection.mjs';
 import { loadTaskManifest } from './redis-task-manifest.mjs';
 import { writeJsonAtomic } from './checkpoint.mjs';
 import {openVolumeRuntime} from './volume-runtime.mjs';
+import {scopedTasks} from './task-scope.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -19,10 +20,16 @@ export class RedisDispatcher {
     const campaign = campaignOverride || (!skipImport && settings.taskPoolCampaign) || `${settings.campaign}-${skipImport ? 'export' : 'mysql'}-${manifest.manifestHash.slice(0, 16)}`;
     try {
       const dispatcher = new RedisDispatcher({ settings, manifest, client, campaign, stateRoot, workerId, stopFile });
+      dispatcher.schedulingTasks = await scopedTasks(root, manifest.tasks);
+      dispatcher.scopeLimited = dispatcher.schedulingTasks.length !== manifest.tasks.length;
+      if (dispatcher.schedulingTasks.length !== manifest.tasks.length) {
+        console.log(`[专题调度] 仅领取${[...new Set(dispatcher.schedulingTasks.map(t=>t.topic))].join('、')}：${dispatcher.schedulingTasks.length}词；其余专题任务及断点保留。`);
+      }
       await client.ping();
       const chosen=selectedTaskIds ? manifest.tasks.filter(t=>selectedTaskIds.includes(t.redisTaskId||t.id)) : null;
       if(chosen && chosen.length!==selectedTaskIds.length)throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
       dispatcher.volume=skipImport||manifestOverride?null:await openVolumeRuntime({root,stateRoot,queue:dispatcher.queue,manifest,platform:'抖音'});
+      if (!dispatcher.volume && dispatcher.scopeLimited) throw new Error('TASK_SCOPE_REQUIRES_VOLUME_RUNTIME');
       const published=chosen||dispatcher.volume ? (await Promise.all((chosen||manifest.tasks).map(task=>dispatcher.queue.verifyExisting(task)))).at(-1)
         : await dispatcher.queue.publish(manifest.tasks);
       console.log(`[Redis预检] 通过；任务池=${campaign}，清单${manifest.taskCount}项，新增${published.added}项、已存在${published.existing}项`);
@@ -62,7 +69,8 @@ export class RedisDispatcher {
     if(this.volume){
       if(correctionPolicy)throw new Error('VOLUME_AND_LEGACY_CORRECTION_ARE_EXCLUSIVE');
       let index=0;
-      const chosen=taskIds?taskIds.map(id=>this.manifest.tasks.find(t=>(t.redisTaskId||t.id)===id)):this.manifest.tasks;
+      const eligible=this.schedulingTasks || this.manifest.tasks;
+      const chosen=taskIds?taskIds.map(id=>eligible.find(t=>(t.redisTaskId||t.id)===id)):eligible;
       if(chosen.some(t=>!t))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
       for(const task of chosen){
         if(this.halted||await this.stopped())return;
@@ -191,6 +199,9 @@ export class RedisDispatcher {
     if(volumeResult?.annualEvidence&&result)result.annualAcceptance=volumeResult.annualEvidence;
     if(volumeResult?.searchExhaustionEvidence&&result)result.searchExhaustionAcceptance=volumeResult.searchExhaustionEvidence;
     if(volumeResult?.confirmation){confirmation=volumeResult.confirmation;Object.assign(result||{},
+      ...(confirmation.acceptedByRiskVolume?[{collectionError:result?.collectionError||result?.previousCollectionError||result?.error||null,
+       collectionSucceeded:false,dataImported:true,pendingImport:false,businessCompleted:true,riskVolumeCompleted:true,
+       riskVolumeEvidence:volumeResult.riskVolumeEvidence}]:[]),
       ...(confirmation.acceptedByResetOnce?[{collectionError:result?.collectionError||result?.error||null,
        collectionSucceeded:confirmation.collectionSucceeded===true,dataImported:confirmation.dataImported===true,
        pendingImport:confirmation.pendingImport===true,businessCompleted:true}]:[]),
@@ -210,6 +221,7 @@ export class RedisDispatcher {
     else if (kind === 'defer') confirmation = await this.queue.defer(taskId, token, result);
     else confirmation = await this.queue.fail(taskId, token, result?.error || result?.status || 'Worker interrupted', result);
     if(confirmation?.acceptedBySearchExhaustion)console.log(`[搜索耗尽结案] ${result?.keyword||taskId}：成功完成；入库${volumeResult.decision.posts}/${volumeResult.decision.threshold}篇，保留未解决候选${volumeResult.searchExhaustionEvidence.missingCandidateIds.length}条，非P80达标；继续后续任务`);
+    if(confirmation?.acceptedByRiskVolume)console.log(`[风控达量结案] ${result?.keyword||taskId}：数据库数量已达标且本轮入库成功；保留节点冷却，后续不再重采该词`);
     this.current = null;
     try { await this.writeLease({ active: false, validUntil: 0 }); }
     catch (error) {

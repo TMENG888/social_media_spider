@@ -1,8 +1,10 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import {extractId} from './schema.mjs';
 import {commentPause,waitForPacing} from './collection-pacing.mjs';
 import {aggregateCommentThreads,commentNodesFromResult} from './comment-threads.mjs';
 import {searchScrollDom} from './search-scroll.mjs';
 import {assertPlatformAccess,guardedPlatformAction} from './platform-access.mjs';
+import {clickCommentExpansionWithRetry} from './comment-click-retry.mjs';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function searchCard(page,id){
  if(!/^\d{15,22}$/.test(id||''))throw new Error('SEARCH_CARD_ID_INVALID');
@@ -25,7 +27,8 @@ async function searchCard(page,id){
  // Other players and comment references cannot identify a link-only card.
  return page.locator(`.search-result-card:not([data-e2e-vid]):visible:not(:is(${blocked}) *)`).filter({has:page.locator(`:is(${links.join(',')}):not(:is(${blocked}) *)`),hasNot:page.locator('[data-e2e-vid]')}).filter({hasNot:page.locator('.search-result-card')}).first();
 }
-export async function commentScope(page,id) {
+export async function commentScope(...args){return timed('comment_panel_check',()=>commentScopeDetailedImpl(...args),{});}
+async function commentScopeDetailedImpl(page,id) {
  // A search card remains in the DOM behind a modal. Never collect or scroll
  // its hidden/background comments when the site's click opened a modal.
  const modal=page.locator('[data-e2e="modal-video-container"]');
@@ -77,10 +80,11 @@ function searchRequestKind(request,keyword){
   return value===keyword?'search_api':null;
  }catch{return null;}
 }
-async function visibleSearchControl(groups,{shouldStop,timeoutMs,errorCode}){
+async function visibleSearchControl(groups,{shouldStop,timeoutMs,errorCode,checkAccess}){
  const deadline=Date.now()+timeoutMs;
  do{
   await waitForPacing(0,{shouldStop});
+  await checkAccess();
   for(const group of groups){
    const visible=[];
    for(let i=0;i<await group.count();i++){const control=group.nth(i);if(await control.isVisible()&&await control.isEnabled())visible.push(control);}
@@ -89,6 +93,7 @@ async function visibleSearchControl(groups,{shouldStop,timeoutMs,errorCode}){
   }
   await waitForPacing(Math.min(200,Math.max(0,deadline-Date.now())),{shouldStop});
  }while(Date.now()<deadline);
+ await waitForPacing(0,{shouldStop});await checkAccess();
  throw new Error(`${errorCode}：未找到唯一可见的搜索控件，保留断点`);
 }
 export async function dismissRememberLoginPrompt(page,{shouldStop,observation}={}){
@@ -147,7 +152,7 @@ async function searchFromInput(page,keyword,{shouldStop,timeoutMs,settleMs,typin
   const input=await visibleSearchControl([
    page.locator('[data-e2e="searchbar-input"]'),
    page.locator('input[name="keyword"],input[placeholder*="搜索"]'),
-  ],{shouldStop,timeoutMs,errorCode:'STOP_SEARCH_INPUT_UNAVAILABLE'});
+  ],{shouldStop,timeoutMs,errorCode:'STOP_SEARCH_INPUT_UNAVAILABLE',checkAccess:()=>assertAccess(page)});
   await searchUiAction(page,async()=>{
    await input.click({timeout:Math.min(timeoutMs,4000)});await input.fill('',{timeout:Math.min(timeoutMs,4000)});
   },{shouldStop,observation});
@@ -166,7 +171,7 @@ async function searchFromInput(page,keyword,{shouldStop,timeoutMs,settleMs,typin
   page.locator('[data-e2e="searchbar-button"]'),
   page.getByRole('button',{name:'搜索',exact:true}),
   page.getByText('搜索',{exact:true}),
- ],{shouldStop,timeoutMs,errorCode:'STOP_SEARCH_SUBMIT_UNAVAILABLE'});
+ ],{shouldStop,timeoutMs,errorCode:'STOP_SEARCH_SUBMIT_UNAVAILABLE',checkAccess:()=>assertAccess(page)});
  const requests=new Map();let responseEvidence=null,gatewayStatus=null;
  // Track requests created AFTER input and before the normal search click.
  // A late response from a previous keyword (even the same word) is not proof.
@@ -201,7 +206,8 @@ async function searchFromInput(page,keyword,{shouldStop,timeoutMs,settleMs,typin
   throw new Error('STOP_SEARCH_SUBMIT_UNCONFIRMED：未确认新词搜索框、结果页和本次搜索响应，禁止沿用旧结果');
  }finally{page.off('request',onRequest);page.off('response',onResponse);}
 }
-export async function navigateSearch(page,keyword,{shouldStop,timeoutMs=45000,settleMs=2500,typingDelayMs=65,retryDelaysMs=[15000,30000],allowManualLogin=false,onObservation=()=>{}}={}) {
+export async function navigateSearch(...args){return timed('search',()=>navigateSearchTimingImpl(...args),{});}
+async function navigateSearchTimingImpl(page,keyword,{shouldStop,timeoutMs=45000,settleMs=2500,typingDelayMs=65,retryDelaysMs=[15000,30000],allowManualLogin=false,onObservation=()=>{}}={}) {
  // Ordinary UI search only, within the existing lease and bounded retry budget.
  // No direct search/article requests, proxy changes or CAPTCHA retries.
  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>2||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>60000))throw new Error('SEARCH_GATEWAY_RETRY_BUDGET_INVALID');
@@ -231,7 +237,8 @@ export async function navigateSearch(page,keyword,{shouldStop,timeoutMs=45000,se
 }
 let accessIncidentReporter=null;
 export function setAccessIncidentReporter(reporter){accessIncidentReporter=reporter;}
-export async function assertAccess(page) {
+export async function assertAccess(...args){return timed('access_check',()=>assertAccessDetailedImpl(...args),{});}
+async function assertAccessDetailedImpl(page) {
  await assertPlatformAccess(page,'抖音',{report:accessIncidentReporter});
 }
 async function searchCheck(page,shouldStop){
@@ -253,7 +260,8 @@ export async function searchEndUi(page,keyword){
  }
  return {visible:false};
 }
-export async function scrollSearchResults(page,{keyword}={}){
+export async function scrollSearchResults(...args){return timed('search',()=>scrollSearchResultsTimingImpl(...args),{});}
+async function scrollSearchResultsTimingImpl(page,{keyword}={}){
  const current=searchPageKeyword(page.url());
  if(current===null||(keyword!=null&&current!==keyword))throw new Error('STOP_SEARCH_SCROLL_CONTEXT_LOST');
  await assertAccess(page);
@@ -296,7 +304,7 @@ export async function waitForInitialSearch(page,observer,{shouldStop,timeoutMs=4
     })};
   }).catch(()=>({unavailable:true}))});
  do{
-  await searchCheck(page,shouldStop);await observer.flush();
+  await searchCheck(page,shouldStop);await timed('response_flush',()=>observer.flush());
   const keyword=searchPageKeyword(page.url());
   if(expectedKeyword!=null&&keyword!==expectedKeyword)throw new Error('STOP_SEARCH_CONTEXT_LOST：搜索准备期间关键词改变');
   const failure=(observer.searchFailures||[]).filter(current).at(-1);
@@ -358,7 +366,7 @@ export async function selectLatest(page,observer,keyword,options={}) {
  await latest.last().click({timeout:10000});
  // Confirm the actual UI-triggered request, not just a successful click.
  for(let i=0;i<20;i++){
-  await searchCheck(page,options.shouldStop);await observer.flush();
+  await searchCheck(page,options.shouldStop);await timed('response_flush',()=>observer.flush());
   if(observer.searchRequests.some(r=>r.at>=start&&r.latest&&(!r.keyword||r.keyword===keyword))){
    // Sorting remounts the list. Do not acknowledge the layout from an old
    // click before the new search has rendered its actual single-column rows.
@@ -385,7 +393,8 @@ function retryableInitialSearch(error){
  // Never repeatedly submit it as an ordinary loading/transport failure.
  return failure?.statusCode==null&&([502,503,504].includes(failure?.http)||['DOUYIN_RESPONSE_BODY_TIMEOUT'].includes(failure?.error));
 }
-export async function selectLatestWithRecovery(page,observer,keyword,{after=0,documentVerified=false,shouldStop,
+export async function selectLatestWithRecovery(...args){return timed('search',()=>selectLatestWithRecoveryTimingImpl(...args),{});}
+async function selectLatestWithRecoveryTimingImpl(page,observer,keyword,{after=0,documentVerified=false,shouldStop,
  timeoutMs=45000,pollMs=500,navigationOptions={},retryDelaysMs=[15000,30000],onRecovery=()=>{},onDiagnostic}={}){
  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>2||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>60000))throw new Error('SEARCH_READINESS_RETRY_BUDGET_INVALID');
  const audit={version:SEARCH_PREPARATION_VERSION,keyword,maxRetries:retryDelaysMs.length,attempts:[]};
@@ -416,7 +425,8 @@ export async function selectLatestWithRecovery(page,observer,keyword,{after=0,do
   }
  }
 }
-export async function visibleCards(page) {
+export async function visibleCards(...args){return timed('search',()=>visibleCardsTimingImpl(...args),{});}
+async function visibleCardsTimingImpl(page) {
  const snapshot=await page.locator('.search-result-card').evaluateAll(cards=>{
   const blocked='[data-e2e="comment-list"],[data-e2e="comment-list-container"],[data-e2e="modal-video-container"],nav,aside';
   const valid=id=>/^\d{15,22}$/.test(id||'');
@@ -446,7 +456,8 @@ export async function visibleCards(page) {
   });
  });
 }
-export async function openCard(page,note) {
+export async function openCard(...args){return timed('detail_open',()=>openCardTimingImpl(...args),{});}
+async function openCardTimingImpl(page,note) {
  if(!/^\d{15,22}$/.test(note.noteId||''))throw new Error('SEARCH_CARD_ID_INVALID');
  if(!(await visibleCards(page)).some(row=>row.noteId===note.noteId))throw new Error('SEARCH_CARD_NOT_VISIBLE：重新扫描当前搜索结果，不直接打开详情地址');
  const card=await searchCard(page,note.noteId);
@@ -478,7 +489,8 @@ export async function openCard(page,note) {
  }
  throw new Error('SEARCH_CARD_NOT_VISIBLE：重新扫描当前搜索结果，不直接打开详情地址');
 }
-export async function restoreSearch(page,keyword,noteId=null) {
+export async function restoreSearch(...args){return timed('return_search',()=>restoreSearchTimingImpl(...args),{});}
+async function restoreSearchTimingImpl(page,keyword,noteId=null) {
  // Normal details close in place. Never visit an author or reload search here.
  if(noteId&&!new URL(page.url()).searchParams.has('modal_id')){
   const card=await searchCard(page,noteId);
@@ -520,13 +532,14 @@ export function commentRepairPlan(prior,post){
  if(roots.some(id=>!rows.some(c=>c.评论id===id&&c.文章id===post.文章id&&Number(c.评论回复数)>0)))return null;
  return {rootIds:roots,rows,audits:prior.commentAudits||[],pages:audit.pages};
 }
-export async function collectComments(page,observer,post,{shouldStop,maxRounds=0,priorResult=null,pacingConfig=null}={}) {
+export async function collectComments(...args){return timed('comments',()=>collectCommentsTimingImpl(...args),{});}
+async function collectCommentsTimingImpl(page,observer,post,{shouldStop,maxRounds=0,priorResult=null,pacingConfig=null,onDiagnostic}={}) {
  const id=post.文章id;
  if(post.文章评论数!=null&&Number(post.文章评论数)===0)return {rows:[],audit:{status:'reported_zero',complete:true,reported:0}};
  const start=Date.now();
  const repair=commentRepairPlan(priorResult,post);
  if(repair)console.log(`[评论精准恢复] ${id}：保留${repair.rows.length}条及${repair.pages}页主分页结束证据，仅补验${repair.rootIds.length}个缺口回复线程`);
- let zeroGrowth=0,lastCount=-1,lastScroll=null,round=0,lastProgressAt=0;
+ let zeroGrowth=0,lastCount=-1,lastScroll=null,round=0,lastProgressAt=0,lastLoggedCount=0;
  const scope=await commentScope(page,id);
  const existingPanel=scope.locator('[data-e2e="comment-list"],[data-e2e="comment-list-container"]');
  let panelOpen=false;for(let i=0;i<await existingPanel.count();i++)if(await existingPanel.nth(i).isVisible()){panelOpen=true;break;}
@@ -539,9 +552,9 @@ export async function collectComments(page,observer,post,{shouldStop,maxRounds=0
   if(pacingConfig){
    const delay=commentPause(pacingConfig,round);
    if(delay.kind==='comment_batch')console.log(`[评论休息] ${id}：完成${round}轮分页，休息${Math.round(delay.ms/1000)}秒`);
-   await waitForPacing(delay.ms,{shouldStop});await assertAccess(page);
+   await waitForPacing(delay.ms,{shouldStop,reason:delay.kind});await assertAccess(page);
   }else await pause(1200);
-  await observer.flush();
+  await timed('response_flush',()=>observer.flush());
   // The observer is keyword-scoped. Opening a card may preload its comment
   // page before this function starts; do not discard that real end-page proof.
   const roots=observer.commentPages.filter(p=>p.awemeId===id&&!p.rootId);
@@ -549,18 +562,36 @@ export async function collectComments(page,observer,post,{shouldStop,maxRounds=0
   const rootEnd=roots.some(p=>Number(p.hasMore)===0)||!!repair;
   const replyRoots=repair?repair.rootIds.map(cid=>({cid})):raw.filter(c=>Number(c.reply_comment_total)>0&&(!c.reply_id||String(c.reply_id)==='0'));
   // Expand every visible reply control through the site's UI.
-  const expand=scope.getByText(/^(?:展开\s*\d+\s*(?:条|个)?\s*回复|展开更多(?:回复)?|查看更多回复)$/,{exact:true});
-  let expanded=false;
+  const expanded=await clickCommentExpansionWithRetry({
+   check:async()=>{
+    if(await shouldStop?.())throw new Error('STOP_REQUESTED：评论点击重试已安全停止');
+    await assertAccess(page);
+    // Fail if a modal switched to another video; never expand another post.
+    await commentScope(page,id);
+   },
+   flush:()=>observer.flush(),
+   findControl:async()=>{
+    const currentScope=await commentScope(page,id);
+    const expand=currentScope.getByText(/^(?:展开\s*\d+\s*(?:条|个)?\s*回复|展开更多(?:回复)?|查看更多回复)$/,{exact:true});
+    for(let i=0;i<Math.min(await expand.count(),20);i++)if(await expand.nth(i).isVisible())return expand.nth(i);
+    return null;
+   },
+   onFailure:async({error,attempt,retrying,delayMs,audit})=>{
+    await onDiagnostic?.({stage:retrying?'comment_click_retry':'comment_click_failed',error,
+     details:{postId:id,attempt,retrying,delayMs,retry:audit}});
+   }
+  });
   // Reply expansion is an in-place action. Do not wait for unrelated scheduled
   // navigation after the click already finished; validate access/context in
   // the following iteration and confirm the actual reply response instead.
-  for(let i=0;i<Math.min(await expand.count(),20);i++)if(await expand.nth(i).isVisible()){await expand.nth(i).click({timeout:10000,noWaitAfter:true});expanded=true;await pause(800);break;}
+  if(expanded)await pause(800);
   const replyEnds=observer.commentPages.filter(p=>p.awemeId===id&&p.rootId&&Number(p.hasMore)===0);
   const replyComplete=c=>replyEnds.some(p=>p.rootId===String(c.cid))||observer.embeddedReplyCoverage?.get(`${id}/${c.cid}`)?.complete===true;
   const merged=snapshot(cid=>replyRoots.some(c=>String(c.cid)===cid)?replyComplete({cid}):null);
   const repliesComplete=replyRoots.every(replyComplete)&&merged.orphanCommentIds.length===0&&merged.commentAudits.every(a=>a.thread_complete!==false);
-  if(Date.now()-lastProgressAt>=30000){console.log(`[评论进度] ${id}：已取得${raw.length}条，页面统计${post.文章评论数}；主分页${roots.length}页，主分页结束=${rootEnd}，回复结束=${repliesComplete}`);lastProgressAt=Date.now();}
+  if(Date.now()-lastProgressAt>=30000){timingProgress('comment_progress',{round,comments:raw.length,pages:roots.length,replyPages:replyEnds.length,deltaCount:Math.max(0,raw.length-lastLoggedCount),rootEnd,repliesComplete,expanded,zeroGrowth});lastLoggedCount=raw.length;console.log(`[评论进度] ${id}：已取得${raw.length}条，页面统计${post.文章评论数}；主分页${roots.length}页，主分页结束=${rootEnd}，回复结束=${repliesComplete}`);lastProgressAt=Date.now();}
   if(rootEnd&&repliesComplete&&!expanded){
+   timingProgress('comment_completed',{round,comments:merged.rawCommentCount,threads:merged.threadCount,rootEnd,repliesComplete});
    return {rows:merged.rows,commentAudits:merged.commentAudits,audit:{status:'browser_pages_exhausted',complete:true,aggregation_mode:'comment_thread',aggregation_version:1,reported:post.文章评论数,collected:merged.rawCommentCount,raw_comment_count:merged.rawCommentCount,thread_count:merged.threadCount,pages:repair?.pages||roots.length,rootEnd:true,resumedRootEnd:!!repair,repairRootIds:repair?.rootIds||[],collectionStartedAt:start}};
   }
   const panel=scope.locator('[data-e2e="comment-list"],[data-e2e="comment-list-container"]');
@@ -576,7 +607,7 @@ export async function collectComments(page,observer,post,{shouldStop,maxRounds=0
   // A large wheel delta chains from a short sidebar into the search list,
   // activating the next video. Native element scrolling confines movement
   // to this post's comment scrollport and emits its normal scroll events.
-  await target.evaluate(el=>el.scrollBy({top:Math.max(80,Math.min(400,el.clientHeight*.8)),behavior:'smooth'}));
+  await timed('comment_scroll',()=>target.evaluate(el=>el.scrollBy({top:Math.max(80,Math.min(400,el.clientHeight*.8)),behavior:'smooth'})),{round});
  }
  }catch(error){
   // All failures, including an ordinary locator timeout, retain observations

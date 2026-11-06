@@ -12,12 +12,12 @@ const forbiddenError=/(?:STOP_|LOGIN|CAPTCHA|SECURITY|RESTRICTION|COOLDOWN|LEASE
  * Unknown dates, dead letters and unlocated results remain in the upper bound.
  * This proves a bound on available browser-search results, not platform recall.
  */
-export function assessAnnualLowVolume(decision,{scan,inventory,error=null,year=2026}={}, {now=Date.now(),maxScanAgeMs=1800000}={}){
+export function assessAnnualLowVolume(decision,{scan,inventory,error=null,year=2026}={}, {now=Date.now(),sqlNow=now,maxScanAgeMs=1800000}={}){
  if(!decision||decision.dbReadbackVerified!==true||decision.subtitleQualityRequired!==false||decision.qualityVerified!==false
   ||!integer(decision.posts)||!integer(decision.threshold)||decision.threshold<1||!decision.taskId||!decision.keyword||!decision.projectName)
   return reject('ANNUAL_SQL_EVIDENCE_INVALID');
  const checkedAt=stamp(decision.checkedAt);
- if(!Number.isFinite(checkedAt)||now-checkedAt>60000||checkedAt>now+1000)return reject('ANNUAL_SQL_EVIDENCE_STALE');
+ if(!Number.isFinite(checkedAt)||sqlNow-checkedAt>60000||checkedAt>sqlNow+1000)return reject('ANNUAL_SQL_EVIDENCE_STALE');
  if(decision.posts>=decision.threshold)return reject('USE_QUANTITY_COMPLETION');
  if(error&&error!=='VOLUME_BELOW_THRESHOLD'&&error!=='KNOWN_CANDIDATES_INCOMPLETE')return reject('ANNUAL_COLLECTOR_ERROR');
  if(error&&forbiddenError.test(error))return reject('ANNUAL_COLLECTOR_ERROR');

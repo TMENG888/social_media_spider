@@ -4,7 +4,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import os from 'node:os';
 import {inspectPlatformAccess} from './platform-access.mjs';
-export const DIAGNOSTIC_VERSION='page-diagnostics-20261021-search-v2';
+export const DIAGNOSTIC_VERSION='page-diagnostics-20261105-bound-page-v4';
 
 export function safeUrl(value) {
   try {
@@ -51,6 +51,47 @@ async function bounded(work,ms=2500) {
   try{return await Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DIAGNOSTIC_TIMEOUT')),ms);})]);}
   finally{clearTimeout(timer);}
 }
+// Snapshot only the already loaded DOM. Never reload a failed URL or save
+// cookies/storage/scripts. A failed download navigation may leave about:blank.
+export async function captureDiagnosticHtml(page) {
+  return page.evaluate(()=>{
+    const clone=document.documentElement.cloneNode(true);
+    clone.querySelectorAll('script,template,base,iframe,object,embed').forEach(el=>el.remove());
+    const redact=value=>String(value).replace(/(["']?(?:password|passwd|authorization|cookie|access_token|refresh_token|xsec_token|secret|token)["']?\s*[:=]\s*)[^\s,;<>]+/gi,'$1[redacted]');
+    const url=value=>{
+      try{
+        const u=new URL(value,location.href);
+        if(!['http:','https:','about:'].includes(u.protocol))return '[removed]';
+        u.username='';u.password='';u.hash='';
+        for(const key of [...u.searchParams.keys()])if(!['keyword','source','type','modal_id','sort_type','publish_time'].includes(key))u.searchParams.delete(key);
+        return u.href;
+      }catch{return '[removed]';}
+    };
+    for(const el of [clone,...clone.querySelectorAll('*')]){
+      for(const attr of [...el.attributes]){
+        if(/^on/i.test(attr.name)||/password|passwd|authorization|cookie|token|secret|nonce|srcdoc|srcset|action|formaction/i.test(attr.name))el.removeAttribute(attr.name);
+        else if(['href','src','poster','data'].includes(attr.name))el.setAttribute(attr.name,url(attr.value));
+        else el.setAttribute(attr.name,redact(attr.value));
+      }
+      if(el.matches('input,textarea,select')){
+        el.removeAttribute('value');el.removeAttribute('checked');
+        if(el.tagName!=='INPUT')el.textContent='[form value removed]';
+      }
+      if(el.matches('meta[http-equiv],meta[name]'))el.remove();
+    }
+    const walker=document.createTreeWalker(clone,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_COMMENT);
+    const remove=[];while(walker.nextNode()){
+      const node=walker.currentNode;
+      if(node.nodeType===Node.COMMENT_NODE)remove.push(node);else node.textContent=redact(node.textContent);
+    }
+    remove.forEach(node=>node.remove());
+    let head=clone.querySelector('head');if(!head){head=document.createElement('head');clone.prepend(head);}
+    const charset=document.createElement('meta');charset.setAttribute('charset','utf-8');head.prepend(charset);
+    const csp=document.createElement('meta');csp.setAttribute('http-equiv','Content-Security-Policy');
+    csp.setAttribute('content',"default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'");head.prepend(csp);
+    return '<!DOCTYPE html>\n'+clone.outerHTML;
+  });
+}
 export function diagnosticReasons(evidence) {
   const reasons=[];
   const layoutFailure=/^layout_(?:click_failed|not_confirmed)$/.test(evidence.stage||'')
@@ -86,7 +127,7 @@ function contextFor(url,platform,keyword) {
     return {matches:Boolean(route&&current===keyword),observedKeyword:safeText(current),expectedKeyword:safeText(keyword)};
   }catch{return {matches:false,observedKeyword:null,expectedKeyword:safeText(keyword)};}
 }
-export function createPageDiagnostics({page,platform,keyword,outputDir,workerId='',runId='',limit=60}){
+export function createPageDiagnostics({page,platform,keyword,outputDir,workerId='',runId='',pageRole='collection',limit=60}){
   const timeline=[],listeners=[];let sequence=0,lastCapture=null;
   const mark=(stage,details={})=>{
     const event={sequence:++sequence,...stamp(),stage,url:safeUrl(page?.url?.()),details:safeValue(details)};
@@ -100,15 +141,34 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
   listen('pageerror',error=>mark('page_javascript_error',{errors:diagnosticError(error)}));
   listen('requestfailed',request=>{try{if(request.isNavigationRequest())mark('navigation_request_failed',
     {url:safeUrl(request.url()),failure:safeText(request.failure()?.errorText)});}catch{}});
-  mark('diagnostics_attached');
+  listen('response',response=>{try{
+    const request=response.request();
+    if(!request.isNavigationRequest()||request.frame()!==page.mainFrame())return;
+    const headers=response.headers();
+    mark('navigation_response',{url:safeUrl(response.url()),httpStatus:response.status(),
+      contentType:safeText(headers['content-type']||''),contentDisposition:safeText(headers['content-disposition']||''),
+      contentLength:safeText(headers['content-length']||''),location:headers.location?safeUrl(new URL(headers.location,response.url()).href):null});
+  }catch{}});
+  listen('download',download=>{try{mark('navigation_download_started',{
+    url:safeUrl(download.url()),suggestedFilename:safeText(path.basename(download.suggestedFilename()))});}catch{}});
+  mark('diagnostics_attached',{pageRole});
+  console.log('[Page diagnostics ready] '+DIAGNOSTIC_VERSION+' '+platform+' / '+pageRole);
   const capture=async(stage,error,details={})=>{
     try {
       mark(stage,{...details,errors:diagnosticError(error)});
       const rawUrl=page?.url?.()||'';
       const evidence={schemaVersion:1,diagnosticVersion:DIAGNOSTIC_VERSION,nodeVersion:process.version,...stamp(),platform,keyword:safeText(keyword),workerId,runId,
-        computer:os.hostname(),pid:process.pid,stage,url:safeUrl(rawUrl),closed:!page||page.isClosed(),
-        context:contextFor(rawUrl,platform,keyword),errors:diagnosticError(error),details:safeValue(details)};
+        computer:os.hostname(),pid:process.pid,stage,pageRole,url:safeUrl(rawUrl),closed:!page||page.isClosed(),
+        captureSource:'bound_playwright_page',
+        context:(pageRole.includes('detail')||details.noteId)?{matches:null,kind:'detail',expectedKeyword:safeText(keyword)}:contextFor(rawUrl,platform,keyword),errors:diagnosticError(error),details:safeValue(details)};
       if(!evidence.closed){
+        evidence.activation={attempted:true,succeeded:false};
+        try{await bounded(()=>page.bringToFront(),1500);evidence.activation.succeeded=true;}
+        catch(e){evidence.activation.error=safeText(e.message);}
+        const host=(()=>{try{return new URL(rawUrl).hostname;}catch{return '';}})();
+        evidence.pageIdentity={expectedPlatform:platform,
+          platformHostMatches:platform==='小红书'?/(^|\.)xiaohongshu\.com$/i.test(host):/(^|\.)douyin\.com$/i.test(host),
+          role:pageRole,actualUrl:safeUrl(rawUrl)};
         try{evidence.access=await bounded(()=>inspectPlatformAccess(page,platform));}catch{}
         try{
           evidence.dom=await bounded(()=>page.evaluate(()=>{
@@ -151,18 +211,24 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
         try{evidence.tabs=page.context().pages().slice(0,12).map(p=>({url:safeUrl(p.url()),closed:p.isClosed(),current:p===page}));}catch{}
       }
       evidence.reasons=diagnosticReasons(evidence);
+      if(evidence.pageIdentity?.platformHostMatches===false)evidence.reasons.push('bound_page_outside_platform_or_browser_error');
       evidence.timeline=[...timeline];
       const directory=path.join(outputDir,'page-diagnostics');
       await fs.mkdir(directory,{recursive:true});
       const id=Date.now()+'-'+randomUUID().slice(0,8);
-      const jsonFile=path.join(directory,id+'.json'),imageFile=path.join(directory,id+'.png');
+      const jsonFile=path.join(directory,id+'.json'),imageFile=path.join(directory,id+'.png'),htmlFile=path.join(directory,id+'.html');
+      evidence.htmlSnapshotKind='current_rendered_dom_redacted';
       if(!evidence.closed){
+        try{
+          const html=await bounded(()=>captureDiagnosticHtml(page),3000);
+          await fs.writeFile(htmlFile,html,{encoding:'utf8',flag:'wx'});evidence.html=path.basename(htmlFile);
+        }catch(e){evidence.htmlError=safeText(e.message);}
         try{await bounded(()=>page.screenshot({path:imageFile,timeout:3000,fullPage:false,
           mask:[page.locator('input,canvas,iframe,[class*="qr"],[class*="QR"],[data-e2e*="qr"]')]}),3500);evidence.screenshot=path.basename(imageFile);}
         catch(e){evidence.screenshotError=safeText(e.message);}
       }
       await fs.writeFile(jsonFile,JSON.stringify(safeValue(evidence),null,2),{encoding:'utf8',flag:'wx'});
-      lastCapture={jsonFile,screenshot:evidence.screenshot?imageFile:null,at:evidence.at,stage,reasons:evidence.reasons};
+      lastCapture={jsonFile,htmlFile:evidence.html?htmlFile:null,screenshot:evidence.screenshot?imageFile:null,at:evidence.at,stage,reasons:evidence.reasons};
       console.warn('[Page diagnostics] '+DIAGNOSTIC_VERSION+' '+platform+' '+stage+' / '+evidence.reasons.join(',')+' / '+jsonFile);
       return lastCapture;
     }catch(e){console.warn('[Page diagnostics] Capture unavailable; original collection error retained.');return {stage,captureError:safeText(e.message)};}

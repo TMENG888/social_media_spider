@@ -1,3 +1,6 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
+import {observeAccountNickname} from './account-nickname.mjs';
+import {noteTaskResumed} from './login-bridge.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -5,6 +8,8 @@ import {spawnSync} from 'node:child_process';
 import {chromium} from 'playwright';
 import mysql from 'mysql2/promise';
 import {collectKeyword} from './collector.mjs';
+import {createPersistenceGate} from './persistence-gate.mjs';
+import {assertLocalLease} from './lease-guard.mjs';
 import {RedisDispatcher} from './redis-dispatcher.mjs';
 import {loadTaskManifest} from './redis-task-manifest.mjs';
 import {mysqlConnectionOptions,verifyTable} from './import-mysql.mjs';
@@ -20,10 +25,12 @@ import {supportedCorrectionPolicy} from './correction-lease.mjs';
 import {keywordQueueConfirmed as volumeQueueConfirmed,reconcileVolumeCompletion} from './volume-confirmation.mjs';
 import {OperationalGate,classifyRestriction} from './operational-gate.mjs';
 import {setAccessIncidentReporter} from './douyin-browser.mjs';
+import {installWorkerDiagnostics} from './worker-diagnostics.mjs';
 const common=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const args={};for(let i=2;i<process.argv.length;i++){if(!process.argv[i].startsWith('--'))continue;const k=process.argv[i].slice(2),v=process.argv[i+1];args[k]=v&&!v.startsWith('--')?process.argv[++i]:true;}
 const worker=path.resolve(String(args['worker-root']||path.join(common,'../worker-01')));
 const workerId=path.basename(worker),stateRoot=path.join(worker,'.state'),runsRoot=path.join(worker,'runs');
+installWorkerDiagnostics(worker);
 const readJson=async file=>JSON.parse((await fs.readFile(file,'utf8')).replace(/^\uFEFF/,''));
 const exists=async file=>fs.access(file).then(()=>true,()=>false);
 const config=await readJson(path.join(common,'config.json'));
@@ -39,6 +46,7 @@ if(args.preflight){
  if(probe.status!==0)checks.asrError=probe.error?.message||String(probe.stderr).split('\n').at(-2);
  console.log(JSON.stringify(checks,null,2));process.exit(checks.ok?0:1);
 }
+configureTiming({directory:path.join(runsRoot,'timing'),platform:'抖音',workerId,runId:'worker-'+process.pid+'-'+Date.now(),lane:'foreground'});
 const commit=!args['export-only'],test=Boolean(args.test),phase=String(args.phase||'auto');
 const onlyKeywords=args['only-keywords']?String(args['only-keywords']).split('|').filter(Boolean):null;
 if(onlyKeywords&&test)throw new Error('SELECTED_ANNUAL_RUN_CANNOT_USE_SAMPLE_TEST_MODE');
@@ -53,26 +61,27 @@ if(!Number.isFinite(runtimeMinutes)||runtimeMinutes<0)throw new Error('MAX_RUNTI
 const deadline=runtimeMinutes===0?Infinity:Date.now()+runtimeMinutes*60000;
 let requested=false,dispatcher=null,context=null,fatal=null,retryAfterRest=false;
 let remoteControl=null,operations=null;
-const shouldStop=async()=>requested||Date.now()>=deadline||await exists(stopFile);
-process.on('SIGINT',()=>{requested=true;});process.on('SIGTERM',()=>{requested=true;});
+const shouldStop=async()=>{if(requested){timingStop('worker_stop_flag');return true;}if(Date.now()>=deadline){timingStop('runtime_deadline',{deadlineAtMs:deadline});return true;}if(await exists(stopFile)){timingStop('stop_file');return true;}return false;};
+process.on('SIGINT',()=>{timingStop('os_signal');requested=true;});process.on('SIGTERM',()=>{timingStop('os_signal');requested=true;});
 const lockFile=path.join(stateRoot,'worker.lock');let lock;
 try{lock=await fs.open(lockFile,'wx');await lock.writeFile(JSON.stringify({pid:process.pid,at:new Date().toISOString()}));}
 catch(e){if(e.code!=='EEXIST')throw e;let old;try{old=await readJson(lockFile);}catch{}let alive=false;if(old?.pid){try{process.kill(old.pid,0);alive=true;}catch{}}
  if(alive)throw new Error('WORKER_ALREADY_RUNNING：同一节点禁止重复启动');await fs.rm(lockFile,{force:true});lock=await fs.open(lockFile,'wx');await lock.writeFile(JSON.stringify({pid:process.pid}));}
-const status={workerId,startedAt:new Date().toISOString(),phase,tasks:[],completed:0,failed:0,status:'running',fatalError:null};
+const status={codeVersion:"finalize-cluster-fixes-20261105-v3",workerId,startedAt:new Date().toISOString(),phase,tasks:[],completed:0,failed:0,status:'running',fatalError:null};
 try{
- if(!test&&commit){remoteControl=await RemoteStopControl.open(common,worker);await remoteControl.gate();remoteControl.watch();}
- if(!test&&commit){operations=await OperationalGate.open({root:common,workerId,platform:'抖音'});await operations.assertReady();}
+ if(!test&&commit){remoteControl=await timed('control_open',()=>RemoteStopControl.open(common,worker));await timed('control_gate',()=>remoteControl.gate());remoteControl.watch();}
+ if(!test&&commit){operations=await timed('operational_gate_open',()=>OperationalGate.open({root:common,workerId,platform:'抖音'}));await timed('operational_gate_check',()=>operations.assertReady());}
  if(operations)setAccessIncidentReporter(message=>operations.record(message,{taskId:dispatcher?.current?.taskId||'',keyword:status.currentKeyword||''}));
  try{await cleanupWorkerAsrMedia({stateRoot,mediaName:'media',keepMedia:config.asrKeepMedia===true,dryRun:false});}
  catch(e){console.warn(`[ASR媒体清理] 跳过本轮清理，不影响采集：${e.message}`);}
  if(commit){
-  const db=await mysql.createConnection(mysqlConnectionOptions());
+  const db=await timed('database_connect',()=>mysql.createConnection(mysqlConnectionOptions()));
   try{await verifyTable(db,'ods_social_media_post',POST_FIELDS);await verifyTable(db,'ods_social_media_comment',COMMENT_FIELDS);console.log('[数据库预检] 连接与两张目标表结构通过');}finally{await db.end();}
  }
- if(!test)dispatcher=await RedisDispatcher.open({root:common,stateRoot,workerId,skipImport:!commit,stopFile,selectedTaskIds:selectedTasks?.map(t=>t.redisTaskId||t.id)||null});
+ if(!test)dispatcher=await timed('dispatcher_open',()=>RedisDispatcher.open({root:common,stateRoot,workerId,skipImport:!commit,stopFile,selectedTaskIds:selectedTasks?.map(t=>t.redisTaskId||t.id)||null}));
  if(dispatcher){dispatcher.operations=operations;dispatcher.operationalShouldStop=shouldStop;}
- context=await chromium.launchPersistentContext(path.join(stateRoot,'browser-profile'),{executablePath:chrome,headless:false,viewport:null,timeout:45000});
+ context=await timed('startup',()=>chromium.launchPersistentContext(path.join(stateRoot,'browser-profile'),{executablePath:chrome,headless:false,viewport:null,timeout:45000}));
+ observeAccountNickname({context,stateRoot,platform:'抖音'});
  const page=context.pages()[0]||await context.newPage();
  // Reject accidental popup navigation during the posts phase instead of
  // silently collecting in another tab and losing the latest search context.
@@ -87,8 +96,13 @@ try{
    const taskKey=stableId(`${task.topic}/${task.keyword}`),replay=dispatcher?.current?.recollectionPolicy||'',stateDir=path.join(stateRoot,'tasks',taskKey,replay),outputDir=path.join(runsRoot,taskKey,replay);
    status.currentKeyword=task.keyword;await writeJsonAtomic(path.join(runsRoot,'worker_status.json'),status);
    try{
-    const result=await collectKeyword({page,task,config,commonRoot:common,stateDir,outputDir,shouldStop,sampleLimit:test?Number(args.limit||10):verificationSample,commit,allowManualLogin:test});
-    const confirmation=dispatcher?await dispatcher.finish(verificationSample?'release':'complete',result):null;
+    const result=await collectKeyword({page,task,config,commonRoot:common,stateDir,outputDir,shouldStop,onContentImported:()=>noteTaskResumed({worker,stateRoot,keyword:task.keyword,evidence:'original_supervisor_content_imported'}).catch(()=>{}),persistenceGate:createPersistenceGate({
+      stopCollecting:shouldStop,verifyLease:()=>assertLocalLease(),
+      verifyControl:async()=>{if(!test&&commit){if(!remoteControl)throw new Error('PERSISTENCE_CONTROL_UNAVAILABLE');await remoteControl.verifyPersistence();}},
+      readStop:async()=>{try{return await fs.readFile(stopFile,'utf8');}catch(e){if(e.code==='ENOENT')return '';throw e;}}
+    }),sampleLimit:test?Number(args.limit||10):verificationSample,commit,allowManualLogin:test});
+    result.riskVolumeStopApproved=!requested&&!await exists(stopFile);
+    const confirmation=dispatcher?await timed('task_confirmation',()=>dispatcher.finish(verificationSample?'release':'complete',result),{keyword:task.keyword}):null;
     if(dispatcher?.volume&&!verificationSample){
      Object.assign(result,reconcileVolumeCompletion(result,confirmation));
      if(!result.redisConfirmed){
@@ -102,7 +116,7 @@ try{
     else if(result.disposition==='no_change')status.noChangeCompleted=(status.noChangeCompleted||0)+1;
     else if(result.status==='completed_with_skips')status.completedWithSkips=(status.completedWithSkips||0)+1;
     else status.completed++;
-    if(result.mustStopNode){const restriction=classifyRestriction(result.error);if(restriction)status.operationalHold=restriction;requested=true;break;}
+    if(result.mustStopNode){const restriction=classifyRestriction(result.collectionError||result.previousCollectionError||result.error);if(restriction)status.operationalHold=restriction;requested=true;break;}
     // A verified sample is not an annual keyword completion. Keep all saved
     // rows/checkpoints, return the real lease, and leave production pending.
    }catch(e){
@@ -113,6 +127,7 @@ try{
     const boundedContentRetry=!test&&!verificationSample&&maySkipExhausted(e.collectionSummary);
     if(boundedContentRetry&&!restriction)action='content_retry';
     const failureRecord=e.collectionSummary||{error:e.message};
+    failureRecord.riskVolumeStopApproved=!requested&&!await exists(stopFile);
     if(restriction)failureRecord.error=e.message;
     const confirmation=dispatcher&&!dispatcher.lost?await dispatcher.finish(e.reviewRequired?'review':action==='stop'?'release':action==='rest_retry'?'defer':'fail',failureRecord):null;
     if(volumeQueueConfirmed(confirmation)){
@@ -138,7 +153,7 @@ try{
    }
   }
  }
- if(dispatcher&&commit&&phase!=='posts'&&!retryAfterRest&&!await shouldStop())status.authors=await authorPhase({page,root:common,stateRoot,workerId,stopFile,postDispatcher:dispatcher,config,shouldStop});
+ if(dispatcher&&(!dispatcher.scopeLimited||phase==='authors')&&commit&&phase!=='posts'&&!retryAfterRest&&!await shouldStop())status.authors=await authorPhase({page,root:common,stateRoot,workerId,stopFile,postDispatcher:dispatcher,config,shouldStop});
  status.status=await shouldStop()?'partial_stopped':retryAfterRest?'retry_after_rest':verificationSample?'sample_completed':'completed';
  if(test&&commit&&!await shouldStop()){
   const results=[];const db=await mysql.createConnection(mysqlConnectionOptions());

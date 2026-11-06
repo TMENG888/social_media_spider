@@ -1,3 +1,4 @@
+import {readControlWithReconnect} from './control-read-retry.mjs';
 // Dedicated control keys only. Never claim, ACK, reset a task, or kill a PID.
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -72,8 +73,8 @@ async function atomicJson(file,value) {
   await fs.writeFile(temp,JSON.stringify(value,null,2),'utf8');await fs.rename(temp,file);
 }
 export class RemoteStopControl {
-  constructor(ctx,client){this.ctx=ctx;this.client=client;this.request=null;this.timer=null;this.polling=null;this.closed=false;}
-  static async open(commonRoot,workerRoot){const ctx=await controlContext(commonRoot,workerRoot);return new RemoteStopControl(ctx,await connectControl(ctx));}
+  constructor(ctx,client,{connect=connectControl,retryOptions={}}={}){this.ctx=ctx;this.client=client;this.request=null;this.timer=null;this.polling=null;this.closed=false;this.reading=Promise.resolve();this.connect=connect;this.retryOptions=retryOptions;}
+  static async open(commonRoot,workerRoot){const ctx=await controlContext(commonRoot,workerRoot);const control=new RemoteStopControl(ctx,null);await readControlWithReconnect(control,client=>controlCommand(client,ctx,'HGET','stop-requests',[ctx.target]),connectControl);return control;}
   get receiptFile(){return path.join(this.ctx.workerRoot,'.state','remote-stop-receipt.json');}
   async flags(request) {
     const state=path.join(this.ctx.workerRoot,'.state');await fs.mkdir(state,{recursive:true});
@@ -87,11 +88,34 @@ export class RemoteStopControl {
     await controlCommand(this.client,this.ctx,'HSET','stop-acks',[this.ctx.target,JSON.stringify(value)]);
     return value;
   }
+  async readRequest() {
+    // A reconnect replaces the connection. Queue all authoritative reads so the
+    // collector and background watcher cannot close each other's live client.
+    const pending=this.reading.catch(()=>{}).then(()=>readControlWithReconnect(this,
+      client=>controlCommand(client,this.ctx,'HGET','stop-requests',[this.ctx.target]),this.connect,this.retryOptions));
+    this.reading=pending;
+    return pending;
+  }
   async poll({terminal=null}={}) {
-    const raw=await controlCommand(this.client,this.ctx,'HGET','stop-requests',[this.ctx.target]);
+    const previousReconnects=this.reconnectedReads||0;
+    const raw=await this.readRequest();
+    if((this.reconnectedReads||0)>previousReconnects)console.warn('[Remote control] Fresh authenticated read verified after reconnect.');
     const request=parseRequest(raw,this.ctx);
     if(request){this.request=request;await this.flags(request);await this.ack(terminal||'draining');}
     return Boolean(this.request);
+  }
+  async verifyPersistence() {
+    // An outstanding ordinary safe-stop request allows local draining. A failed
+    // authoritative control read never does. Keep all existing stop flags.
+    if (this.closed) throw new Error('PERSISTENCE_CONTROL_CLOSED');
+    if (this.polling) await this.polling;
+    try {
+      const raw = await this.readRequest();
+      parseRequest(raw,this.ctx);
+    } catch (error) {
+      await this.flags({reason:'REMOTE_CONTROL_UNAVAILABLE'});
+      throw Object.assign(new Error('PERSISTENCE_CONTROL_UNAVAILABLE'),{code:'PERSISTENCE_CONTROL_UNAVAILABLE',cause:error});
+    }
   }
   async gate() {
     // An authoritative empty read is needed before a manual new launch.
@@ -103,6 +127,7 @@ export class RemoteStopControl {
     const tick=async()=>{
       if(this.closed)return;
       this.polling=this.poll().catch(async()=>{
+        if(this.closed)return;
         // Fail closed on control-channel loss; no forced termination, no false ACK.
         await this.flags({reason:'REMOTE_CONTROL_UNAVAILABLE'});await onFailure();
       });

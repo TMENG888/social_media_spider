@@ -1,3 +1,4 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -58,7 +59,8 @@ export class AsrJobProcessor {
     return path.join(this.mediaDir, `${key}${extensionFor(job.mediaUrl)}`);
   }
 
-  async process(job) {
+  async process(job) {return timed('asr_job',()=>this.processTimingImpl(job),{keyword:job.keyword,articleId:job.noteId,lane:'asr',attempt:job.attempts});}
+  async processTimingImpl(job) {
     const mediaPath = this.mediaPath(job);
     const temporary = `${mediaPath}.part`;
     try {
@@ -72,7 +74,7 @@ export class AsrJobProcessor {
         await fs.mkdir(path.dirname(mediaPath), { recursive: true });
         await fs.rm(mediaPath, { force: true }).catch(() => {});
         await fs.rm(temporary, { force: true }).catch(() => {});
-        await this.service.download(job.mediaUrl, temporary, job.referer || "https://www.xiaohongshu.com/");
+        await timed('media_download',()=>this.service.download(job.mediaUrl, temporary, job.referer || "https://www.xiaohongshu.com/"));
         await fs.rm(mediaPath, { force: true }).catch(() => {});
         await fs.rename(temporary, mediaPath);
       }
@@ -80,7 +82,7 @@ export class AsrJobProcessor {
       console.log(`[ASR后台] ${job.noteId}：第${job.attempts}/${job.maxAttempts}次识别`);
       // The first pass uses the note context. A quality retry drops the prompt
       // so a bad title/tag hint cannot be echoed into the transcript again.
-      const output = await this.service.transcribePath(mediaPath, job.articleId || job.noteId, job.attempts === 1 ? job.prompt : null);
+      const output = await timed('asr_inference',()=>this.service.transcribePath(mediaPath, job.articleId || job.noteId, job.attempts === 1 ? job.prompt : null));
       assertMediaProvenance(job.mediaBinding,{noteId:job.noteId,url:job.mediaUrl,duration:output.audit?.duration});
       if (!output.text && output.audit?.status === "quality_rejected") {
         const qualityError = new Error(`ASR_QUALITY_REJECTED：${output.audit?.quality?.reason || "字幕完整性或幻觉检测未通过"}`);
@@ -149,7 +151,8 @@ export class AsrJobProcessor {
     }
   }
 
-  async drain() {
+  async drain() {return timed('asr_drain',()=>this.drainDetailedImpl(),{lane:'persistence'});}
+  async drainDetailedImpl() {
     this.drainRequested = true;
     this.start();
     this.wake();

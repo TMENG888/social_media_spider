@@ -1,3 +1,4 @@
+import {noteTaskResumed} from './login-bridge.mjs';
 import fs from "node:fs/promises";
 import {verifyCheckpointCoverage} from './coverage-gate.mjs';
 import {supportedCorrectionPolicy} from './correction-lease.mjs';
@@ -11,7 +12,6 @@ import { writeJsonAtomic } from "./checkpoint.mjs";
 import { POLICY_VERSION, ACCEPTANCE_VERSION, projectForTopic } from "./collection-policy.mjs";
 import { RedisDispatcher } from "./redis-dispatcher.mjs";
 import { loadTaskManifest } from "./redis-task-manifest.mjs";
-import { repairCategoryNull } from "./category-repair.mjs";
 import { repairInvalidArticleLinks } from "./link-repair.mjs";
 import { summarizeWorkerTasks } from "./worker-status.mjs";
 import { collectionFailurePolicy, collectionNodeFailure } from "./collection-failure.mjs";
@@ -23,6 +23,8 @@ import { RateLimitCooldown, restrictionKind, cooldownWorkerExit } from "./rate-l
 import { cleanupWorkerAsrMedia } from "./cleanup-worker-asr-media.mjs";
 import {unchangedRetry} from './retry-no-change.mjs';
 import {writeRuntimeStop, recoverOrphanRuntimeStop} from './runtime-stop.mjs';
+import {KeywordCycleBudget} from './keyword-cycle-budget.mjs';
+import {CollectionCyclePause,COLLECTION_PAUSE_VERSION} from './collection-cycle-pause.mjs';
 import {recoverLocalStorageStop,verifyLocalStorage,isStorageFull} from './local-storage-stop.mjs';
 import {appendDiagnosticEvent} from './page-diagnostics.mjs';
 
@@ -292,11 +294,14 @@ let browserProcess = null;
 let dispatcher = null;
 let runtimeTimer = null;
 let runtimeStopRequest = null;
+let runtimeBudget = null;
+let collectionPause = null;
+let collectingAuthors = phase === 'authors';
 let fatalError = null;
 let remoteControl=null;
 let cooldown=null, stopCooldownMonitor=null, cooldownMonitorError=null;
 const statusFile = path.join(runsRoot, "worker_status.json");
-let status = { workerId, mode, dispatchMode, cycleId, startedAt: now(), finishedAt: null, tasks: [] };
+let status = { codeVersion: "xhs-inplace-cycle-pause-20261105-v1", workerId, mode, dispatchMode, cycleId, startedAt: now(), finishedAt: null, tasks: [] };
 let diagnosticPhase='starting',lifecycleQueue=Promise.resolve(),diagnosticKeyword='';
 const lifecycleFile=path.join(runsRoot,'collection-lifecycle-'+now().slice(0,10)+'.jsonl');
 function markLifecycle(stage,details={}) {
@@ -360,8 +365,7 @@ try {
     await promptCredentials();
     await verifyDatabaseConnection();
     if(!onlyTaskId){
-    const categoryRepair = await repairCategoryNull({ runsRoot, stateRoot });
-    console.log(`[分类修复] 本地${categoryRepair.localRowsNormalized}条，数据库文章${categoryRepair.postsUpdated}条、评论${categoryRepair.commentsUpdated}条已统一为NULL${categoryRepair.localFileErrors.length ? `；${categoryRepair.localFileErrors.length}个占用中的本地文件稍后重试` : ""}`);
+    // Historical category maintenance is explicit; normal imports already write SQL NULL.
     const linkRepair = await repairInvalidArticleLinks({ stateRoot });
     console.log(`[链接修复] 数据库文章${linkRepair.postsUpdated}条、评论${linkRepair.commentsUpdated}条已恢复为对应文章详情链接`);
     }
@@ -385,25 +389,51 @@ try {
   } catch {}
   await writeJsonAtomic(statusFile, status);
 
-  if (maxRuntimeMinutes > 0) {
-    const deadline = Date.now() + Math.round(maxRuntimeMinutes * 60000);
+  const pauseInPlace = maxRuntimeMinutes > 0 && !collectingAuthors;
+  if(pauseInPlace){
+    const readMinutes=(name,fallback)=>{
+      const v=Number(args[name]??fallback);
+      if(!Number.isFinite(v)||v<=0||v>1440)throw new Error('INVALID_CYCLE_PAUSE_MINUTES');
+      return Math.round(v*60000);
+    };
+    const supervisorState=await fs.readFile(path.join(stateRoot,'monitor-supervisor.json'),'utf8')
+      .then(JSON.parse,error=>{if(error.code==='ENOENT')return {};throw error;});
+    const pauseConfig={workerId,cycleId:cycleId||`direct-${process.pid}-${Date.now()}`,workerPid:process.pid,
+      supervisorPid:supervisorState.supervisorPid,supervisorSessionId:supervisorState.sessionId,
+      firstDeadlineAtMs:Date.now()+Math.round(maxRuntimeMinutes*60000),
+      runMinMs:readMinutes('cycle-run-min-minutes',45),runMaxMs:readMinutes('cycle-run-max-minutes',60),
+      restMinMs:readMinutes('cycle-rest-min-minutes',30),restMaxMs:readMinutes('cycle-rest-max-minutes',60),
+      stateFile:path.join(stateRoot,'collection-cycle-pause.json')};
+    collectionPause=await new CollectionCyclePause(pauseConfig,{autoTimer:false,
+      shouldStop:async()=>stopSignalCount>0||await exists(stopFile),
+      onState:state=>markLifecycle('collection_cycle_'+state.phase,{pauseVersion:COLLECTION_PAUSE_VERSION,
+        round:state.round,resumeAt:state.resumeAt,deadlineAtMs:state.deadlineAtMs})}).initialize();
+    childEnv.XHS_COLLECTION_CYCLE_CONFIG=JSON.stringify(pauseConfig);
+    status.runtimeLimitMinutes=maxRuntimeMinutes;status.deadline=new Date(pauseConfig.firstDeadlineAtMs).toISOString();
+    status.runtimeLimitPolicy='pause_in_place';status.pauseVersion=COLLECTION_PAUSE_VERSION;
+    console.log(`[原位轮次] 采集${maxRuntimeMinutes}分钟后暂停网页操作，浏览器保留现场；休息后从暂停处继续，不刷新页面。`);
+    await writeJsonAtomic(statusFile,status);
+  }
+  runtimeBudget = new KeywordCycleBudget({minutes:pauseInPlace?0:maxRuntimeMinutes,
+    beforeNext:async()=>{await collectionPause?.beforeAction({reload:true});}});
+  if (maxRuntimeMinutes > 0 && !pauseInPlace) {
+    const deadline = runtimeBudget.deadline;
     status.runtimeLimitMinutes = maxRuntimeMinutes;
     status.deadline = new Date(deadline).toISOString();
-    console.log(`[限时采集] 已启动${maxRuntimeMinutes}分钟计时；到时安全停止，不强制打断当前笔记或ASR`);
+    status.runtimeLimitPolicy = 'author_safe_stop';
     runtimeTimer = setTimeout(() => {
+      status.runtimeLimitReached = true;
       markLifecycle('runtime_limit_reached',{minutes:maxRuntimeMinutes,phaseAtDeadline:diagnosticPhase});
-      console.warn(`[限时采集] 已到${maxRuntimeMinutes}分钟，发出安全停止请求`);
       runtimeStopRequest = writeRuntimeStop({stopFile, supervisorStopFile, cycleId, workerId,
-        minutes: maxRuntimeMinutes}).then(marker => {
-          if (marker) status.runtimeStop = marker;
-        }).catch(error => {
-          fatalError ||= error;
-          console.warn('[Cycle stop] Runtime stop marker could not be saved; automatic resume disabled.');
-        });
-    }, Math.max(1, deadline - Date.now()));
+        minutes:maxRuntimeMinutes}).then(marker=>{if(marker)status.runtimeStop=marker;})
+        .catch(error=>{fatalError ||= error;});
+    }, Math.max(1,deadline-Date.now()));
   }
 
-  for await (const [taskIndex, task] of (phase==='authors' ? [] : dispatcher ? dispatcher.tasks({taskId:onlyTaskId,...(correctionPolicy?{correctionPolicy}:{})}) : tasks.entries())) {
+  const keywordTasks = phase==='authors' ? [] : dispatcher
+    ? dispatcher.tasks({taskId:onlyTaskId,mayClaim:()=>!runtimeBudget.expired,...(correctionPolicy?{correctionPolicy}:{})})
+    : tasks.entries();
+  for await (const [taskIndex, task] of runtimeBudget.tasks(keywordTasks)) {
     if (await exists(stopFile)) break;
     console.log(`[工作节点进度] ${workerId}：本机第${taskIndex + 1}词${dispatcher ? `（全局任务池${dispatcher.manifest.taskCount}词）` : `/${tasks.length}`}，开始关键词“${task.keyword}”，专题=${task.topic || ""}，评论=${task.collectComments !== false ? "采集" : "不采集"}`);
     const baseSubdir = dispatcher ? path.join("redis", dispatcher.campaign, task.topic || "default", `${slug(task.keyword)}-${task.redisTaskId.slice(-12)}`) : path.join(task.topic || "default", slug(task.keyword));
@@ -425,6 +455,7 @@ try {
       continue;
     }
     if (!dispatcher && mode === "retry" && previous && !["failed", "incomplete", "interrupted", "partial_stopped", "partial_error", "login_required", "risk_controlled", "import_failed", "import_pending", "running"].includes(previous.status)) continue;
+    await noteTaskResumed({worker:path.dirname(queueDir),stateRoot,keyword:task.keyword}).catch(()=>{});
     const startedAt = now();
     const runId = `${Date.now()}-${process.pid}-${taskIndex}`;
     const cutoff = task.cutoff || queue.cutoff || task.minPublishedDate || queue.minPublishedDate || "2026-01-01";
@@ -469,6 +500,7 @@ try {
       configArgs.push("--config", taskConfig);
     }
     await cooldown?.assertReady();
+    await collectionPause?.beforeAction({reload:true});
     diagnosticKeyword=task.keyword;
     await markLifecycle('collector_started',{runId});
     const result = await runChild([
@@ -522,6 +554,8 @@ try {
     if (!skipImport) taskState = importTaskState(taskState, importResult?.code, collectorFailure);
     if (dispatcher?.lost) taskState = "lease_lost";
     const stopping = stopSignalCount > 0 || await exists(stopFile);
+    const riskStopMarker=stopping?await fs.readFile(stopFile,'utf8').catch(()=> 'STOP_STATE_UNAVAILABLE'):'';
+    const riskVolumeStopApproved=stopSignalCount===0&&(!stopping||riskStopMarker.trim()==='RATE_LIMIT_COOLDOWN_ACTIVE');
     const observation=collector.retryObservation;
     const noChange=observation && unchangedRetry(observation.before,observation.after,{...observation,
       status:taskState,error:collector.error||'',stopped:stopping,importOk:!skipImport&&importResult?.code===0,
@@ -542,11 +576,12 @@ try {
     }
     let completed = ["completed","completed_with_skips"].includes(taskState) && (dispatcher?.volume ? coverage.ok===true : skipImport || importResult?.code === 0);
     const record = { workerId, runId, policyVersion: POLICY_VERSION, searchSummaries: collector.searchSummaries || [], taskId: task.id || null, topic: task.topic || null, keyword: task.keyword, projectName: task.projectName || null, collectComments: task.collectComments !== false, startedAt, finishedAt: now(), status: completed ? "completed" : taskState, exitCode: result.code, importExitCode: importResult?.code ?? null, outputDir: taskDir, stateDir, checkpointDb, posts: collector.posts ?? null, commentThreads: collector.commentThreads ?? null, error: collector.error || null };
-    Object.assign(record,{collectionStatus,collectionError,mustStopNode:collectorFailure.stopNode,
+    Object.assign(record,{riskVolumeStopApproved,collectionStatus,collectionError,mustStopNode:collectorFailure.stopNode,
       deadLetterNotes:collector.deadLetterNotes||0,collectionCompleteness:collector.collectionCompleteness||null,asrJobs:collector.asrJobs||null,
       searchAcceptance:collector.searchAcceptance||null,scopeAcceptance:collector.scopeAcceptance||null,coverage,
       firstFailureAt:collector.firstFailureAt||null,pageDiagnostics:collector.pageDiagnostics||null});
     if(completed && taskState==='completed_with_skips')record.status=taskState;
+    if(observation)record.retryObservation={...observation,keyword:task.keyword,runId};
     if(noChange)record.stagnationEvidence=noChange;
     if(completed)record.accepted=coverage.ok;
     if (dispatcher) {
@@ -596,12 +631,41 @@ try {
       }
       if (!dispatcher || ["login_required", "risk_controlled", "web_unavailable", "import_failed", "import_pending", "asr_deferred","asr_review_required"].includes(taskState)) break;
     }
+    if (runtimeBudget.expired) {
+      status.runtimeLimitReached = true;
+      await markLifecycle('runtime_keyword_boundary',{runId,keyword:task.keyword,
+        taskStatus:record.status,redisConfirmed:record.redisConfirmed===true,importExitCode:record.importExitCode});
+      console.log(`[轮次休息] 已超过${maxRuntimeMinutes}分钟，当前检索词“${task.keyword}”已收尾；不领取下一词，交由监督器安排休息`);
+      break;
+    }
     if (task.transitionDelaySeconds) await sleep(Number(task.transitionDelaySeconds) * 1000);
   }
-  if(dispatcher && !skipImport && phase!=='posts' && !await exists(stopFile) && !status.tasks.some(task => task.mustStopNode || ['import_pending','import_failed','risk_controlled','login_required','web_unavailable','lease_lost','confirmation_failed'].includes(task.status))){
+  if(runtimeBudget.expired){
+    status.runtimeLimitReached=true;
+    if (!collectingAuthors) {
+      // Only publish the owned cycle marker AFTER the keyword iterator has
+      // closed and collection/import/queue disposition have returned. This
+      // retains the supervisor's existing import/manual-stop verification
+      // without exposing a timer stop to the active collector.
+      runtimeStopRequest = writeRuntimeStop({stopFile,supervisorStopFile,cycleId,workerId,
+        minutes:maxRuntimeMinutes}).then(marker=>{
+          if(marker)status.runtimeStop=marker;
+        }).catch(error=>{
+          fatalError ||= error;
+          console.warn('[Cycle stop] Keyword boundary marker could not be saved; automatic resume disabled.');
+        });
+      await runtimeStopRequest;
+    }
+  }
+  if(dispatcher && (!dispatcher.scopeLimited || phase==='authors') && !skipImport && phase!=='posts' && !runtimeBudget.expired && !await exists(stopFile) && !status.tasks.some(task => task.mustStopNode || ['import_pending','import_failed','risk_controlled','login_required','web_unavailable','lease_lost','confirmation_failed'].includes(task.status))){
     await cooldown?.assertReady();
-    status.authorPhase=await runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher:dispatcher,cdpUrl:childEnv.XHS_CDP_URL,cooldown});
-    console.log(`[采集阶段] 作者阶段=${status.authorPhase.status}，本机回填${status.authorPhase.completed}位作者`);
+    // The cooldown check can cross the deadline. Do not start an author phase
+    // after the keyword timer has already fired in deferred-stop mode.
+    if (!runtimeBudget.expired) {
+      collectingAuthors = true;
+      status.authorPhase=await runAuthorPhase({root,stateRoot,runsRoot,workerId,stopFile,postDispatcher:dispatcher,cdpUrl:childEnv.XHS_CDP_URL,cooldown});
+      console.log(`[采集阶段] 作者阶段=${status.authorPhase.status}，本机回填${status.authorPhase.completed}位作者`);
+    } else status.runtimeLimitReached = true;
   }
 } catch (error) {
   fatalError = error;
@@ -609,6 +673,7 @@ try {
     await fs.writeFile(stopFile,error.code,{encoding:'utf8',flag:'wx'}).catch(()=>{});
   console.warn(`[工作节点停止] ${error.code || "ERROR"}：${String(error.message || error).split("\n")[0]}`);
 } finally {
+  await collectionPause?.close({terminal:true}).catch(error=>{fatalError ||= error;});
   await stopCooldownMonitor?.();
   if(cooldown){
     try{status.cooldown=await cooldown.read();}
@@ -631,7 +696,7 @@ try {
   status.manualStopRequested = stopSignalCount > 0;
   status.exitCode = cooldownWorkerExit({fatalError,lost:dispatcher?.lost,status});
   status.cycleResumeEligible = status.exitCode === 0 && !status.manualStopRequested && !fatalError;
-  status.exitDiagnosis={runtimeLimitObserved:Boolean(status.runtimeStop),manualStopRequested:status.manualStopRequested,
+  status.exitDiagnosis={runtimeLimitObserved:Boolean(status.runtimeLimitReached||status.runtimeStop),manualStopRequested:status.manualStopRequested,
     fatalError:status.fatalError,taskStatuses:status.tasks.map(task=>({keyword:task.keyword,status:task.status,importExitCode:task.importExitCode})),
     automaticResumeEligible:status.cycleResumeEligible,lifecycleFile};
   await markLifecycle('worker_exit_decided',{exitCode:status.exitCode,...status.exitDiagnosis});

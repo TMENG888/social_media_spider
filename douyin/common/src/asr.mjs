@@ -12,6 +12,14 @@ import { cleanText } from "./text-cleaner.mjs";
 const workerScript = fileURLToPath(new URL("./asr-worker.py", import.meta.url));
 const CACHE_VERSION = 2;
 
+export function transientDownloadError(error) {
+  if(error?.transientDownload === true)return true;
+  const status=Number(error?.httpStatus || String(error?.message||'').match(/HTTP\s+(\d{3})/)?.[1]);
+  return [408,429,500,502,503,504].includes(status)
+    || ['ECONNRESET','ECONNREFUSED','ETIMEDOUT','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(error?.code||error?.cause?.code)
+    || error?.name==='TimeoutError' || /^(terminated|fetch failed)$/.test(String(error?.message||''));
+}
+
 function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([
@@ -100,15 +108,30 @@ export class AsrService {
 
   async download(url, target, referer = "https://www.douyin.com/") {
     await fs.mkdir(path.dirname(target), { recursive: true });
+    try {
     const response = await fetch(url, {
       redirect: "follow", headers: { "User-Agent": "Mozilla/5.0", Referer: referer },
       signal: AbortSignal.timeout(this.options.downloadTimeoutMs)
     });
-    if (!response.ok || !response.body) throw new Error(`视频下载失败 HTTP ${response.status}`);
+    if (!response.ok || !response.body) {
+      const retryAfter=response.headers.get('retry-after');
+      const retryAfterMs=retryAfter===null?0:/^\d+(?:\.\d+)?$/.test(retryAfter)?Number(retryAfter)*1000:Math.max(0,Date.parse(retryAfter)-Date.now())||0;
+      await response.body?.cancel().catch(()=>{});
+      throw Object.assign(new Error(`视频下载失败 HTTP ${response.status}`),{code:'MEDIA_DOWNLOAD_HTTP',httpStatus:response.status,retryAfterMs});
+    }
     await pipeline(Readable.fromWeb(response.body), (await import("node:fs")).createWriteStream(target));
     const size = (await fs.stat(target)).size;
     if (!size) throw new Error("视频下载为空，无法提取音轨");
     return size;
+    } catch(error) {
+      if(transientDownloadError(error)){
+        // Keep transport codes, not signed media URLs or arbitrary fetch errors.
+        throw Object.assign(new Error(error.httpStatus?`视频下载失败 HTTP ${error.httpStatus}`:'MEDIA_DOWNLOAD_NETWORK'),{
+          code:error.httpStatus?'MEDIA_DOWNLOAD_HTTP':'MEDIA_DOWNLOAD_NETWORK',httpStatus:error.httpStatus||null,
+          transientDownload:true,retryAfterMs:error.retryAfterMs||0});
+      }
+      throw error;
+    }
   }
 
   async transcribeFile(mediaPath, articleId, prompt) {
@@ -207,4 +230,3 @@ export class AsrService {
     this.readyPromise = null;
   }
 }
-

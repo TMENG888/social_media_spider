@@ -1,5 +1,6 @@
 import {readFileSync} from 'node:fs';
 import {collectionNodeFailure} from './collection-failure.mjs';
+import {riskRetryIncrementEvidence} from './recollection-risk-evidence.mjs';
 const SCRIPT=readFileSync(new URL('./reset-once.lua',import.meta.url),'utf8');
 export const RECOLLECTION_POLICY='reset-once-20261016-v1';
 export function protectedRecollection(record,pause=false){
@@ -22,9 +23,11 @@ export class ResetOncePolicy{
  arm(id,record,expected){return this.command('arm',id,{record,expected});}
  prepare(id){return this.command('prepare',id);}
  async start(id,token){const row=await this.read(id);if(!row.state)return null;return this.command('start',id,{token});}
- async finish(id,token,record,{pause=false}={}){
+ async finish(id,token,record,{pause=false,allowRiskRetry=false}={}){
   const row=await this.read(id);if(!row.state)return null;
   if(row.state==='completed')return this.prepare(id);
+  const riskRetryEvidence=allowRiskRetry?riskRetryIncrementEvidence(record):null;
+  if(riskRetryEvidence)return this.command('risk_retry_finish',id,{token,record:{...recollectionOutcome(record),riskRetryEvidence}});
   return this.command(protectedRecollection(record,pause)?'pause':'finish',id,{token,record:recollectionOutcome(record)});
  }
 }

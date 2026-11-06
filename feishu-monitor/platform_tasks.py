@@ -107,7 +107,9 @@ def queue_observation(c, namespace, campaign, tasks=()):
             if result.get('disposition')=='no_change':counts['noChangeCompleted']+=1
             if result.get('acceptedBy')=='retry_exhausted_completion':counts['retryExhaustedCompleted']+=1
             if result.get('acceptedBy')=='reset_once_recollection':counts['resetOnceCompleted']+=1
-            if result.get('pendingImport') is True:counts['completedPendingImport']+=1
+            if result.get('pendingImport') is True:
+                counts['completedPendingImport']+=1
+                row['completedPendingImport']+=1
         if state == 'leased':
             expiry = leases.get(task_id)
             if expiry is None:
@@ -147,10 +149,16 @@ def queue_observation(c, namespace, campaign, tasks=()):
         counts['pendingUnclassified'] = counts['pending']
     else:
         counts['pendingUnclassified'] += counts['pending'] - classified
+    partition_fields=('total',*QUEUE_STATES,'unknown','pendingNew','retryPending','pendingUnclassified','completedPendingImport')
+    topic_verified=not missing_payloads and all(
+        sum(row.get(key,0) for row in topics.values())==counts[key] for key in partition_fields)
+    for row in topics.values():
+        for key in partition_fields:row.setdefault(key,0)
     return {'campaign': campaign, 'source': 'ok',
             'counts': {k: counts[k] for k in ('total', 'pending', 'pendingNew', 'retryPending', 'pendingUnclassified', 'leased', 'completed', 'completed_with_skips', 'skipped_unresolved', 'noChangeCompleted', 'failed', 'unknown', 'excluded', 'validLeases', 'expiredLeases', 'missingLeaseEvidence')},
             'disposedCount': counts['completed'] + counts['completed_with_skips'] + counts['skipped_unresolved'],
             'topics': {k: dict(v) for k, v in sorted(topics.items())},
+            'topicBreakdownVerified': topic_verified,
             'workers': [{'worker': owner, **row} for owner, row in sorted(workers.items())],
             'activeLeaseActivity': dict(activity),
             'completedResultStates': dict(result_states), 'retryExhaustedCompleted':counts['retryExhaustedCompleted'],

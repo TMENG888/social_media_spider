@@ -19,6 +19,7 @@ export function retrySnapshot(db,keyword) {
   });
   const attempts=Object.fromEntries([...rows.map(r=>['detail:'+r.note_id,Number(r.attempts)]),...jobs.map(r=>['asr:'+r.note_id,Number(r.attempts)])]);
   return {digest:contentDigest({keyword,content,jobs:jobs.map(j=>({noteId:j.note_id,articleId:j.article_id,transcript:j.transcript||null}))}),
+    retainedArticleIds:[...new Set(rows.filter(r=>r.status==='completed').map(r=>parse(r.result_json)?.post?.文章id).filter(id=>typeof id==='string'&&id.trim()))].sort(),
     count:rows.length,attempts,hasPriorEvidence:rows.some(r=>Number(r.attempts)>0||parse(r.result_json)?.post),
     unresolvedDetails:rows.filter(r=>r.status!=='skipped_irrelevant'&&(!['completed','skipped_old','dead_letter'].includes(r.status)||parse(r.result_json)?.audit?.commentsComplete===false)).map(r=>'detail:'+r.note_id),
     unresolvedAudio:jobs.filter(j=>!['completed','dead_letter','skipped_unresolved'].includes(j.status)).map(j=>'asr:'+j.note_id),

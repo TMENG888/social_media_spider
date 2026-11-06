@@ -145,7 +145,7 @@ test('crawler and worker cannot use legacy year windows or no-change to bypass t
   assert.doesNotMatch(source,/visited\.has/);
   assert.match(source,/const remaining = incompleteCandidates\(attachScopeAudits\(checkpoint,checkpointCandidates\(checkpoint,task.keyword\),task.keyword\),\{keyword:task.keyword\}\);/);
   assert.match(source,/await detail\.goto\(note.url,[\s\S]*?await ensureLogin\(detail\)/);
-  assert.match(source,/if\(recoverSaved\)\{await detail\.close\(\)/);
+  assert.match(source,/if\(recoverSaved\)\{detailDiagnostics\?\.dispose\(\);pageDiagnosticContexts\.delete\(detail\);await detail\.close\(\)/);
   const worker=await fs.readFile(new URL('./run-worker.mjs',import.meta.url),'utf8');
   assert.match(worker,/collector\.searchAcceptance\?\.ok===true&&coverage\.ok===true/);
   assert.doesNotMatch(worker,/if\(noChange&&acceptanceVerified\)/);

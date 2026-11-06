@@ -1,3 +1,4 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
 import mysql from "mysql2/promise";
@@ -29,7 +30,8 @@ export function mysqlConnectionOptions() {
   };
 }
 
-export async function verifyTable(connection, table, fields) {
+export async function verifyTable(...args){return timed('database_schema_check',()=>verifyTableDetailedImpl(...args),{});}
+async function verifyTableDetailedImpl(connection, table, fields) {
   if (!["ods_social_media_post", "ods_social_media_comment"].includes(table)) throw new Error("不支持的目标数据表");
   const [cols] = await connection.query(`SHOW FULL COLUMNS FROM \`${table}\``);
   const actual = cols.map((c) => c.Field);
@@ -73,7 +75,8 @@ export function utf8mb3CompatibleText(value) {
   }
   return output;
 }
-async function makeRowsCompatibleWithTable(connection, table, rows) {
+async function makeRowsCompatibleWithTable(...args){return timed('database_prepare',()=>makeRowsCompatibleWithTableDetailedImpl(...args),{});}
+async function makeRowsCompatibleWithTableDetailedImpl(connection, table, rows) {
   if (!rows.length) return { rows, stats: { changedRows: 0, changedValues: 0, fields: [] } };
   const [columns] = await connection.query(`SHOW FULL COLUMNS FROM \`${table}\``);
   const utf8mb3Fields = new Set(columns.filter((column) => isUtf8mb3Collation(column.Collation)).map((column) => column.Field));
@@ -131,7 +134,8 @@ export async function rowsNeedingImport(connection,table,fields,rows,uniqueWhere
   }
   return pending;
 }
-async function upsertRows(connection, table, fields, rows, uniqueWhere) {
+async function upsertRows(...args){return timed('database_write',()=>upsertRowsDetailedImpl(...args),{});}
+async function upsertRowsDetailedImpl(connection, table, fields, rows, uniqueWhere) {
   if (!rows.length) return { inserted: 0, updated: 0 };
   let id = await nextId(connection, table), inserted = 0, updated = 0, videoContentWrites = 0;
   const dataFields = fields.filter((f) => f !== "id");
@@ -170,7 +174,8 @@ export async function archiveSubtitleReplacement(existing,row,{archive=process.e
   finally{await handle.close();}
   return true;
 }
-export async function importRows({ posts = [], comments = [], verify = false, lockTimeoutSeconds = 15,
+export async function importRows(...args){return timed('database',()=>importRowsTimingImpl(...args),{});}
+async function importRowsTimingImpl({ posts = [], comments = [], verify = false, lockTimeoutSeconds = 15,
   batchRows = 10, maxAttempts = 4, retryDelayMs = 2000, onProgress = async () => {} } = {}) {
   if (!Number.isFinite(lockTimeoutSeconds) || lockTimeoutSeconds < 0 || lockTimeoutSeconds > 120) throw new Error('入库锁等待时间必须在0至120秒之间');
   // 最后一道入库防线：无论数据来自实时采集、旧断点还是人工JSON，分类都必须写成SQL NULL。
@@ -218,7 +223,7 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
           if(!postChanges.length&&!commentChanges.length)return {
             postResult:{inserted:0,updated:0,videoContentWrites:0,verifiedUnchanged:batch.posts.length},
             commentResult:{inserted:0,updated:0,verifiedUnchanged:batch.comments.length}};
-          const [lock] = await connection.query("SELECT GET_LOCK('social_xhs_distributed_import', ?) AS acquired", [lockTimeoutSeconds]);
+          const [lock] = await timed('database_lock',()=>connection.query("SELECT GET_LOCK('social_xhs_distributed_import', ?) AS acquired", [lockTimeoutSeconds]));
           if (Number(lock[0]?.acquired) !== 1) throw Object.assign(new Error('等待小红书分布式入库锁超时，请稍后重试'), { code: 'MYSQL_IMPORT_LOCK_TIMEOUT' });
           acquired = true;
           await verifyLease();

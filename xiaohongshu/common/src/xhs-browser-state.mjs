@@ -1,3 +1,4 @@
+import {collectionWorkNow} from './collection-cycle-pause.mjs';
 const RESULT_SELECTOR = 'section.note-item,.note-item,[data-note-id]';
 const DETAIL_SELECTOR = '#noteContainer,.note-container,#detail-title,#detail-desc';
 const FILTER_CONTROL = 'div.filter,button.filter,[class~="filter"]';
@@ -181,7 +182,7 @@ export async function closeDetailToSearch(page, state, { timeout = 45000, assert
     && !await visibleAny(page, DETAIL_SELECTOR) && !await visibleAny(page, previewSelector)
     && await visibleAny(page, RESULT_SELECTOR);
   const finish = async (method, waitMs = 0) => {
-    const deadline = Date.now() + waitMs;
+    const deadline = collectionWorkNow(page) + waitMs;
     do {
       await assertSafe(page);
       if (await recovered()) {
@@ -192,7 +193,7 @@ export async function closeDetailToSearch(page, state, { timeout = 45000, assert
         log(`[详情关闭] ${method}，沿用检索开始时已确认的最新排序，保留“${state.keyword}”搜索结果页`);
         return true;
       }
-      if (Date.now() >= deadline) break;
+      if (collectionWorkNow(page) >= deadline) break;
       await page.waitForTimeout(200);
     } while (true);
     return false;

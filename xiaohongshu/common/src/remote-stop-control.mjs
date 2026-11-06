@@ -1,3 +1,4 @@
+import {readControlWithReconnect} from './control-read-retry.mjs';
 // Dedicated control keys only. Never claim, ACK, reset a task, or kill a PID.
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -74,7 +75,7 @@ async function atomicJson(file,value) {
 }
 export class RemoteStopControl {
   constructor(ctx,client){this.ctx=ctx;this.client=client;this.request=null;this.timer=null;this.polling=null;this.closed=false;}
-  static async open(commonRoot,workerRoot){const ctx=await controlContext(commonRoot,workerRoot);return new RemoteStopControl(ctx,await connectControl(ctx));}
+  static async open(commonRoot,workerRoot){const ctx=await controlContext(commonRoot,workerRoot);const control=new RemoteStopControl(ctx,null);await readControlWithReconnect(control,client=>controlCommand(client,ctx,'HGET','stop-requests',[ctx.target]),connectControl);return control;}
   get receiptFile(){return path.join(this.ctx.workerRoot,'.state','remote-stop-receipt.json');}
   async flags(request) {
     if(request.reason==='REMOTE_CONTROL_UNAVAILABLE'&&!request.commandId)return markControlFailure(this.ctx);
@@ -90,7 +91,9 @@ export class RemoteStopControl {
     return value;
   }
   async poll({terminal=null}={}) {
-    const raw=await controlCommand(this.client,this.ctx,'HGET','stop-requests',[this.ctx.target]);
+    const previousReconnects=this.reconnectedReads||0;
+    const raw=await readControlWithReconnect(this,client=>controlCommand(client,this.ctx,'HGET','stop-requests',[this.ctx.target]),connectControl);
+    if((this.reconnectedReads||0)>previousReconnects)console.warn('[Remote control] Fresh authenticated read verified after reconnect.');
     const request=parseRequest(raw,this.ctx);
     if(request){this.request=request;await this.flags(request);await this.ack(terminal||'draining');}
     return Boolean(this.request);
@@ -111,6 +114,7 @@ export class RemoteStopControl {
     const tick=async()=>{
       if(this.closed)return;
       this.polling=this.poll().catch(async(error)=>{
+        if(this.closed)return;
         // Fail closed on control-channel loss; no forced termination, no false ACK.
         const code=await markControlFailure(this.ctx,error);
         console.warn('[Remote control unavailable] '+code+'; safe stop retained.');await onFailure();

@@ -13,13 +13,15 @@ const shouldStop=()=>fs.access(stopFile).then(()=>true).catch(()=>false);
 let controller;
 try {
   controller=await RateLimitCooldown.open({root,stateRoot,workerId:queue.workerId});
-  console.log(`[保护作用域] ${COOLDOWN_SCOPE_VERSION}；本节点=${queue.workerId}；登录/验证码按机器节点隔离。`);
+  console.log(`[保护作用域] ${COOLDOWN_SCOPE_VERSION}；本节点=${queue.workerId}；定时冷却=${controller.scope} / ${controller.machine}；登录/验证码按机器节点隔离。`);
   if(args.action==='reset-confirmed'){
     await controller.resetConfirmed();
-    console.log('[Cooldown] Manual confirmation recorded. Shared cooldown reset; no tasks/database/checkpoints changed.');
+    console.log('[Cooldown] Manual confirmation recorded for this cooldown scope; no tasks/database/checkpoints changed.');
   }else{
     let announced='';
-    const result=await controller.wait({shouldStop,waitForManual:true,onState:s=>{
+    const {automaticRecoveryWait}=await import('./recovery-wait.mjs');
+    const recoveryStop=automaticRecoveryWait({gate:controller.operations,root,workerRoot,shouldStop});
+    const result=await controller.wait({shouldStop:recoveryStop,waitForManual:true,onState:s=>{
       const key=`${s.lastIncidentAt}-${s.nodeIncidentId}-${s.scope}-${s.active}-${s.manualRequired}`;
       if(key===announced)return;announced=key;
       if(s.manualRequired)console.warn(s.scope==='node'

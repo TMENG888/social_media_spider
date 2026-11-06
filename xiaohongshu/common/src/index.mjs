@@ -1,3 +1,5 @@
+import {observeAccountNickname} from './account-nickname.mjs';
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
@@ -28,6 +30,7 @@ import { assertWebNoteAccessible, recoverWebUnavailableToSearch, WebUnavailableS
 import { itemPause, waitForPacing } from "./collection-pacing.mjs";
 import { RateLimitCooldown, restrictionKind } from "./rate-limit-cooldown.mjs";
 import {createPageDiagnostics} from './page-diagnostics.mjs';
+import {CollectionCyclePause,pausePlaywright} from './collection-cycle-pause.mjs';
 
 function argsOf(argv) {
   const out = {};
@@ -157,12 +160,14 @@ const requestGracefulStop = (signal) => {
 };
 process.on("SIGINT", () => requestGracefulStop("SIGINT"));
 if (process.platform === "win32") process.on("SIGBREAK", () => requestGracefulStop("SIGBREAK"));
+let collectionPause = null;
 const stopRequested = async () => {
   await assertLocalLease();
-  return signalStopRequested || Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false));
+  if(signalStopRequested){timingStop('os_signal');return true;}const flagged=Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false));if(flagged)timingStop('stop_file');return flagged;
 };
 
-async function connectBrowser() {
+async function connectBrowser(...args){return timed('startup',()=>connectBrowserTimingImpl(...args),{});}
+async function connectBrowserTimingImpl() {
   try {
     const browser = await chromium.connectOverCDP(cfg.cdpUrl, { timeout: 5000 });
     const context = browser.contexts()[0];
@@ -179,7 +184,8 @@ async function connectBrowser() {
 
 const SECURITY_CHALLENGE_PATTERN = /安全验证|安全限制|访问频繁|操作频繁|请完成验证|网络环境存在风险|300013/;
 
-async function ensureLogin(page) {
+async function ensureLogin(...args){return timed('login_check',()=>ensureLoginTimingImpl(...args),{});}
+async function ensureLoginTimingImpl(page) {
   if (!page.url().includes("xiaohongshu.com")) {
     await page.goto("https://www.xiaohongshu.com/explore", { waitUntil: "domcontentloaded", timeout: cfg.timeout });
   }
@@ -189,6 +195,7 @@ async function ensureLogin(page) {
   await assertNoSecurityChallenge(page);
 }
 
+const pageDiagnosticContexts=new WeakMap();
 let cooldownPublication=null, cooldownPublicationPromise=null;
 async function publishRestriction(message){
   if(!process.env.XHS_COOLDOWN_CAMPAIGN || !restrictionKind(message))return;
@@ -209,7 +216,7 @@ async function assertNoSecurityChallenge(page,{allowWebUnavailable=false}={}) {
   await assertPlatformAccess(page,'小红书',{report:publishRestriction});
   if (page.isClosed()) throw new Error("STOP_BROWSER_CLOSED：浏览器页签已关闭，保留断点后停止本节点");
   if(!allowWebUnavailable) await assertWebNoteAccessible(page).catch(async error => {
-    await page.screenshot({path:path.join(cfg.outputDir, `网页不可访问-${Date.now()}.png`),fullPage:false}).catch(()=>{});
+    error.pageDiagnostic=await pageDiagnosticContexts.get(page)?.capture('web_note_unavailable',error);
     throw error;
   });
 }
@@ -233,7 +240,8 @@ async function waitForDetailOrSecurityChallenge(page) {
   }
 }
 
-async function* collectSearchLinks(page, keyword, progress) {
+async function* collectSearchLinks(...args){const iterator=collectSearchLinksTimingImpl(...args);try{while(true){const item=await timed('search',()=>iterator.next());if(item.done)return item.value;yield item.value;}}finally{await iterator.return?.();}}
+async function* collectSearchLinksTimingImpl(page, keyword, progress) {
   progress.startedAt=new Date().toISOString();
   // URL参数不是排序已生效的证据；必须操作并核验页面的排序控件。
   const searchUrl = `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}&source=web_explore_feed&type=51`;
@@ -340,22 +348,25 @@ async function* collectSearchLinks(page, keyword, progress) {
   progress.reason = "search_limit";
 }
 
-async function expandComments(page) {
+async function expandComments(...args){return timed('comment_expand_batch',()=>expandCommentsTimingImpl(...args),{});}
+async function expandCommentsTimingImpl(page) {
   for (let round = 0; round < cfg.maxCommentScrolls; round += 1) {
     const expanders = page.getByText(/展开.*回复|查看更多回复|展开更多/, { exact: false });
     const count = await expanders.count().catch(() => 0);
     for (let i = 0; i < Math.min(count, 10); i += 1) {
       const button = expanders.nth(i);
-      if (await button.isVisible().catch(() => false)) await button.click().catch(() => {});
+      if (await button.isVisible().catch(() => false)) await timed('comment_reply_click',()=>button.click(),{round}).catch(error=>timingFailure('comment_click_failure',error,{round}));
     }
     const list = page.locator(".comments-container,.list-container").last();
-    if (await list.count()) await list.evaluate((node) => node.scrollBy(0, node.scrollHeight)).catch(() => {});
-    else await page.mouse.wheel(0, 800);
+    if (await list.count()) await timed('comment_scroll',()=>list.evaluate((node) => node.scrollBy(0, node.scrollHeight)),{round}).catch(error=>timingFailure('comment_scroll_failure',error,{round}));
+    else await timed('comment_scroll',()=>page.mouse.wheel(0,800),{round});
+    timingProgress('comment_progress',{round,availableControls:count});
     await rand(Math.max(700, Math.floor(cfg.actionDelayMs[0] / 2)), Math.max(1400, Math.floor(cfg.actionDelayMs[1] / 2)));
   }
 }
 
-async function parseCommentItem(item) {
+async function parseCommentItem(...args){return timed('comment_parse',()=>parseCommentItemDetailedImpl(...args));}
+async function parseCommentItemDetailedImpl(item) {
   const idAttr = await item.getAttribute("id");
   const userLink = await attr(item, ['a.name[href*="/user/profile/"]', 'a[href*="/user/profile/"]'], "href");
   const dateText = await text(item, [".info .date", ".date"]);
@@ -371,7 +382,8 @@ async function parseCommentItem(item) {
   };
 }
 
-async function parseThreads(page, post, context) {
+async function parseThreads(...args){return timed('comments',()=>parseThreadsTimingImpl(...args),{});}
+async function parseThreadsTimingImpl(page, post, context) {
   await expandComments(page);
   const rows = [], audits = [];
   const containers = page.locator(".list-container .parent-comment");
@@ -412,7 +424,7 @@ async function parseThreads(page, post, context) {
       cleaning_stats: cleanedThread.stats, ...threadAudit
     });
   }
-  return { rows, audits };
+  timingProgress('comment_completed',{threads:rows.length});return { rows, audits };
 }
 
 async function returnFromAuthorToDetail(page, recovery) {
@@ -450,7 +462,8 @@ async function returnFromAuthorToDetail(page, recovery) {
   throw new Error("STOP_DETAIL_CONTEXT_LOST：连续三个作者历史项后仍未返回帖子详情");
 }
 
-async function authorStats(page, authorUrl, recovery) {
+async function authorStats(...args){return timed('author',()=>authorStatsTimingImpl(...args),{});}
+async function authorStatsTimingImpl(page, authorUrl, recovery) {
   if (!cfg.visitAuthorProfile || !authorUrl) return {};
   const authorId = extractId(authorUrl, "user");
   const detail = await renderedControl(page.locator('#noteContainer,.note-container'));
@@ -506,7 +519,8 @@ async function authorStats(page, authorUrl, recovery) {
   }
 }
 
-async function openPostFromSearch(page, note, keyword) {
+async function openPostFromSearch(...args){return timed('detail_open',()=>openPostFromSearchTimingImpl(...args),{});}
+async function openPostFromSearchTimingImpl(page, note, keyword) {
   const state = await captureSearchState(page, keyword);
   await page.evaluate(() => performance.clearResourceTimings()).catch(() => {});
   const candidates = page.locator(`a[href*="/search_result/${note.noteId}"],a[href*="/explore/${note.noteId}"]`);
@@ -526,7 +540,8 @@ async function openPostFromSearch(page, note, keyword) {
   return state;
 }
 
-async function closePostToSearch(page, state,{allowWebUnavailable=false}={}) {
+async function closePostToSearch(...args){return timed('return_search',()=>closePostToSearchTimingImpl(...args),{});}
+async function closePostToSearchTimingImpl(page, state,{allowWebUnavailable=false}={}) {
   pageDiagnostics?.mark('detail_close_started',{expectedSearchUrl:state.searchUrl,keyword:state.keyword});
   try {
     const result = allowWebUnavailable
@@ -539,7 +554,8 @@ async function closePostToSearch(page, state,{allowWebUnavailable=false}={}) {
     throw error;
   }
 }
-async function parsePost(page, note, context, { navigate = true } = {}) {
+async function parsePost(...args){return timed('detail_parse',()=>parsePostTimingImpl(...args),{});}
+async function parsePostTimingImpl(page, note, context, { navigate = true } = {}) {
   if (navigate) await page.goto(note.url, { waitUntil: "domcontentloaded", timeout: cfg.timeout });
   await waitForDetailOrSecurityChallenge(page);
   await page.waitForTimeout(1800);
@@ -637,8 +653,9 @@ async function parsePost(page, note, context, { navigate = true } = {}) {
 
 await fs.mkdir(cfg.outputDir, { recursive: true });
 await fs.mkdir(path.dirname(cfg.checkpointDb), { recursive: true });
+configureTiming({directory:path.join(cfg.outputDir,'timing'),platform:'小红书',workerId:process.env.XHS_COOLDOWN_WORKER_ID||path.basename(process.env.XHS_WORKER_ROOT||''),keyword:entries[0]?.keyword||'',topic:entries[0]?.topic||'',runId:cfg.runId,lane:'foreground'});
 const checkpoint = openCheckpoint(cfg.checkpointDb);
-const retryBefore = entries.length===1 ? retrySnapshot(checkpoint,entries[0].keyword) : null;
+const retryBefore = entries.length===1 ? timedSync('checkpoint_read',()=>retrySnapshot(checkpoint,entries[0].keyword)) : null;timingProgress('keyword_baseline',{priorRetained:retryBefore?.retainedArticleIds?.length||0});
 const repairedQuality = repairCheckpointDataQuality(checkpoint);
 if (repairedQuality.links || repairedQuality.asr) console.log(`[数据质量修复] 文章链接${repairedQuality.links}条，低质量ASR${repairedQuality.asr}条已标记重采`);
 for(const task of entries){
@@ -656,7 +673,8 @@ function enqueueImport(keyword, batch) {
     console.warn(`[增量入库] 批次${batchId}失败，任务收尾时仍会全量兜底入库：${String(error?.message || error).split("\n")[0]}`);
   });
 }
-async function runIncrementalImport(keyword, batchId, batch) {
+async function runIncrementalImport(...args){return timed('database_batch',()=>runIncrementalImportTimingImpl(...args),{keyword:args[0],lane:'persistence'});}
+async function runIncrementalImportTimingImpl(keyword, batchId, batch) {
   const posts = batch.map((item) => item.post).filter(Boolean);
   const comments = batch.flatMap((item) => item.comments || []);
   if (!posts.length) return;
@@ -709,7 +727,10 @@ const asrJobs = cfg.asrEnabled ? new AsrJobProcessor({
   mediaDir: path.join(path.dirname(cfg.checkpointDb), "asr-media"),
   maxAttempts: cfg.asrJobMaxAttempts, retryDelayMs: cfg.asrJobRetryDelayMs,
   keepMedia: cfg.asrKeepMedia,
-  shouldStop: async () => signalStopRequested || Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false)),
+  shouldStop: async () => {
+    try{await collectionPause?.beforeAction();}catch{return true;}
+    if(signalStopRequested){timingStop('os_signal');return true;}const flagged=Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false));if(flagged)timingStop('stop_file');return flagged;
+  },
   onCompleted: async (_job, _output, updated) => {
     if (cfg.skipImport || !process.env.MYSQL_USER || !process.env.MYSQL_PASSWORD) return;
     await importRows({ posts: [updated.post], comments: [], verify: true });
@@ -723,15 +744,46 @@ let pageDiagnostics = null, failureDiagnostic = null, firstFailureAt = null;
 let completedDetails = 0, consecutiveFailures = 0, runError = null, runStatus = "running";
 const searchSummaries = [];
 try {
+  if(process.env.XHS_COLLECTION_CYCLE_CONFIG){
+    const pauseConfig=JSON.parse(process.env.XHS_COLLECTION_CYCLE_CONFIG);
+    collectionPause=await new CollectionCyclePause(pauseConfig,{
+      shouldStop:stopRequested,
+      onPause:state=>{
+        setMeta(checkpoint,'collection_cycle_pause',{...state,keyword:entries[0]?.keyword});
+        console.log(`[原位休息] 已到轮次上限；保留当前浏览器页面、滚动和函数进度，休息至${new Date(state.resumeAtMs).toISOString()}。`);
+      },
+      onResume:async()=>{
+        await assertLocalLease();
+        // No page exists yet; initial login/access checks follow connection.
+        console.log('[原位恢复] 休息结束，租约和页面保护核验通过；继续原页面，不刷新、不重新搜索。');
+      }
+    }).initialize({reuse:true});
+    await collectionPause.beforeAction();
+  }
   session = await connectBrowser();
-  searchPage = session.context.pages()[0] || await session.context.newPage();
+  observeAccountNickname({context:session.context,stateRoot:path.dirname(cfg.profileDir),platform:'小红书'});
+  let rawSearchPage = session.context.pages()[0] || await session.context.newPage();
+  // The callback above runs later, after the same page has been obtained.
+  if(collectionPause){
+    collectionPause.onResume=async()=>{
+      await assertLocalLease();await assertPlatformAccess(rawSearchPage,'小红书',{report:publishRestriction});
+      console.log('[原位恢复] 休息结束，租约和页面保护核验通过；继续原页面，不刷新、不重新搜索。');
+    };
+    session={...session,context:pausePlaywright(session.context,collectionPause),
+      browser:session.browser?pausePlaywright(session.browser,collectionPause):null};
+  }
+  searchPage = collectionPause?pausePlaywright(rawSearchPage,collectionPause):rawSearchPage;
   searchPage.setDefaultTimeout(cfg.timeout);
+  pageDiagnostics=createPageDiagnostics({page:searchPage,platform:'小红书',keyword:entries[0]?.keyword||'',
+    outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId,pageRole:'search'});
+  pageDiagnosticContexts.set(searchPage,pageDiagnostics);
   await ensureLogin(searchPage);
   for (const task of entries) {
     if (await stopRequested()) throw new Error("STOP_REQUESTED：已在进入下一个关键词前安全停止");
     pageDiagnostics?.dispose();
     pageDiagnostics = createPageDiagnostics({page:searchPage,platform:'小红书',keyword:task.keyword,
-      outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId});
+      outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId,pageRole:'search'});
+    pageDiagnosticContexts.set(searchPage,pageDiagnostics);
     pageDiagnostics.mark('keyword_started');
     console.log(`[检索开始] ${task.keyword}`);
     const progress = { keyword: task.keyword, rounds: 0, discovered: 0, examined: 0, accepted: 0, skipped: 0, excludedScope:0, failed: 0, reason: null };
@@ -744,7 +796,7 @@ try {
     const projectName = task.projectName || cfg.projectName;
     async function processNote(note, trackBoundary = true, recoverSaved = false) {
       if (await stopRequested()) throw new Error("STOP_REQUESTED：已在打开下一篇笔记前安全停止");
-      const cached = saved.get(note.noteId);
+      const cached = saved.get(note.noteId);timingProgress('candidate_check',{articleId:note.noteId,priorStatus:cached?.status||'unseen'});
       if(cached?.status==='skipped_irrelevant'&&verifiedScopeExclusion(cached,task.keyword)){
         progress.examined++;progress.excludedScope++;
         console.log(`[范围排除] ${note.noteId}：已留存关键词锚点缺失证据，不重新采集、不计有效帖子`);
@@ -767,7 +819,7 @@ try {
         if (trackBoundary) boundary.observe(note.noteId, cached.publishedAt);
         progress.examined += 1;
         progress.accepted += 1;
-        console.log(`[断点跳过] ${task.keyword} / ${note.noteId}：已核验${cached.publishedAt}`);
+        timingProgress('checkpoint_skip',{articleId:note.noteId,reason:'local_completed'});console.log(`[断点跳过] ${task.keyword} / ${note.noteId}：已核验${cached.publishedAt}`);
         return;
       }
       if (cached?.status === "skipped_old" && validDate(cached.publishedAt) && !inTargetYear(cached.publishedAt, cfg.targetYear, cfg.minPublishedDate)) {
@@ -776,12 +828,16 @@ try {
         progress.skipped += 1;
         return;
       }
-      console.log(`[详情开始] ${task.keyword} / ${note.noteId}`);
+      await contentTiming({keyword:task.keyword,topic:task.topic,articleId:note.noteId},async()=>{
+      timingProgress('content_resume',{priorStatus:cached?.status||'unseen',newToLocal:!cached?.result});console.log(`[详情开始] ${task.keyword} / ${note.noteId}`);
       // A saved candidate may no longer have a clickable card in the current
       // virtual search list. Verify its original detail URL in a temporary tab
       // instead of repeatedly treating the missing card as a content failure.
       const detail = recoverSaved ? await session.context.newPage() : searchPage;
       detail.setDefaultTimeout(cfg.timeout);
+      const detailDiagnostics=recoverSaved?createPageDiagnostics({page:detail,platform:'小红书',keyword:task.keyword,
+        outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId,pageRole:'saved_detail'}):pageDiagnostics;
+      pageDiagnosticContexts.set(detail,detailDiagnostics);
       let inPlaceState = null;
       let primaryError = null;
       let handledUnavailable=false;
@@ -811,26 +867,27 @@ try {
           console.log(`[范围排除] ${note.noteId}：详情明确命中已配置的范围外实体，已留证；不计采集成功`);
         } else if (result.outsideYear) {
           markSkipped(checkpoint, task.keyword, note, `详情发布时间${publishedAt}不在目标${cfg.targetYear}年`, publishedAt);
-          progress.skipped += 1;
+          progress.skipped += 1;timingDisposition('outside_year');
           console.log(`[日期跳过] ${note.noteId}：${publishedAt}；最近窗口${boundary.recent.length}/${cfg.searchStopWindow}`);
         } else {
           recordScope(checkpoint,task.keyword,note,result,assessKeywordScope(task.keyword,result,{excludedEntities:cfg.scopeExcludedEntitiesByKeyword[task.keyword]||[]}));
           const { asrJob, ...storedResult } = result;
           const audit = { keyword: task.keyword, articleId: result.post["文章id"], title: result.post["文章标题"], status: "已持久化", commentThreads: result.comments.length, missing: POST_FIELDS.filter(f => !["id", "文章图片信息", "文章标注", "分类", "清洗标注", "是否广告", "广告关键词"].includes(f) && result.post[f] == null) };
-          markCompleted(checkpoint, task.keyword, note, { ...storedResult, audit },{asrJob,asrMaxAttempts:cfg.asrJobMaxAttempts});
+          timedSync('checkpoint_write',()=>markCompleted(checkpoint, task.keyword, note, { ...storedResult, audit },{asrJob,asrMaxAttempts:cfg.asrJobMaxAttempts}));timingProgress('content_saved',{newToLocal:!cached?.result,afterCount:storedResult.comments?.length||0,beforeCount:cached?.result?.comments?.length||0,deltaCount:Math.max(0,(storedResult.comments?.length||0)-(cached?.result?.comments?.length||0))});
           progress.accepted += 1;
           importBuffer.push({ noteId: note.noteId, post: result.post, comments: result.comments });
           if (asrJob) {
             // Ensure the base article exists before a fast ASR completion can upsert its transcript.
             enqueueImport(task.keyword, importBuffer.splice(0));
-            await importQueue;
+            await timed('database_queue_wait',()=>importQueue);
             asrJobs?.enqueue(asrJob);
           } else if (importBuffer.length >= cfg.importBatchSize) enqueueImport(task.keyword, importBuffer.splice(0, cfg.importBatchSize));
           console.log(`[详情完成] ${result.post["文章标题"] || note.noteId}，评论讨论串${result.comments.length}条（已写入断点库）`);
         }
         failedNotes.delete(note.noteId);
       } catch (error) {
-        primaryError = error;
+        primaryError = error;timingDisposition('failed');
+        error.pageDiagnostic ||= await detailDiagnostics?.capture('detail_failure',error,{noteId:note.noteId,expectedDetailUrl:note.url});
         if (detail.isClosed() || /Target page, context or browser has been closed/.test(String(error.message))) {
           throw new Error("STOP_BROWSER_CLOSED：浏览器已关闭；当前数据保留，停止本节点", { cause: error });
         }
@@ -855,19 +912,23 @@ try {
         const detailStatus=markFailed(checkpoint, task.keyword, note, error,detailAttemptLimit(checkpoint,task.keyword,note.noteId));
         if(detailStatus==='dead_letter'){failedNotes.delete(note.noteId);progress.deadLetters=(progress.deadLetters||0)+1;}
         console.warn(`[详情失败] ${note.noteId}：${String(error.message || error).split("\n")[0]}（不计为非目标年份）`);
-        await detail.screenshot({ path: path.join(cfg.outputDir, `详情失败-${note.noteId}.png`), fullPage: false }).catch(() => {});
+
         }
       } finally {
         // Do not overwrite security/login/lease/browser failures with a close
         // error, nor perform additional navigation after a stop signal.
-        if(recoverSaved){await detail.close().catch(()=>{});}
+        if(recoverSaved){detailDiagnostics?.dispose();pageDiagnosticContexts.delete(detail);await detail.close().catch(()=>{});}
         else if (inPlaceState && !detail.isClosed() && (handledUnavailable || !String(primaryError?.message || "").startsWith("STOP_"))) {
-          await closePostToSearch(detail, inPlaceState,{allowWebUnavailable:handledUnavailable}).catch((error) => {
+          await closePostToSearch(detail, inPlaceState,{allowWebUnavailable:handledUnavailable}).catch(async(error) => {
+            error.pageDiagnostic ||= await detailDiagnostics?.capture('detail_close_failure',error,{noteId:note.noteId});
             if (String(error.message || error).startsWith("STOP_")) throw error;
-            throw new Error(`STOP_SEARCH_CONTEXT_LOST：详情关闭后未能恢复搜索页：${String(error.message || error).split("\n")[0]}`);
+            const contextError=new Error(`STOP_SEARCH_CONTEXT_LOST：详情关闭后未能恢复搜索页：${String(error.message || error).split("\n")[0]}`,{cause:error});
+            contextError.pageDiagnostic=error.pageDiagnostic;
+            throw contextError;
           });
         }
       }
+      });
       completedDetails += 1;
       if (await stopRequested()) throw new Error("STOP_REQUESTED：当前笔记已保存，执行安全停止");
       if (consecutiveFailures >= cfg.maxConsecutiveFailures) throw new Error(`STOP_FAILURE_THRESHOLD：连续失败${consecutiveFailures}篇，已保留断点`);
@@ -927,11 +988,12 @@ try {
   const message = String(error?.message || error);
   await publishRestriction(message);
   failureDiagnostic = error.pageDiagnostic || await pageDiagnostics?.capture('collector_failure',error,{firstFailureAt});
-  runStatus = collectionFailurePolicy(message).status;
+  timingFailure('keyword_failure',error);runStatus = collectionFailurePolicy(message).status;
   console.warn(`[采集收尾] ${runStatus}：${message.split("\n")[0]}`);
 } finally {
-  await importQueue.catch(() => {});
-  const asrSummary = await finalizeAsr(asrJobs,{volumeMode,readStats:()=>asrJobStats(checkpoint)}).catch((error) => {
+  await collectionPause?.close();
+  await timed('persistence_queue_drain',()=>importQueue).catch(() => {});
+  const asrSummary = await timed('asr_finalize',()=>finalizeAsr(asrJobs,{volumeMode,readStats:()=>asrJobStats(checkpoint)})).catch((error) => {
     console.warn(`[ASR队列] 收尾异常，未完成任务仍保存在asr_job：${String(error.message || error).split("\n")[0]}`);
     return null;
   });

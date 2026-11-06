@@ -44,6 +44,17 @@ Write-Host "Starting $Mode for $(Split-Path $WorkerRoot -Leaf)..."
 $queueFile = Join-Path $WorkerRoot 'task-queue.json'
 if (-not (Test-Path $queueFile)) { $queueFile = Join-Path $Root 'common\task-queue.json' }
 $queue = Get-Content $queueFile -Raw -Encoding UTF8 | ConvertFrom-Json
+$scopePath = Join-Path $Common 'task-scope.json'
+if (Test-Path -LiteralPath $scopePath) {
+  $topicScope = Get-Content -LiteralPath $scopePath -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($topicScope.enabled -ne $false) {
+    $allowedTopics = @($topicScope.allowedTopics)
+    if ($topicScope.version -ne 1 -or -not $allowedTopics.Count -or @($allowedTopics | Where-Object { $_ -notin @('topic1','topic2') }).Count) { throw 'TASK_SCOPE_INVALID' }
+    $queue.tasks = @($queue.tasks | Where-Object { $_.id -in $allowedTopics })
+    if (-not $queue.tasks.Count) { throw 'TASK_SCOPE_EMPTY' }
+    Write-Host '[Topic priority] Only Topic 2 is enabled; Topic 1 checkpoints are retained.'
+  }
+}
 $configuredMaxResults = if ($queue.PSObject.Properties.Name -contains 'maxResultsPerKeyword') { [int]$queue.maxResultsPerKeyword } else { 0 }
 # Production collection must cover the complete date window. Legacy worker
 # packages used 100 here as a per-keyword cap, which produced partial_limit at

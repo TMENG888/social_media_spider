@@ -21,6 +21,7 @@ function HiddenValue([string]$Label){
   finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Pointer);$Secure.Dispose()}
 }
 try {
+  if(-not $Check){Enter-MonitorSupervisorLock}
   & $Node (Join-Path $Common 'src\run-worker.mjs') --worker-root $Worker --preflight
   if($LASTEXITCODE -ne 0){throw 'Environment preflight failed. Collection not started.'}
   if($Check){exit 0}
@@ -63,7 +64,9 @@ try {
     if($Test){$WorkerArgs+=@('--test','--limit',[string]$Limit,'--max-runtime-minutes','90')}
     Set-MonitorSupervisorState 'collecting'
     & $Node @WorkerArgs
-    if($LASTEXITCODE -ne 0){throw 'Worker exited abnormally. Automatic restart is disabled.'}
+    $WorkerExitCode=$LASTEXITCODE
+    Write-MonitorSupervisorDiagnostic 'worker_exited' $WorkerExitCode
+    if($WorkerExitCode -ne 0){throw ('Worker exited abnormally (code '+$WorkerExitCode+'). Automatic restart is disabled. Check runs/worker-process-*.jsonl and this supervisor session log.')}
     if($SingleCycle -or $Test -or (Test-Path -LiteralPath $SupervisorStop)){break}
     $Status=Get-Content -LiteralPath (Join-Path $Worker 'runs\worker_status.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if($Status.operationalHold){

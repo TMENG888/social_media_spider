@@ -146,7 +146,7 @@ test('Lua rejects wrong/expired lease, task mismatch, stale SQL, wrong types and
  }
  // JS assessment uses fixture time; Redis clock is deliberately >60s later.
  const f=fixture(),q=luaClient(f);const now=f.now;f.now+=61000;const before=clone(q.client.state);
- await assert.rejects(()=>completeExhaustedSearch(q,f.snapshot,f.decision,f.task,f.record,{generation:'fixture-v1',token:'token',commit:true,now}),/EVIDENCE_INVALID/);
+ await assert.rejects(()=>completeExhaustedSearch(q,f.snapshot,f.decision,f.task,f.record,{generation:'fixture-v1',token:'token',commit:true,now}),/SEARCH_CLOSURE_EVIDENCE_EXPIRED/);
  assert.deepEqual(q.client.state,before);
 });
 

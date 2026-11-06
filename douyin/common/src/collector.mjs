@@ -1,3 +1,4 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
@@ -24,11 +25,12 @@ import {verifyCheckpointCoverage} from './coverage-gate.mjs';
 import {searchScrollProgress} from './search-scroll.mjs';
 import {readTaskVolume,validateVolumeSnapshot} from './volume-acceptance.mjs';
 import {finalizeAsr} from './asr-finalization.mjs';
+import {createPersistenceGate,persistenceConnection} from './persistence-gate.mjs';
 import {planObservedSearchItems} from './search-response-recovery.mjs';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-async function patchTranscript(result) {
+async function patchTranscript(result, persistenceGate) {
  await retryMysqlDeadlock(()=>withImportLease(async verify=>{
-  const connection=await mysql.createConnection(mysqlConnectionOptions());
+  const connection=persistenceConnection(await mysql.createConnection(mysqlConnectionOptions()),persistenceGate);
   try{
    await verify();
    // Backfills allocate no IDs. Resolve a unique row without taking broad
@@ -44,15 +46,20 @@ async function patchTranscript(result) {
    if(readback.length!==1 || (readback[0]['文章视频内容']??null)!==(result.post.文章视频内容??null))throw new Error('ASR_TRANSCRIPT_READBACK_MISMATCH');
    await recordCommittedPosts(connection,[result.post],{inserted:0,videoContentWrites:subtitleWriteCount(rows[0]['文章视频内容'],result.post.文章视频内容)},new Date().toISOString(),true);
   }catch(e){await connection.rollback();throw e;}finally{await connection.end();}
- }));
+ }),{shouldStop:persistenceGate.shouldAbort});
 }
-export async function collectKeyword({page,task,config,commonRoot,stateDir,outputDir,shouldStop,sampleLimit=0,commit=true,allowManualLogin=false,importer=importRows,prepareLatest=selectLatestWithRecovery}) {
+export async function collectKeyword(options){
+ const {task,outputDir}=options;configureTiming({directory:path.join(outputDir,'timing'),platform:'抖音',workerId:process.env.DY_WORKER_ID||'',keyword:task.keyword,topic:task.topic,runId:randomUUID(),lane:'foreground'});
+ return timed('keyword',()=>collectKeywordTimingImpl(options));
+}
+async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,outputDir,shouldStop,persistenceGate=null,sampleLimit=0,commit=true,allowManualLogin=false,importer=importRows,prepareLatest=selectLatestWithRecovery,onContentImported=async()=>{}}) {
+ persistenceGate ||= createPersistenceGate({stopCollecting:shouldStop,verifyLease:()=>assertLocalLease(),verifyControl:async()=>{if(commit&&process.env.DY_DISPATCH==='redis')throw new Error('PERSISTENCE_CONTROL_UNAVAILABLE');}});
  const volumeMode=commit&&!sampleLimit&&process.env.SOCIAL_VOLUME_ENABLED==='1';
  const volumeSnapshot=volumeMode?validateVolumeSnapshot(JSON.parse(await fs.readFile(process.env.SOCIAL_VOLUME_SNAPSHOT,'utf8')),{platform:'抖音'}):null;
  const volumeRead=()=>readTaskVolume({connect:()=>mysql.createConnection(mysqlConnectionOptions()),snapshot:volumeSnapshot,taskId:task.redisTaskId||task.id});
  await fs.mkdir(stateDir,{recursive:true});await fs.mkdir(outputDir,{recursive:true});
  const db=openCheckpoint(path.join(stateDir,'checkpoint.sqlite'));
- const retryBefore=retrySnapshot(db,task.keyword);
+ const retryBefore=timedSync('checkpoint_read',()=>retrySnapshot(db,task.keyword));timingProgress('keyword_baseline',{priorRetained:retryBefore.retainedArticleIds?.length||0});
  const observer=new DouyinResponseObserver(page),boundary=new YearBoundary(config.targetYear||2026,task.searchStopWindow||8);
  const seen=new Set(),summary={keyword:task.keyword,topic:task.topic,status:'running',posts:0,comments:0,verified:0,old:0,error:null,sortConfirmed:false,stopReason:null};
  Object.assign(summary,{taskId:task.redisTaskId||task.id,projectName:task.projectName,
@@ -67,14 +74,14 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   }
  };
  if(sampleLimit)summary.sampleNoteIds=[];
- let service=null,asr=null,error=null,baseImported=false;
+ let service=null,asr=null,error=null,baseImported=false,finalizing=false;
  const stop=async()=>{await assertLocalLease();return shouldStop?await shouldStop():false;};
  const check=async()=>{if(await stop())throw new Error('STOP_REQUESTED：已安全停止');};
  const releaseJobs=()=>db.prepare("UPDATE asr_job SET status='pending' WHERE status='waiting_import' AND EXISTS (SELECT 1 FROM candidate c WHERE c.keyword=asr_job.keyword AND c.note_id=asr_job.note_id AND c.status='completed' AND (c.import_status='imported' OR ?=1))").run(commit?0:1);
  const importResults=async results=>{
   const ids=results.map(r=>String(r.post.文章id));
   try {
-   if(commit&&results.length)await importer({posts:results.map(r=>r.post),comments:results.flatMap(r=>r.audit?.comments?.aggregation_mode==='legacy_unresolved'?[]:r.comments||[]),shouldStop:stop,verify:true});
+   if(commit&&results.length){await persistenceGate.assert();await importer({posts:results.map(r=>r.post),comments:results.flatMap(r=>r.audit?.comments?.aggregation_mode==='legacy_unresolved'?[]:r.comments||[]),shouldStop:persistenceGate.shouldAbort,persistenceGate,verify:true});}
    if(commit)markBaseImported(db,task.keyword,ids);
    if(commit){
     for(const result of results){
@@ -89,7 +96,7 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   const results=completedResults(db),posts=results.map(r=>r.post),comments=results.flatMap(r=>r.comments||[]);
   await importResults(results);
   if(commit&&posts.length)console.log(`[断点保全入库] ${task.keyword}: ${posts.length}篇，${comments.length}条评论`);
-  baseImported=true;releaseJobs();asr?.wake();return {posts:posts.length,comments:comments.length};
+  baseImported=true;if(!finalizing&&!await stop()){releaseJobs();asr?.wake();}return {posts:posts.length,comments:comments.length};
  };
  try{
   await check();
@@ -100,7 +107,7 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   if(summary.recoveredImportNotes.length)console.log(`[断点修复] ${task.keyword}: ${summary.recoveredImportNotes.length}篇已保存帖子恢复为待入库；不重新访问帖子、不改评论完整性`);
   if(config.asrEnabled){
    service=new AsrService({pythonExecutable:path.join(commonRoot,'runtime/python/python.exe'),model:path.resolve(commonRoot,config.asrModelPath),device:config.asrDevice||'cpu',computeType:config.asrComputeType||'int8_float32',cpuThreads:config.asrCpuThreads||1,beamSize:config.asrBeamSize||1,localFilesOnly:true,tempDir:path.join(stateDir,'media'),cacheDir:path.join(stateDir,'asr-cache')});
-   asr=new AsrJobProcessor({db,service,mediaDir:path.join(stateDir,'media'),keepMedia:config.asrKeepMedia===true,shouldStop:stop,onCompleted:async(_job,_output,result)=>{if(commit&&baseImported){await patchTranscript(result);return true;}return false;}});
+   asr=new AsrJobProcessor({db,service,mediaDir:path.join(stateDir,'media'),keepMedia:config.asrKeepMedia===true,shouldStop:stop,onCompleted:async(_job,_output,result)=>{if(commit&&baseImported){await patchTranscript(result,persistenceGate);return true;}return false;}});
   }
   await importSaved();
   asr?.start().catch(e=>{summary.asrError=String(e.message);});
@@ -236,6 +243,7 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
     continue;
    }
    if(prior?.status==='completed'&&prior.result?.audit?.commentsComplete!==false&&!mediaRecoveryIds.has(note.noteId)){
+    timingProgress('checkpoint_skip',{articleId:note.noteId,reason:'local_completed',priorStatus:prior.status});
     summary.verified++;summary.posts++;
     if(sampleLimit)summary.sampleNoteIds.push(note.noteId);
     summary.comments+=prior.result.comments?.length||0;
@@ -243,9 +251,11 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
     if(sampleLimit&&summary.posts>=sampleLimit){summary.stopReason='sample_limit';done=true;}
     continue;
    }
+   let opened=false,result=null,noteError=null,durable=false,dateExcluded=false;
+   await contentTiming({articleId:note.noteId},async()=>{
+   timingProgress('content_resume',{priorStatus:prior?.status||'unseen',beforeCount:prior?.result?.comments?.length||0,newToLocal:!prior?.result});
    console.log(`[详情开始] ${task.keyword} / ${note.noteId}`);
    await writeJsonAtomic(path.join(outputDir,'collector_progress.json'),{...summary,currentNote:note.noteId,updatedAt:new Date().toISOString()});
-   let opened=false,result=null,noteError=null,durable=false,dateExcluded=false;
    try{
     await openCard(page,note);opened=true;
     for(let attempt=0;attempt<10&&!observer.awemes.has(note.noteId);attempt++){await check();await pause(500);await observer.flush();}
@@ -254,13 +264,13 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
     result=postFromAweme(raw,task);summary.verified++;
     const date=result.post.文章时间地点;
     if(!inTargetYear(date,config.targetYear||2026,task.cutoff||'2026-01-01')){
-     markSkipped(db,task.keyword,note,'不在目标年度',date);summary.old++;dateExcluded=true;
+     markSkipped(db,task.keyword,note,'不在目标年度',date);summary.old++;dateExcluded=true;timingDisposition('outside_year');
      if(!recovering&&boundary.observe(note.noteId,date))summary.oldDateWindowObserved=true;
      console.log(`[日期跳过] ${note.noteId}: ${date}`);
     }else{
      let commentError=null;
      if(task.collectComments){
-      try{const output=await collectComments(page,observer,result.post,{shouldStop:stop,maxRounds:Number(config.maxCommentScrolls)||0,priorResult:prior?.result,pacingConfig:config});result.comments=output.rows;result.commentAudits=output.commentAudits||[];result.audit.comments=output.audit;result.audit.commentsComplete=output.audit.complete;}
+      try{const output=await collectComments(page,observer,result.post,{shouldStop:stop,maxRounds:Number(config.maxCommentScrolls)||0,priorResult:prior?.result,pacingConfig:config,onDiagnostic});result.comments=output.rows;result.commentAudits=output.commentAudits||[];result.audit.comments=output.audit;result.audit.commentsComplete=output.audit.complete;}
       catch(e){
        const merged=mergeCommentResults(result.post,prior?.result,{comments:e.partialComments||[],commentAudits:e.partialCommentAudits||[],audit:{comments:e.commentAudit}});
        result.comments=merged.rows;result.commentAudits=merged.commentAudits;result.audit.comments={...e.commentAudit,status:'incomplete',complete:false,aggregation_mode:'comment_thread',aggregation_version:1,collected:merged.rawCommentCount,raw_comment_count:merged.rawCommentCount,thread_count:merged.threadCount,orphan_comment_ids:merged.orphanCommentIds,unattached_comments:merged.unattachedComments};result.audit.commentsComplete=false;result.audit.commentsError=e.message;commentError=e;
@@ -268,8 +278,9 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
      }
      const job=config.asrEnabled&&result.post.文章视频链接?{keyword:task.keyword,noteId:note.noteId,articleId:note.noteId,mediaUrl:result.post.文章视频链接,referer:result.post.文章链接,prompt:null,sourceObserved:true}:null;
      markCompleted(db,task.keyword,note,result,{asrJob:job});
-     durable=true;
+     durable=true;timingProgress('content_saved',{newToLocal:!prior?.result,beforeCount:prior?.result?.comments?.length||0,afterCount:result.comments.length,deltaCount:Math.max(0,result.comments.length-(prior?.result?.comments?.length||0))});
      await importResults([result]);
+     if(commit&&!commentError)await onContentImported();
      baseImported=true;releaseJobs();asr?.wake();
      summary.posts++;summary.comments+=result.comments.length;if(!recovering)boundary.observe(note.noteId,date);
      console.log(`[详情完成] ${result.post.文章标题}；评论讨论串${result.comments.length}条；文章已持久化${commit?'并入库':''}`);
@@ -279,14 +290,14 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
      if(sampleLimit&&!recovering&&summary.posts>=sampleLimit){summary.stopReason='sample_limit';done=true;}
     }
    }catch(e){
-    noteError=e;
+    noteError=e;timingDisposition('failed');
     if(!durable)markFailed(db,task.keyword,note,e);
     if(!recovering)boundary.observe(note.noteId,null);
     if(!recoverableContentGap(e))throw e;
     summary.contentGaps||=[];summary.contentGaps.push({noteId:note.noteId,reason:String(e.message).split('：')[0]});
     console.warn(`[单帖缺口保留] ${note.noteId}: 不计入成功；继续搜索并在最后核对80%入库率`);
    }finally{
-    if(opened&&!/STOP_PLATFORM_RESTRICTION|STOP_LOGIN_REQUIRED/.test(noteError?.message||result?.audit?.commentsError||'')){
+    if(opened&&!await stop()&&!/STOP_PLATFORM_RESTRICTION|STOP_LOGIN_REQUIRED/.test(noteError?.message||result?.audit?.commentsError||'')){
      try{await restoreSearch(page,task.keyword,note.noteId);}
      catch(closeError){throw Object.assign(new Error('STOP_SEARCH_CONTEXT_LOST：详情关闭未能恢复原检索列表'),{cause:closeError,originalContentError:noteError?.message});}
     }
@@ -296,6 +307,7 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
     if(!noteError&&durable)summary.recoveredDetailNotes.push(note.noteId);
     else if(!noteError&&dateExcluded)summary.recoveredOldNotes.push(note.noteId);
    }
+   });
    // Count actual card visits, including old-year details, not the frozen number
    // of imported current-year posts. The eighth visit rests exactly once.
    handled++;
@@ -317,7 +329,7 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   if(sampleLimit&&summary.posts<sampleLimit)throw new Error(`SAMPLE_LIMIT_NOT_REACHED：搜索已结束但只取得${summary.posts}/${sampleLimit}篇，不能冒充抽样数量通过`);
   summary.status=sampleLimit?'sample_completed':'completed';
  }catch(e){
-  error=e;summary.error=String(e.message||e);summary.status=/STOP_REQUESTED/.test(summary.error)?'partial_stopped':'incomplete';
+  error=e;timingFailure('keyword_failure',e);summary.error=String(e.message||e);summary.status=/STOP_REQUESTED/.test(summary.error)?'partial_stopped':'incomplete';
   if(e.searchReadiness)summary.searchReadiness=e.searchReadiness;
   if(e.searchPreparationRecovery)summary.searchPreparationRecovery=e.searchPreparationRecovery;
   summary.firstFailureAt=new Date().toISOString();
@@ -330,10 +342,12 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   await writeJsonAtomic(path.join(outputDir,'collector_progress.json'),{...summary,asr:asrJobStats(db),updatedAt:new Date().toISOString()});
  }
  finally{
+  const collectionStopped=async()=>{try{return await stop();}catch(e){error ||= e;return true;}};
+  finalizing=true;persistenceGate.beginDrain();
   observer.detach();await observer.flush().catch(()=>{});
-  if(asr){try{summary.asrFinalization=await finalizeAsr(asr,{volumeMode,closeOnly:Boolean(error&&!recoverableContentGap(error)),readStats:()=>asrJobStats(db)});}catch(e){summary.asrError=String(e.message);}}
+  if(asr){try{summary.asrFinalization=await timed('asr_finalize',async()=>finalizeAsr(asr,{volumeMode,closeOnly:Boolean(await collectionStopped()||error&&!recoverableContentGap(error)),readStats:()=>asrJobStats(db)}));}catch(e){summary.asrError=String(e.message);}}
   await service?.close().catch(()=>{});
-  try{await check();const totals=await importSaved();summary.savedPosts=totals.posts;summary.savedComments=totals.comments;}catch(e){summary.importError=String(e.message);if(!error||e.code==='LEASE_LOST')error=e;summary.status=/STOP_REQUESTED/.test(error.message)?'partial_stopped':'incomplete';}
+  try{await persistenceGate.assert();const totals=await timed('preservation_import',()=>importSaved());summary.persistence={...persistenceGate.status(),status:'confirmed'};summary.savedPosts=totals.posts;summary.savedComments=totals.comments;}catch(e){summary.importError=String(e.message);summary.persistence={...persistenceGate.status(),status:'pending',reason:e.code||e.message};if(!error||e.code==='LEASE_LOST')error=e;summary.status=/STOP_REQUESTED/.test(error.message)?'partial_stopped':'incomplete';}
   summary.imports=db.prepare('SELECT import_status AS status,COUNT(*) AS count FROM candidate WHERE keyword=? AND status=\'completed\' GROUP BY import_status').all(task.keyword);
   const retryKey=`import_retry_cycles/${task.keyword}`;
   if(error?.importPending&&transientImportError(error)){
@@ -346,7 +360,8 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   summary.unresolvedMediaSources=settleExpiredMediaGaps(db,task.keyword,{scanComplete:!error&&verifiedAnnualSearchEnd(summary)});
   summary.asr=asrJobStats(db);
   summary.asr.runtimeUnavailable=Boolean(asr?.haltedReason);
-  summary.importOk=commit&&!summary.importError;
+  summary.pendingImport=summary.imports.some(row=>row.status!=='imported'&&row.count>0);
+  summary.importOk=commit&&!summary.importError&&!summary.pendingImport;
   summary.asrAcceptance=assessAsrAcceptance(summary.asr,{required:!volumeMode&&Boolean(config.asrEnabled),allowExhaustedSkip:true});
   if(!error && summary.status==='completed' && summary.asrAcceptance.status==='accepted_with_skips'){
    summary.status='completed_with_skips';summary.asr.skippedExhausted=summary.asrAcceptance.skipped;
@@ -360,9 +375,9 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   const noChange=unchangedRetry(retryBefore,retrySnapshot(db,task.keyword),{
    error:[summary.error,summary.asrError].filter(Boolean).join(' | '),status:summary.status,
    freshSearch:summary.sortConfirmed,boundedRecoverySearch:summary.boundedRecoverySearch,
-   stopped:await stop(),importOk:commit&&!summary.importError,runtimeUnavailable:summary.asr.runtimeUnavailable,
+   stopped:await collectionStopped(),importOk:commit&&!summary.importError,runtimeUnavailable:summary.asr.runtimeUnavailable,
    pendingAsr:summary.asr.pendingTotal||0});
-  if(volumeMode&&!await stop()){
+  if(volumeMode&&!await collectionStopped()){
    try{summary.volumeAcceptance=await volumeRead();
     if(summary.volumeAcceptance.ok){summary.previousCollectionError=error?.message||null;
      summary.mustStopNode=Boolean(error&&/LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION/.test(error.message));
@@ -377,7 +392,7 @@ export async function collectKeyword({page,task,config,commonRoot,stateDir,outpu
   }
   if(noChange)summary.stagnationEvidence=noChange;
   setMeta(db,'collection_summary',summary);
-  summary.finishedAt=new Date().toISOString();
+  summary.finishedAt=new Date().toISOString();timingProgress('keyword_result',{outcome:summary.status,posts:summary.posts,comments:summary.comments,pending:summary.asr?.pendingTotal||0});
   await exportCheckpoint(db,outputDir,{projectName:task.projectName,cutoff:task.cutoff||'2026-01-01',targetYear:config.targetYear||2026,collectComments:task.collectComments,collectionCompleteness:summary.status});
   await writeJsonAtomic(path.join(outputDir,'collector_status.json'),summary);
   diagnostics.dispose();

@@ -1,6 +1,8 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
 import mysql from "mysql2/promise";
+import {persistenceConnection} from './persistence-gate.mjs';
 import { mysqlTargetOptions } from "./mysql-target-options.mjs";
 import { POST_FIELDS, COMMENT_FIELDS, canonicalDouyinPostUrl } from "./schema.mjs";
 import { pathToFileURL } from "node:url";
@@ -29,7 +31,8 @@ export function mysqlConnectionOptions() {
   };
 }
 
-export async function verifyTable(connection, table, fields) {
+export async function verifyTable(...args){return timed('database_schema_check',()=>verifyTableDetailedImpl(...args),{});}
+async function verifyTableDetailedImpl(connection, table, fields) {
   if (!["ods_social_media_post", "ods_social_media_comment"].includes(table)) throw new Error("不支持的目标数据表");
   const [cols] = await connection.query(`SHOW FULL COLUMNS FROM \`${table}\``);
   const actual = cols.map((c) => c.Field);
@@ -73,7 +76,8 @@ export function utf8mb3CompatibleText(value) {
   }
   return output;
 }
-async function makeRowsCompatibleWithTable(connection, table, rows) {
+async function makeRowsCompatibleWithTable(...args){return timed('database_prepare',()=>makeRowsCompatibleWithTableDetailedImpl(...args),{});}
+async function makeRowsCompatibleWithTableDetailedImpl(connection, table, rows) {
   if (!rows.length) return { rows, stats: { changedRows: 0, changedValues: 0, fields: [] } };
   const [columns] = await connection.query(`SHOW FULL COLUMNS FROM \`${table}\``);
   const utf8mb3Fields = new Set(columns.filter((column) => isUtf8mb3Collation(column.Collation)).map((column) => column.Field));
@@ -133,7 +137,8 @@ export async function existingBusinessRows(connection,table,rows){
  }
  return found;
 }
-async function upsertRows(connection, table, fields, rows) {
+async function upsertRows(...args){return timed('database_write',()=>upsertRowsDetailedImpl(...args),{});}
+async function upsertRowsDetailedImpl(connection, table, fields, rows) {
   if(!rows.length)return {inserted:0,updated:0};
   const existingRows=await existingBusinessRows(connection,table,rows);
   let id = await nextId(connection, table), inserted = 0, updated = 0, videoContentWrites = 0;
@@ -172,7 +177,8 @@ export async function retryMysqlDeadlock(operation,{attempts=3,delayMs=300,shoul
     }
   }
 }
-export async function acquireImportLock(connection,{lockTimeoutSeconds=10,maxLockWaitMs=600000,shouldStop=null,verifyLease=async()=>{}}={}){
+export async function acquireImportLock(...args){return timed('database_lock',()=>acquireImportLockTimingImpl(...args),{});}
+async function acquireImportLockTimingImpl(connection,{lockTimeoutSeconds=10,maxLockWaitMs=600000,shouldStop=null,verifyLease=async()=>{}}={}){
   const started=Date.now(),deadline=started+Math.max(0,Number(maxLockWaitMs)||0);
   let warnedAt=0;
   do{
@@ -187,12 +193,13 @@ export async function acquireImportLock(connection,{lockTimeoutSeconds=10,maxLoc
   }while(Date.now()<deadline);
   throw Object.assign(new Error('MYSQL_IMPORT_LOCK_WAIT_TIMEOUT：共享入库锁限时等待结束，数据保留在本地'),{code:'MYSQL_IMPORT_LOCK_WAIT_TIMEOUT'});
 }
-export async function importRows({ posts = [], comments = [], verify = false, lockTimeoutSeconds = 10,maxLockWaitMs=600000,shouldStop=null } = {}) {
+export async function importRows(...args){return timed('database',()=>importRowsTimingImpl(...args),{});}
+async function importRowsTimingImpl({ posts = [], comments = [], verify = false, lockTimeoutSeconds = 10,maxLockWaitMs=600000,shouldStop=null,persistenceGate=null } = {}) {
   // 最后一道入库防线：无论数据来自实时采集、旧断点还是人工JSON，分类都必须写成SQL NULL。
   posts = repairArticleLinks(forceNullCategory(posts.map(normaliseDouyinPostFields)));
   comments = repairArticleLinks(forceNullCategory(comments.map(normaliseDouyinCommentFields)));
   return retryMysqlDeadlock(()=>withImportLease(async verifyLease => {
-  const connection = await mysql.createConnection(mysqlConnectionOptions());
+  const connection = persistenceConnection(await mysql.createConnection(mysqlConnectionOptions()),persistenceGate);
   let importLockAcquired = false;
   try {
     await acquireImportLock(connection,{lockTimeoutSeconds,maxLockWaitMs,shouldStop,verifyLease});
@@ -217,6 +224,7 @@ export async function importRows({ posts = [], comments = [], verify = false, lo
     const postResult = await upsertRows(connection, "ods_social_media_post", POST_FIELDS, posts);
     const commentResult = await upsertRows(connection, "ods_social_media_comment", COMMENT_FIELDS, comments);
     await verifyLease();
+    if(await shouldStop?.())throw new Error('PERSISTENCE_ABORT_BEFORE_COMMIT');
     await connection.commit();
     await recordCommittedPosts(connection,posts,postResult,new Date().toISOString());
     return { postResult, commentResult, charsetCompatibility: compatibility };

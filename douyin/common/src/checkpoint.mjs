@@ -1,3 +1,4 @@
+import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
 import { inTargetYear } from "./collection-policy.mjs";
@@ -479,7 +480,8 @@ async function atomicWrite(file, content) {
   await fs.rename(temp, file);
 }
 
-export async function exportCheckpoint(db, outputDir, extra = {}) {
+export async function exportCheckpoint(...args){return timed('checkpoint_export',()=>exportCheckpointDetailedImpl(...args),{});}
+async function exportCheckpointDetailedImpl(db, outputDir, extra = {}) {
   await fs.mkdir(outputDir, { recursive: true });
   const taskLabels = {
     ...(extra.projectName ? { 项目: extra.projectName } : {}),

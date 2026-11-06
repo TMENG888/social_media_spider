@@ -1,3 +1,4 @@
+import {evidenceTimeGuardLua} from './redis-evidence-clock.mjs';
 import {createHash} from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
 import {collectorAnnualScan} from './annual-scan-adapter.mjs';
@@ -10,13 +11,13 @@ const contentErrors=new Set(['VOLUME_BELOW_THRESHOLD','KNOWN_CANDIDATES_INCOMPLE
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const reject=reason=>({ok:false,policy:SEARCH_EXHAUSTION_POLICY,reason});
 
-export function assessSearchExhaustion(decision,task,record,{now=Date.now()}={}){
+export function assessSearchExhaustion(decision,task,record,{now=Date.now(),sqlNow=now}={}){
  if(decision?.platform!=='抖音'||decision.dbReadbackVerified!==true||decision.ok!==false
   ||decision.reason!=='VOLUME_BELOW_THRESHOLD'||!Number.isSafeInteger(decision.posts)||decision.posts<0
   ||!Number.isSafeInteger(decision.threshold)||decision.threshold<1||decision.posts>=decision.threshold)
   return reject('SEARCH_CLOSURE_SQL_INVALID');
  const checkedAtMs=Date.parse(decision.checkedAt);
- if(!Number.isFinite(checkedAtMs)||now-checkedAtMs>60000||checkedAtMs>now+1000)return reject('SEARCH_CLOSURE_SQL_STALE');
+ if(!Number.isFinite(checkedAtMs)||sqlNow-checkedAtMs>60000||checkedAtMs>sqlNow+1000)return reject('SEARCH_CLOSURE_SQL_STALE');
  if(!task||(task.redisTaskId||task.id)!==decision.taskId||task.keyword!==decision.keyword
   ||task.projectName!==decision.projectName||record?.taskId!==decision.taskId
   ||record.keyword!==decision.keyword||record.projectName!==decision.projectName)
@@ -71,8 +72,9 @@ local time=redis.call('TIME');local now=tonumber(time[1])*1000+math.floor(tonumb
 if e.policy~='${SEARCH_EXHAUSTION_POLICY}' or e.ok~=true or e.taskId~=id or e.snapshotId~=snapshot_id
  or e.keyword~=d.keyword or e.projectName~=d.projectName or e.posts~=d.posts or e.threshold~=d.threshold
  or d.dbReadbackVerified~=true or d.posts>=d.threshold or e.quantityAccepted~=false
- or type(e.checkedAtMs)~='number' or now-e.checkedAtMs>60000 or e.checkedAtMs>now+1000 then
+ then
  return redis.error_reply('SEARCH_CLOSURE_EVIDENCE_INVALID') end
+${evidenceTimeGuardLua('SEARCH_CLOSURE','e.checkedAtMs')}
 local status=redis.call('HGET',KEYS[2],id)
 if exhausted_search_closed(id,generation,snapshot_id,status) then
  return cjson.encode({status='completed',changed=false,acceptedBySearchExhaustion=true,acceptedByVolume=false}) end
@@ -108,7 +110,7 @@ export async function completeExhaustedSearch(queue,snapshot,decision,task,recor
  if(!/^[A-Za-z0-9_-]{1,100}$/.test(generation||''))throw new Error('SEARCH_CLOSURE_GENERATION_REQUIRED');
  if(!isDeepStrictEqual(decision,volumeDecision(snapshot,{taskId:decision.taskId,posts:decision.posts,
   readbackVerified:decision.dbReadbackVerified,checkedAt:decision.checkedAt})))throw new Error('SEARCH_CLOSURE_DECISION_INVALID');
- const evidence=assessSearchExhaustion(decision,task,record,{now});
+ const evidence=assessSearchExhaustion(decision,task,record,{now,...(commit?{sqlNow:Date.parse(decision.checkedAt)}:{})});
  if(!evidence.ok)return {evidence,confirmation:null};
  if(!commit)return {evidence,confirmation:{status:'preview',changed:false}};
  if(typeof token!=='string'||!token)throw new Error('SEARCH_CLOSURE_LEASE_REQUIRED');

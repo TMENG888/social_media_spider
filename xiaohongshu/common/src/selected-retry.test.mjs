@@ -43,7 +43,9 @@ test('selection does not weaken final completion predicate',async()=>{
  assert.match(source,/\["completed","completed_with_skips"\]\.includes\(taskState\) && \(dispatcher\?\.volume \? coverage\.ok===true : skipImport \|\| importResult\?\.code === 0\)/);
   assert.match(source,/dispatcher\.tasks\(\{taskId:onlyTaskId,/);
  assert.match(source,/onlyTaskId&&\(skipImport\|\|phase!=='posts'\)/);
-  assert.match(source,/if\(!onlyTaskId\)\{\s*const categoryRepair/);
+  // Background category rewriting was removed; the remaining link repair
+  // must still be gated off for an explicitly selected task.
+  assert.match(source,/if\(!onlyTaskId\)\{\s*\/\/[^\n]*\n\s*const linkRepair = await repairInvalidArticleLinks/);
 });
 test('selected preflight verifies payload without publishing or recreating tasks',async()=>{
  let invocation;

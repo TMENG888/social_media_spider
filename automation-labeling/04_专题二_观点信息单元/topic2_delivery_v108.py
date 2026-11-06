@@ -35,6 +35,6 @@ def export_workbook(payload,output_path,*,work_dir=None,node=NODE,dependency_roo
     if [(s['name'],s['headers'],s['side_headers']) for s in report['sheets']]!=[(s['name'],s['headers'],s['side_headers']) for s in expected['sheets']]:
         raise RuntimeError('Exported worksheet schema differs from authorized standard')
     detail=next(s for s in report['sheets'] if s['name']=='打标明细')
-    if report.get('detail_grain')!='source-and-original-span-v109' or report.get('duplicate_detail_rows')!=0 or report.get('unique_detail_rows')!=detail['rows']:
+    if report.get('detail_grain')!='source-and-original-span-v110' or report.get('duplicate_detail_rows')!=0 or report.get('unique_detail_rows')!=detail['rows']:
         raise RuntimeError('Final detail is not unique per original source slice')
     return {'file':str(output),'schema_version':report['schema_version'],'sheets':len(report['sheets']),'detail_fields':23,'unique_detail_rows':detail['rows'],'process_exit_code':result.returncode}

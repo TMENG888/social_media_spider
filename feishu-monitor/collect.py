@@ -42,6 +42,23 @@ def json_value(raw):
 def parse_time(value):
     return stamp(value)
 
+def keyword_queue_counts(tasks,statuses):
+    """Partition the same observed keyword states by manifest topic."""
+    def counts(rows):
+        states=collections.Counter(statuses.get(t['task_id'],{}).get('status','unseen') for t in rows)
+        records=[statuses.get(t['task_id'],{}) for t in rows]
+        return {'pendingNew':sum(states[s] for s in ('pending','queued')),
+                'recollectPending':states['recollect_pending'],
+                'retryExhaustedCompleted':sum(r.get('acceptedBy')=='retry_exhausted_completion' for r in records),
+                'resetOnceCompleted':sum(r.get('acceptedBy')=='reset_once_recollection' for r in records),
+                'completedPendingImport':sum(r.get('pendingImport') is True for r in records),
+                'retryPending':states['retry_pending'],'deferred':states['completed_with_deferred_retries'],
+                'unobserved':states['unseen'],'states':dict(states),'planned':len(rows)}
+    result=counts(tasks)
+    result['topics']={topic:counts([t for t in tasks if t['topic']==topic]) for topic in sorted({t['topic'] for t in tasks})}
+    result['definition']='待领=pending/queued关键词；unseen未知不默认待领。专题按当前任务清单分组；不是视频重试消息数。'
+    return result
+
 def progress(tasks,statuses,video_counts,mostly_completed_ratio=0.8):
     if not 0 < mostly_completed_ratio < 1:
         raise ValueError('mostly_completed_ratio must be between 0 and 1')
@@ -115,15 +132,7 @@ def collect(config):
                 if state=='completed' and dt and (task_id not in latest_output or dt>parse_time(latest_output[task_id])):latest_output[task_id]=stamp
             counts[task_id]=per
         result['progress'],result['keywords']=progress(tasks,statuses,counts,float(config.get('mostly_completed_ratio',0.8)))
-        keyword_states=collections.Counter(statuses.get(task['task_id'],{}).get('status','unseen') for task in tasks)
-        result['keywordQueueCounts']={'pendingNew':sum(keyword_states[s] for s in ('pending','queued')),
-            'recollectPending':keyword_states['recollect_pending'],
-            'retryExhaustedCompleted':sum(statuses.get(task['task_id'],{}).get('acceptedBy')=='retry_exhausted_completion' for task in tasks),
-            'resetOnceCompleted':sum(statuses.get(task['task_id'],{}).get('acceptedBy')=='reset_once_recollection' for task in tasks),
-            'completedPendingImport':sum(statuses.get(task['task_id'],{}).get('pendingImport') is True for task in tasks),
-            'retryPending':keyword_states['retry_pending'],'deferred':keyword_states['completed_with_deferred_retries'],
-            'unobserved':keyword_states['unseen'],'states':dict(keyword_states),
-            'definition':'待领=pending/queued关键词；重试=retry_pending关键词；补采=遍历结束但视频补采未完成的关键词；unseen未知不默认待领。不是视频重试消息数。'}
+        result['keywordQueueCounts']=keyword_queue_counts(tasks,statuses)
         result['progressDefinition']={'mostlyCompletedThreshold':config.get('mostly_completed_ratio',0.8),'denominator':'known video checkpoints for each keyword, not platform total','uncollected':'no checkpoints in this Redis run; may have previous MySQL data or failed search attempts'}
         result['videos']={'checkpointStates':dict(total),'noChangeCompleted':no_change,'asrStates':dict(asr_status),'reviewFlagCount':reviews,'reviewScope':'explicit Redis flags only; not a full subtitle quality audit'}
         result['videoDiagnostics']=diagnostics

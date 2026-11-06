@@ -35,8 +35,20 @@ try {
   }
   const projects=[...observedProjects];
   const [otherPlatforms]=await conn.execute(`SELECT \`平台\` AS platform,\`项目\` AS project,COUNT(*) AS posts,${coreColumns},SUM(NULLIF(TRIM(\`文章视频内容\`),'') IS NOT NULL) AS contentNonempty FROM ods_social_media_post WHERE \`平台\` IN (?,?) AND \`项目\` IN (${projects.map(()=>'?').join(',')}) GROUP BY \`平台\`,\`项目\``,['小红书','抖音',...projects]);
+  const [otherComments]=await conn.execute(`SELECT \`平台\` AS platform,\`项目\` AS project,COUNT(*) AS comments FROM ods_social_media_comment WHERE \`平台\` IN (?,?) AND \`项目\` IN (${projects.map(()=>'?').join(',')}) GROUP BY \`平台\`,\`项目\``,['小红书','抖音',...projects]);
+  const topicVolumes={};
+  for(const [topic,project] of [['专题一','全国地产设计产品力监测'],['专题二','北京臻澐项目口碑']]) {
+    topicVolumes[topic]={};
+    for(const platform of ['视频号','小红书','抖音']) {
+      if(!observedProjects.has(project))continue;
+      const postRows=platform==='视频号'?posts:otherPlatforms.filter(r=>r.platform===platform);
+      const commentRows=platform==='视频号'?comments:otherComments.filter(r=>r.platform===platform);
+      topicVolumes[topic][platform]={posts:postRows.filter(r=>r.project===project).reduce((n,r)=>n+Number(r.posts),0),
+        comments:commentRows.filter(r=>r.project===project).reduce((n,r)=>n+Number(r.comments),0)};
+    }
+  }
   await conn.commit();
-  result={source:'ok',generatedAt:new Date().toISOString(),posts,comments,otherPlatforms,scope:'historical rows for configured projects and observed production-queue projects; separate platform groups, not exclusively current Redis runs',qualifiedSubtitleRate:null,hourlyInserts:null,hourlyQualifiedSubtitles:null,averageVideoCollectionSeconds:null};
+  result={source:'ok',generatedAt:new Date().toISOString(),posts,comments,otherPlatforms,otherComments,topicVolumes,scope:'historical rows for configured projects and observed production-queue projects; separate platform groups, not exclusively current Redis runs',qualifiedSubtitleRate:null,hourlyInserts:null,hourlyQualifiedSubtitles:null,averageVideoCollectionSeconds:null};
 } catch(e) {result={source:'unavailable',errorType:e.code || e.name,generatedAt:new Date().toISOString()};}
 finally {if(conn)await conn.end().catch(()=>{});}
 atomicWriteFileSync(path.join(root,'output/database.json'),JSON.stringify(result,null,2));

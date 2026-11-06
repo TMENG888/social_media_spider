@@ -10,7 +10,7 @@ export async function inspectPlatformAccess(page,platform,{retryNavigation=true}
   };
   const content='section.note-item,.note-item,[data-note-id],.search-result-card,[data-e2e="search-result"],.note-container,#noteContainer,[data-e2e="feed-active-video"],[data-e2e="feed-video"],[data-e2e="video-desc"],[data-e2e="comment-list"]';
   const shown=selector=>[...document.querySelectorAll(selector)].some(visible);
-  if(shown('iframe#nocaptcha-container,iframe[src*="rc-verifycenter"]'))return {kind:'captcha',evidence:'visible_verification_frame'};
+  if(shown('#captcha_container,iframe[src*="rmc.bytedance.com"],iframe#nocaptcha-container,iframe[src*="rc-verifycenter"]'))return {kind:'captcha',evidence:'visible_verification_frame'};
   const labels=[...document.querySelectorAll('body,main,div,p,span,button,h1,h2,a')]
    .filter(n=>visible(n)&&!n.closest(content)&&n.childElementCount===0)
    .map(n=>(n.textContent||'').trim());

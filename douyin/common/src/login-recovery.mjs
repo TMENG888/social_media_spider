@@ -145,7 +145,7 @@ export async function inspectSearchPage(page,platform,keyword){
    .filter(n=>visible(n)&&!n.closest(cards)&&n.childElementCount===0)
    .map(n=>(n.textContent||'').trim());
   const blocked=labels.some(t=>/登录后推荐更懂你的笔记|登录后查看搜索结果|登录后即可搜索|登录后查看更多|登录后查看评论|扫码登录|请先登录|安全验证|请完成.*验证|拖动.*滑块|访问频繁|操作频繁|访问过于频繁|暂时无法浏览|网络环境存在风险|300013|Bad Gateway|Service Unavailable|Gateway Time-out/i.test(t))
-   ||[...document.querySelectorAll('iframe#nocaptcha-container,iframe[src*="rc-verifycenter"],.login-container,.login-mask')].some(visible);
+   ||[...document.querySelectorAll('#captcha_container,iframe[src*="rmc.bytedance.com"],iframe#nocaptcha-container,iframe[src*="rc-verifycenter"],.login-container,.login-mask')].some(visible);
   const inputs=[...document.querySelectorAll('input[data-e2e="searchbar-input"],input[name="keyword"],input[placeholder*="搜索"],input#search-input')].filter(visible);
   const inputMatches=inputs.some(n=>n.value===keyword);
   const results=[...document.querySelectorAll(cards)].some(visible);
@@ -189,7 +189,7 @@ export async function inspectLoginPage(page,platform){
    .filter(n=>visible(n)&&!n.closest(content)&&n.childElementCount===0)
    .map(n=>(n.textContent||'').trim());
   const blocked=labels.some(t=>/^登录$|登录后推荐更懂你的笔记|登录后查看搜索结果|登录后即可搜索|登录后查看更多|登录后查看评论|扫码登录|请先登录|安全验证|请完成.*验证|拖动.*滑块|访问频繁|操作频繁|访问过于频繁|暂时无法浏览|网络环境存在风险|300013|Bad Gateway|Service Unavailable|Gateway Time-out/i.test(t))
-   ||[...document.querySelectorAll('iframe#nocaptcha-container,iframe[src*="rc-verifycenter"],.login-container,.login-mask,[role="dialog"][aria-label*="登录"]')].some(visible);
+   ||[...document.querySelectorAll('#captcha_container,iframe[src*="rmc.bytedance.com"],iframe#nocaptcha-container,iframe[src*="rc-verifycenter"],.login-container,.login-mask,[role="dialog"][aria-label*="登录"]')].some(visible);
   const unwrap=value=>{
    if(value&&typeof value==='object'&&'value' in value)return value.value;
    if(value&&typeof value==='object'&&'_value' in value)return value._value;

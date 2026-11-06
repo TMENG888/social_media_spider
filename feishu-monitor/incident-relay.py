@@ -66,7 +66,7 @@ def payload(event):
     return {'msg_type':'interactive','card':{'header':{'template':'green' if resolved else 'orange',
         'title':{'tag':'plain_text','content':title}},'elements':[{'tag':'div','text':{'tag':'plain_text','content':text}}]}}
 
-def deliver_source(c,namespace,token,webhook,secret='',sender=send):
+def deliver_source(c,namespace,token,webhook,secret='',sender=send,watch=None):
     stream,delivery=namespace+':monitor:outbox',namespace+':monitor:delivery'
     if not c.command('EVAL',LEASE,1,delivery,token):
         return {'state':'standby','delivered':0}
@@ -74,6 +74,10 @@ def deliver_source(c,namespace,token,webhook,secret='',sender=send):
     rows=[]
     for raw in values:
         event=json.loads(raw)
+        if watch:
+            from incident_auto_filter import eligible_event,current_field
+            current=c.command('HGET',namespace+':monitor:incidents',current_field(event))
+            if not eligible_event(event,json.loads(current) if current else None,watch):continue
         rows.append((event['incidentId']+('|resolved' if event['status']=='resolved' else '|active'),raw))
     rows.sort(key=lambda r:(json.loads(r[1]).get('startedAt',0),json.loads(r[1]).get('status')=='resolved',r[0]))
     delivered=0
@@ -82,7 +86,11 @@ def deliver_source(c,namespace,token,webhook,secret='',sender=send):
         if not c.command('EVAL',LEASE,1,delivery,token):
             raise RuntimeError('Relay lease lost')
         event=json.loads(raw)
-        if sender(payload(event),webhook,secret) is not True:
+        card=payload(event)
+        if watch:
+            from incident_auto_filter import auto_payload
+            card=auto_payload(event,watch)
+        if sender(card,webhook,secret) is not True:
             raise RuntimeError('Feishu delivery not confirmed')
         receipt={'incidentId':event['incidentId'],'status':event['status'],
                  'confirmedAt':time.time(),'deliveryConfirmed':True}
@@ -91,7 +99,7 @@ def deliver_source(c,namespace,token,webhook,secret='',sender=send):
         print('Feishu delivery confirmed; incident='+event['incidentId'],flush=True)
     return {'state':'ready','delivered':delivered}
 
-def sources():
+def sources(include_channels=True):
     config=json.loads((ROOT/'config.json').read_text(encoding='utf-8-sig'))
     result=[]
     for platform,default,prefix,env in [('小红书','xiaohongshu','xhs','MONITOR_XHS_PASSWORD'),('抖音','douyin','xhs:douyin','MONITOR_DY_PASSWORD')]:
@@ -105,15 +113,17 @@ def sources():
         if settings.get('username'):
             u=u._replace(netloc=quote(settings['username'],safe='')+'@'+u.netloc)
         result.append((platform,prefix+':{'+campaign+'}',urlunparse(u),os.environ.get(env)))
+    if not include_channels:return result
     password=(ROOT/config['redis_credential']).read_text(encoding='utf-8-sig').strip()
     result.append(('视频号','wechat:channels:'+config['run_id'],config['redis_url'],password))
     return result
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--check',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--once',action='store_true');p.add_argument('--check',action='store_true');p.add_argument('--watch-config');a=p.parse_args()
+    watch=json.loads(Path(a.watch_config).read_text(encoding='utf-8-sig')) if a.watch_config else None
     if a.check:
         health={}
-        for platform,namespace,url,password in sources():
+        for platform,namespace,url,password in sources(include_channels=not bool(watch)):
             try:
                 if not password:raise RuntimeError('Existing Redis credential unavailable')
                 with RedisConnection(url,password,timeout=5) as c:
@@ -125,26 +135,28 @@ def main():
     if not os.environ.get('FEISHU_WEBHOOK'):
         raise RuntimeError('Existing encrypted Feishu credential required')
     token=secrets.token_hex(24);previous=None
-    configured=sources()
+    configured=sources(include_channels=not bool(watch))
     stop_file=ROOT/'output/incident-relay.stop'
-    while not stop_file.exists():
+    status_file=Path(watch['statusFile']) if watch else ROOT/'output/incident-relay-status.json'
+    watch_stop=Path(watch['stopFile']) if watch else stop_file
+    while not stop_file.exists() and not watch_stop.exists():
         health={}
         for platform,namespace,url,password in configured:
             try:
                 if not password:raise RuntimeError('Existing Redis credential unavailable')
                 with RedisConnection(url,password,timeout=5) as c:
-                    health[platform]=deliver_source(c,namespace,token,os.environ['FEISHU_WEBHOOK'],os.environ.get('FEISHU_SIGN_SECRET',''))
+                    health[platform]=deliver_source(c,namespace,token,os.environ['FEISHU_WEBHOOK'],os.environ.get('FEISHU_SIGN_SECRET',''),watch=watch)
             except Exception as e:
                 health[platform]={'state':'failed','errorType':type(e).__name__,'deliveryConfirmed':False}
         signature={k:(v['state'],v.get('errorType')) for k,v in health.items()}
-        atomic_json(ROOT/'output/incident-relay-status.json',{'pid':os.getpid(),'updatedAt':time.time(),'sources':health})
+        atomic_json(status_file,{'pid':os.getpid(),'updatedAt':time.time(),'sources':health})
         if signature!=previous:
             print(json.dumps({'event':'incident_relay_health','sources':health},ensure_ascii=False),flush=True);previous=signature
         if a.once:return int(any(v['state']=='failed' for v in health.values()))
-        for _ in range(30):
-            if stop_file.exists():break
+        for _ in range(150 if watch else 30):
+            if stop_file.exists() or watch_stop.exists():break
             time.sleep(0.1)
-    atomic_json(ROOT/'output/incident-relay-status.json',{'pid':os.getpid(),'updatedAt':time.time(),'state':'stopped','sources':{}})
+    atomic_json(status_file,{'pid':os.getpid(),'updatedAt':time.time(),'state':'stopped','sources':{}})
     return 0
 
 if __name__=='__main__':

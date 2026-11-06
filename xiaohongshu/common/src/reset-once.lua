@@ -11,8 +11,11 @@ local old=redis.call('HGET',KEYS[3],id)
 local function out(v) return cjson.encode(v) end
 local function completed()
  local result=cjson.decode(s.result or '{}')
+ if result.riskVolumeAccepted==true then return out({status='completed',changed=false,acceptedByVolume=true,acceptedByRiskVolume=true,businessCompleted=true,quantityAccepted=true,pendingImport=false,dataImported=true,collectionSucceeded=false}) end
  return out({status='completed',changed=false,acceptedByResetOnce=true,businessCompleted=true,quantityAccepted=false,
   pendingImport=result.pendingImport==true,collectionSucceeded=result.collectionSucceeded==true,
+  acceptedByRiskRetry=result.acceptedBy=='security_retry_local_increment',
+  riskRetryEvidence=result.outcome and result.outcome.riskRetryEvidence or cjson.null,
   dataImported=result.dataImported==true})
 end
 if mode=='read' then return raw or '{}' end
@@ -56,7 +59,7 @@ local function archive(tag,details)
 end
 local function finish(record,stale)
  local import_ok=record.importOk==true
- local result={status='completed',accepted=true,businessCompleted=true,acceptedBy='reset_once_recollection',
+ local result={status='completed',accepted=true,businessCompleted=true,acceptedBy=record.riskRetryEvidence and 'security_retry_local_increment' or 'reset_once_recollection',
   taskId=id,keyword=s.preservation.keyword,topic=s.preservation.topic,messageId=mid,
   quantityAccepted=false,qualityVerified=false,collectionSucceeded=record.collectionSucceeded==true,
   dataImported=import_ok,pendingImport=not import_ok,completedAt=now,
@@ -75,7 +78,8 @@ local function finish(record,stale)
  else redis.call('XACK',KEYS[7],group,mid) end
  redis.call('HDEL',KEYS[5],id)
  return out({status='completed',changed=true,acceptedByResetOnce=true,businessCompleted=true,
-  quantityAccepted=false,pendingImport=not import_ok,dataImported=import_ok,collectionSucceeded=result.collectionSucceeded})
+  quantityAccepted=false,pendingImport=not import_ok,dataImported=import_ok,collectionSucceeded=result.collectionSucceeded,
+  acceptedByRiskRetry=record.riskRetryEvidence~=nil,riskRetryEvidence=record.riskRetryEvidence or cjson.null})
 end
 if mode=='arm' then
  if s then return out({status=s.state,changed=false,alreadyArmed=true}) end
@@ -135,8 +139,35 @@ if mode=='start' then
  redis.call('HSET',KEYS[1],id,cjson.encode(s))
  return out({status='running',policy=s.policy})
 end
-if mode=='finish' or mode=='pause' then
+if mode=='finish' or mode=='pause' or mode=='risk_retry_finish' then
  if s.state~='running' or s.token~=token or not validate_owner() then return redis.error_reply('RESET_LEASE_LOST') end
+ if mode=='risk_retry_finish' then
+  local proof=evidence.riskRetryEvidence
+  if type(proof)~='table' or proof.policy~='security-retry-local-increment-20261105-v1'
+   or proof.importVerified~=true or proof.pendingImport~=false or proof.stopApproved~=true
+   or evidence.importOk~=true or evidence.pendingImport==true
+   or proof.keyword~=s.preservation.keyword or proof.runId~=evidence.runId
+   or type(proof.newLocalPosts)~='number' or proof.newLocalPosts<1
+   or type(proof.newArticleIds)~='table' or #proof.newArticleIds~=proof.newLocalPosts then
+   return redis.error_reply('RISK_RETRY_PROOF_INVALID') end
+  local prior_security=false
+  for i=1,s.pauses do
+   local archived=redis.call('HGET',KEYS[2],id..'|pause-'..i)
+   if archived then
+    local previous=cjson.decode(archived).outcome or {}
+    local reason=tostring(previous.collectionError or previous.previousCollectionError or previous.error or '')
+    if string.find(reason,'SECURITY_CHALLENGE',1,true) or string.find(reason,'PLATFORM_RESTRICTION',1,true)
+     or string.find(reason,'300013',1,true) or string.find(reason,'安全限制',1,true) then
+     -- A CAPTCHA is human verification, not a timed security retry.
+     if not string.find(reason,'验证码',1,true) and not string.find(reason,'CAPTCHA',1,true)
+      and not string.find(reason,'安全验证',1,true) then prior_security=true end
+    end
+   end
+  end
+  if s.starts>=2 and prior_security then return finish(evidence,false) end
+  -- First security interruption must still preserve the mandatory retry.
+  mode='pause'
+ end
  if mode=='finish' then return finish(evidence,false) end
  s.state='armed';s.pauses=s.pauses+1
  archive('pause-'..s.pauses,{outcome=evidence,at=now,attempts=redis.call('HGET',KEYS[4],field)})

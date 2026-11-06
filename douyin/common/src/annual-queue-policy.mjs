@@ -1,3 +1,4 @@
+import {evidenceTimeGuardLua} from './redis-evidence-clock.mjs';
 import {isDeepStrictEqual} from 'node:util';
 import {assessAnnualLowVolume,ANNUAL_COMPLETION_POLICY} from './keyword-annual-acceptance.mjs';
 import {volumeDecision,validateVolumeSnapshot} from './volume-acceptance.mjs';
@@ -32,8 +33,8 @@ local time=redis.call('TIME');local now=tonumber(time[1])*1000+math.floor(tonumb
 if e.policy~='${ANNUAL_COMPLETION_POLICY}' or e.ok~=true or e.taskId~=id or e.snapshotId~=snapshot_id
  or e.keyword~=d.keyword or e.projectName~=d.projectName or e.posts~=d.posts or e.threshold~=d.threshold
  or d.dbReadbackVerified~=true or e.quantityAccepted~=false or e.subtitleQualityRequired~=false
- or e.retryUnit~='original_keyword' or type(e.checkedAtMs)~='number'
- or now-e.checkedAtMs>60000 or e.checkedAtMs>now+1000 then return redis.error_reply('ANNUAL_EVIDENCE_INVALID') end
+ or e.retryUnit~='original_keyword' then return redis.error_reply('ANNUAL_EVIDENCE_INVALID') end
+${evidenceTimeGuardLua('ANNUAL','e.checkedAtMs')}
 local status=redis.call('HGET',KEYS[2],id)
 if annual_search_closed(id,generation,snapshot_id,status) then
  return cjson.encode({status='completed',changed=false,acceptedByAnnual=true,acceptedByVolume=false})
@@ -69,7 +70,9 @@ export async function completeAnnualKeyword(queue,snapshot,decision,input,{gener
  if(!/^[A-Za-z0-9_-]{1,100}$/.test(generation||''))throw new Error('ANNUAL_GENERATION_REQUIRED');
  if(!isDeepStrictEqual(decision,volumeDecision(snapshot,{taskId:decision.taskId,posts:decision.posts,
   readbackVerified:decision.dbReadbackVerified,checkedAt:decision.checkedAt})))throw new Error('ANNUAL_DECISION_INVALID');
- const evidence=assessAnnualLowVolume(decision,input);
+ // SQL freshness is checked against Redis TIME atomically by the Lua commit.
+ // Collector/search timestamps continue to use their own worker clock.
+ const evidence=assessAnnualLowVolume(decision,input,commit?{sqlNow:Date.parse(decision.checkedAt)}:{});
  if(!evidence.ok)return {evidence,confirmation:null};
  if(!commit)return {evidence,confirmation:{status:'preview',changed:false}};
  if(typeof token!=='string'||!token)throw new Error('ANNUAL_LEASE_REQUIRED');

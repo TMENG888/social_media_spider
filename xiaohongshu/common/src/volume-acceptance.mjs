@@ -1,3 +1,4 @@
+import {readRedisTimeMs,assertFreshSqlTime} from './redis-evidence-clock.mjs';
 import {createHash} from 'node:crypto';
 
 // Business quantity acceptance, deliberately NOT a quality/recall assessment.
@@ -107,19 +108,25 @@ export async function readVolumeSnapshot({connect,platform,tasks,...policyOption
  finally{await connection.end();}
 }
 
-export async function readTaskVolume({connect,snapshot,taskId}){
+export async function readTaskVolume({connect,snapshot,taskId,redisClient=null}){
  validateVolumeSnapshot(snapshot);
  const task=snapshot.entries.find(t=>t.taskId===taskId);
  if(!task)throw new Error('VOLUME_TASK_NOT_IN_MANIFEST');
  const connection=await connect();
  try{
-  await connection.query('SET TRANSACTION READ ONLY');await connection.beginTransaction();
+  await connection.query('SET TRANSACTION READ ONLY');
+  // Take Redis time BEFORE opening the SQL snapshot; connection/query latency counts.
+  const checkedAtMs=redisClient?await readRedisTimeMs(redisClient):null;
+  await connection.beginTransaction();
   const [rows]=await connection.execute(
    "SELECT COUNT(DISTINCT NULLIF(TRIM(`文章id`),'')) AS posts FROM ods_social_media_post WHERE `平台`=? AND `项目`=? AND `关键词`=?",
    [snapshot.platform,task.projectName,task.keyword]);
   if(rows.length!==1)throw new Error('VOLUME_TASK_READBACK_INVALID');
-  const decision=volumeDecision(snapshot,{taskId,posts:Number(rows[0].posts),readbackVerified:true});
-  await connection.commit();return decision;
+  await connection.commit();
+  // Local collector-only counts may omit Redis; queue acceptance always supplies it.
+  if(redisClient)assertFreshSqlTime(checkedAtMs,await readRedisTimeMs(redisClient));
+  return volumeDecision(snapshot,{taskId,posts:Number(rows[0].posts),readbackVerified:true,
+   ...(redisClient?{checkedAt:new Date(checkedAtMs).toISOString()}:{})});
  }catch(error){await connection.rollback().catch(()=>{});throw error;}
  finally{await connection.end();}
 }

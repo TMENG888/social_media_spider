@@ -1,3 +1,4 @@
+import {REDIS_EVIDENCE_CLOCK_VERSION,retryFreshSqlEvidence} from './redis-evidence-clock.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
@@ -8,6 +9,7 @@ import {annualInputFromCollector} from './annual-runtime-evidence.mjs';
 import {completeAnnualKeyword} from './annual-queue-policy.mjs';
 import {operationalFailure} from './retry-exhaustion.mjs';
 import {ResetOncePolicy} from './reset-once.mjs';
+import {completeRiskVolume,riskStopGate,RISK_VOLUME_VERSION} from './risk-volume-completion.mjs';
 
 export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}){
  let config;
@@ -30,17 +32,34 @@ export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}
  await fs.writeFile(snapshotFile,JSON.stringify(snapshot,null,2));
  queue.volumeBaselineKey=queue.namespace+':volume-attempt-baseline';
  const recollection=new ResetOncePolicy(queue);
+ const clockEvidence={version:REDIS_EVIDENCE_CLOCK_VERSION,pid:process.pid,platform,
+  clockSource:'redis_time_before_sql',maxAgeMs:60000,maxAttempts:3,loadedAt:new Date().toISOString()};
+ await fs.writeFile(path.join(stateRoot,'volume-evidence-clock.json'),JSON.stringify(clockEvidence));
+ const diagnostic=async row=>{
+  const safe={...row,platform,loggedAt:new Date().toISOString()};
+  console.warn('[数量核验重查] '+JSON.stringify(safe));
+  await fs.appendFile(path.join(stateRoot,'volume-evidence-diagnostics.jsonl'),JSON.stringify(safe)+'\n')
+   .catch(()=>console.warn('[数量核验诊断] 本地诊断写入失败；不忽略核验错误'));
+ };
+ const recheck=(taskId,operation)=>retryFreshSqlEvidence(operation,{onDiagnostic:row=>diagnostic({...row,taskId})});
  console.log(`[数量验收] ${platform}，非零入库词P80=${snapshot.threshold}篇；字幕质量不阻塞；阈值版本=${config.generation}`);
+ await fs.writeFile(path.join(stateRoot,'risk-volume-policy.json'),JSON.stringify({version:RISK_VOLUME_VERSION,platform,pid:process.pid,loadedAt:new Date().toISOString()}));
  return {snapshot,snapshotFile,generation:config.generation,recollection,
-  read:taskId=>readTaskVolume({connect,snapshot,taskId}),
+  canCompleteRisk:()=>riskStopGate(stateRoot),
+  read:taskId=>readTaskVolume({connect,snapshot,taskId,redisClient:queue.client}),
   apply:(decision,options={})=>applyVolumeDecision(queue,snapshot,decision,{generation:config.generation,...options}),
-  async prepare(taskId){
+  async prepare(taskId){return recheck(taskId,async()=>{
    const replay=await recollection.prepare(taskId);
    if(replay.status!=='absent')return {decision:{posts:null,threshold:snapshot.threshold},confirmation:replay};
-   const decision=await this.read(taskId);const confirmation=await this.apply(decision,{commit:true});return {decision,confirmation};},
-  async finish(taskId,token,record,{pause=false}={}){
-   const replay=await recollection.finish(taskId,token,record,{pause});
-   if(replay?.acceptedByResetOnce)return {confirmation:replay};
+   const decision=await this.read(taskId);const confirmation=await this.apply(decision,{commit:true});return {decision,confirmation};});},
+  async finish(taskId,token,record,{pause=false}={}){return recheck(taskId,async()=>{
+   // An armed one-time recollection must first retry after a security pause;
+   // the old quantity shortcut must not close its first protected attempt.
+   const ledger=await recollection.read(taskId);
+   const risk=!ledger.state?await completeRiskVolume(this,taskId,token,record):null;if(risk)return risk;
+   const allowRiskRetry=Boolean(ledger.state&&await this.canCompleteRisk());
+   const replay=await recollection.finish(taskId,token,record,{pause,allowRiskRetry});
+   if(replay?.acceptedByResetOnce||replay?.acceptedByRiskVolume)return {confirmation:replay};
    if(replay)return {confirmation:null};
    if(pause)return {confirmation:null};
    if(operationalFailure(record))return {confirmation:null};
@@ -55,5 +74,5 @@ export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}
    }
    const terminal=await this.apply(decision,{token,commit:true,finishBelow:true,record});
    return {decision,confirmation:terminal.status==='completed'?terminal:null};
-  }};
+  });}};
 }

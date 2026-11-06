@@ -17,6 +17,7 @@ from operational_gate import OperationalGate
 from database_diagnostics import observe as observe_database, safe_code
 from reset_once import ResetOncePolicy, POLICY as RECOLLECT_POLICY
 from pending_import_recovery import recover_pending_imports, completion_snapshot
+from task_scope import scoped_tasks, read_scoped_new
 from datetime import datetime
 from pathlib import Path
 
@@ -284,7 +285,14 @@ class VolumeRuntime:
         selected = getattr(args,'only_task_id',None)
         if selected and selected not in self.messages:
             raise RuntimeError('VOLUME_SELECTED_TASK_MISSING')
-        self.selected = [t for t in tasks if not selected or t['task_id']==selected]
+        eligible = scoped_tasks(args.common, tasks)
+        self.selected = [t for t in eligible if not selected or t['task_id']==selected]
+        if not self.selected:
+            raise RuntimeError('SELECTED_TASK_OUTSIDE_TOPIC_SCOPE')
+        self.scope_limited = len(eligible) != len(tasks)
+        if self.scope_limited:
+            print(json.dumps({'event': 'topic_scope_enabled', 'topics': sorted({t['topic'] for t in eligible}),
+                              'selectedCount': len(self.selected), 'originalCount': len(tasks)}, ensure_ascii=False), flush=True)
         self.recollection=ResetOncePolicy(self.command,args)
 
     def command(self,*parts):
@@ -372,11 +380,12 @@ class VolumeRuntime:
             decision = self.read(task['task_id'])
             result = self.apply(task,mid,decision)
             if result['status']=='unread_requires_sequential_delivery' and not getattr(self.args,'only_task_id',None):
-                official = self.api.read_new(self.args.redis_url,self.args.redis_password,
-                    self.args.stream,self.args.group,self.args.consumer,1)
+                official = read_scoped_new(self)
                 if not official:
                     log_volume_decision(self,task,'waiting_delivery',reason='sequential_delivery_unavailable')
                     continue
+                if official[0] != mid:
+                    self.pending_pass = True
                 mid,task = official
                 original = self.messages.get(task['task_id'])
                 if not original or original!=(mid,task):

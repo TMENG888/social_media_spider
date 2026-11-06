@@ -67,6 +67,8 @@ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.ur
  try{
   if(a.action==='resolve')console.log(JSON.stringify(await gate.resolve()));
   else {const stop=()=>fs.access(path.join(a['worker-root'],'.state','supervisor.stop')).then(()=>true,()=>false);
-   const r=await gate.wait({shouldStop:stop});process.exitCode=r.stopped?20:0;}
+   const {automaticRecoveryWait}=await import('./recovery-wait.mjs');
+   const recoveryStop=automaticRecoveryWait({gate,root:a.root,workerRoot:a['worker-root'],shouldStop:stop});
+   const r=await gate.wait({shouldStop:recoveryStop});process.exitCode=r.stopped?20:0;}
  }finally{await gate.close();}
 }

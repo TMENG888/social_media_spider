@@ -169,14 +169,31 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
   const sleep=runtime.sleep||(ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   let client;
   let control;
+  let exitReason='parent_not_alive',failures=0,stage='starting';
+  const lifecycle=async(reason,details={})=>{
+    const record={schemaVersion:1,at:new Date().toISOString(),pid:process.pid,supervisorPid:parentPid,sessionId,reason,...details};
+    if(runtime.onLifecycle){await runtime.onLifecycle(record);return;}
+    // Only fixed reasons, numeric identities and sanitized error codes; no URLs/passwords.
+    console.warn('[Monitor lifecycle] '+JSON.stringify(record));
+    if(runtime.context)return; // injected unit contexts do not write fixture paths
+    const name=String(sessionId).replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,100);
+    try{
+      const directory=path.join(ctx.worker,'runs');await fs.mkdir(directory,{recursive:true});
+      await fs.appendFile(path.join(directory,'monitor-helper-'+name+'.jsonl'),JSON.stringify(record)+'\n');
+    }catch{console.warn('[Monitor lifecycle] persistence_unavailable');}
+  };
+  const errorCode=error=>/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code||'')?error.code:'UNCLASSIFIED';
+  await lifecycle('started');
   try {
     while(alive(parentPid)) {
       const started=clock();
       try {
+        stage='read_supervisor_state';
         const state=await readState();
-        if(state.supervisorPid!==parentPid||state.sessionId!==sessionId)break;
+        if(state.supervisorPid!==parentPid||state.sessionId!==sessionId){exitReason='supervisor_identity_changed';break;}
         if(!runtime.context||runtime.controlFactory){
           try{
+            stage='poll_remote_control';
             control ||= await (runtime.controlFactory?runtime.controlFactory():RemoteStopControl.open(root,workerRoot));
             await control.poll({terminal:['stopped','exit_unconfirmed'].includes(state.state)?state.state:null});
           }catch(error){
@@ -186,28 +203,41 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
             throw error;
           }
         }
+        stage='connect_telemetry';
         if(!client?.isReady){if(client?.isOpen)client.destroy();client=await connect(ctx);}
+        stage='read_server_time';
         const serverTime=await monitoringCommand(client,ctx.namespace,'TIME',null,[]);
         const lastSeenAt=new Date(Number(serverTime[0])*1000+Number(serverTime[1])/1000).toISOString();
         const record={schemaVersion:1,platform:ctx.platform,campaign:ctx.campaign,computer:ctx.computer,worker:ctx.workerId,
           supervisorPid:parentPid,sessionId,lastSeenAt,heartbeatIntervalSeconds:3,state:state.state,resumeAt:state.resumeAt||null};
+        stage='write_heartbeat';
         await monitoringCommand(client,ctx.namespace,'HSET','workers',[ctx.computer+'/'+ctx.workerId,JSON.stringify(record)]);
+        stage='write_readiness';
         if(!runtime.context)await writeJson(path.join(ctx.worker,'.state','remote-control-ready.json'),{sessionId,supervisorPid:parentPid,readyAt:lastSeenAt});
-        await flush(client,ctx);
-        if(['stopped','exit_unconfirmed'].includes(state.state))break;
-      } catch {
+        stage='flush_outbox';await flush(client,ctx);
+        if(failures){await lifecycle('connection_recovered',{previousFailures:failures});failures=0;}
+        if(['stopped','exit_unconfirmed'].includes(state.state)){exitReason='supervisor_'+state.state;break;}
+      } catch(error) {
+        failures++;
+        if(failures===1||(failures&(failures-1))===0)await lifecycle('frame_failed',{stage,failures,code:errorCode(error)});
         // No secrets, raw error text, task state changes, or automatic crawler restart.
         if(client?.isOpen)client.destroy();client=null;
       }
       await sleep(Math.max(100,3000-(clock()-started)));
     }
     // Do not manufacture a safe-stop ACK when the parent disappears.
-  } finally{await control?.close().catch(()=>{});if(client?.isOpen)client.destroy();}
+  } catch(error){
+    exitReason='helper_exception';await lifecycle(exitReason,{code:errorCode(error)});throw error;
+  } finally{
+    await control?.close().catch(()=>{});if(client?.isOpen)client.destroy();
+    await lifecycle('exited',{exitReason,failures});
+  }
 }
 if(process.argv[1]&&pathToFileURL(path.resolve(process.argv[1])).href===import.meta.url) {
   const args=process.argv.slice(2);
   if(args[0]!=='--heartbeat')throw new Error('Explicit heartbeat mode required');
   const parentPid=Number(args[2]),sessionId=args[3];
   if(!Number.isSafeInteger(parentPid)||parentPid<1||!sessionId)throw new Error('Invalid supervisor identity');
-  await heartbeatLoop(args[1],parentPid,sessionId);
+  try{await heartbeatLoop(args[1],parentPid,sessionId);}
+  catch(error){console.error('[Monitor lifecycle] '+JSON.stringify({reason:'startup_or_loop_failure',code:/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code||'')?error.code:'UNCLASSIFIED'}));process.exitCode=1;}
 }

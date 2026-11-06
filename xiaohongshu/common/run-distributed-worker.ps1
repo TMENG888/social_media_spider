@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$WorkerRoot,
   [ValidateSet('run','retry','check')][string]$Mode='run',
@@ -10,9 +10,11 @@ param(
   [ValidateRange(1,1440)][int]$CycleRunMaxMinutes=60,
   [ValidateRange(1,1440)][int]$CycleRestMinMinutes=30,
   [ValidateRange(1,1440)][int]$CycleRestMaxMinutes=60,
-  [switch]$SingleCycle
+  [switch]$SingleCycle,
+  [switch]$ResumeManualStop
 )
 $ErrorActionPreference='Stop'
+$StartupAt=[DateTime]::UtcNow.ToString('o')
 $Common=Split-Path -Parent $MyInvocation.MyCommand.Path
 $Worker=(Resolve-Path -LiteralPath $WorkerRoot).Path
 $Node=Join-Path $Common 'runtime\node\node.exe'
@@ -59,6 +61,7 @@ function Complete-OwnedRuntimeStop([string]$CycleId){
   return $LASTEXITCODE
 }
 try {
+  if($Mode -ne 'check'){Enter-MonitorSupervisorLock}
   Set-Location -LiteralPath $Common
   if(-not(Test-Path -LiteralPath $WorkerState)){New-Item -ItemType Directory -Path $WorkerState -Force|Out-Null}
   $env:XHS_WORKER_ROOT=$Common
@@ -70,6 +73,16 @@ try {
   & $Node 'src\run-worker.mjs' '--mode' 'check' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase
   if($LASTEXITCODE -ne 0){throw 'Environment preflight failed; collection not started.'}
   if($Mode -eq 'check'){exit 0}
+  # Explain retained manual stops before asking for credentials or starting helpers.
+  # Explicit resume applies only to flags older than this invocation.
+  $HasSupervisorStop=Test-Path -LiteralPath $SupervisorStop
+  $HasCollectorStop=Test-Path -LiteralPath (Join-Path $WorkerState 'stop.requested')
+  $ManualSupervisorStop=$HasSupervisorStop -and ((Get-Content -LiteralPath $SupervisorStop -Raw -Encoding UTF8) -match '^manual stop ')
+  if($ManualSupervisorStop -or ($ResumeManualStop -and ($HasSupervisorStop -or $HasCollectorStop))){
+    $ManualApproved=if($ResumeManualStop){'yes'}else{'no'}
+    & $Node (Join-Path $Common 'src\manual-stop-recovery.mjs') --worker-root $Worker --before $StartupAt --approved $ManualApproved --action inspect
+    if($LASTEXITCODE -ne 0){$RemoteFinalState='stopped';exit 20}
+  }
   if($Dispatch -eq 'redis'){
     $RedisConfig=Get-Content -LiteralPath (Join-Path $Common 'redis-config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if(-not $env:REDIS_URL){$env:REDIS_URL=$RedisConfig.url}
@@ -84,6 +97,8 @@ try {
         $env:REDIS_PASSWORD=Read-DpapiPassword $RedisCredentialFile
         if($env:REDIS_PASSWORD){Write-Host '[Redis credential] Loaded the saved Windows-encrypted password.'}
       } catch {
+        # Keep diagnostics useful without exposing ciphertext, plaintext or raw errors.
+        Write-Warning ('[Redis credential diagnostic] '+$_.Exception.GetType().Name)
         Write-Warning '[Redis credential] This Windows user cannot decrypt the saved password. Enter and save it again.'
         $env:REDIS_PASSWORD=$null
       }
@@ -115,8 +130,13 @@ try {
   if($Dispatch -eq 'redis' -and -not $ExportOnly){
     & $Node (Join-Path $Common 'src\remote-stop-control.mjs') --action gate --root $Common --worker-root $Worker --recover-control-failure yes
     if($LASTEXITCODE -ne 0){throw 'Remote stop hold or control unavailable. Collection not started.'}
-    Start-MonitorSupervisor
   }
+  if($ResumeManualStop){
+    if($Dispatch -ne 'redis' -or $ExportOnly){throw 'Manual resume requires the authenticated Redis control gate.'}
+    & $Node (Join-Path $Common 'src\manual-stop-recovery.mjs') --worker-root $Worker --before $StartupAt --approved yes --action resume --archive 'E:\Codex\archives\xhs-manual-stop'
+    if($LASTEXITCODE -ne 0){$RemoteFinalState='stopped';exit 20}
+  }
+  if($Dispatch -eq 'redis' -and -not $ExportOnly){Start-MonitorSupervisor}
   $CycleEnabled=$Mode -eq 'run' -and $Dispatch -eq 'redis' -and -not $ExportOnly -and -not $SingleCycle -and $MaxRuntimeMinutes -eq 0
   if(Test-Path -LiteralPath $SupervisorStop){$RemoteFinalState='stopped';Write-Host '[Safe stop] Stop requested during startup; collection will not start.';exit 0}
   if(-not $CycleEnabled){
@@ -148,10 +168,10 @@ try {
       if($CooldownExitCode -ne 0){Write-Warning '[Cycle supervisor] Shared cooldown requires manual review or cannot be verified; no restart.';$RunExitCode=1;break}
       $CycleNumber+=1
       $CycleRuntime=Get-Random -Minimum $CycleRunMinMinutes -Maximum ($CycleRunMaxMinutes+1)
-      Write-Host "[Cycle supervisor] Cycle ${CycleNumber} started; runtime=${CycleRuntime} minutes. Any unfinished task will be safely released."
+      Write-Host "[Cycle supervisor] Cycle ${CycleNumber} started; target=${CycleRuntime} minutes. Pause browser actions in place at the deadline; keep the page and resume after rest without reload."
       Set-MonitorSupervisorState 'collecting'
       $CycleId=[Guid]::NewGuid().ToString('N')
-      & $Node 'src\run-worker.mjs' '--mode' 'run' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $CycleRuntime '--cycle-id' $CycleId
+      & $Node 'src\run-worker.mjs' '--mode' 'run' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $CycleRuntime '--cycle-id' $CycleId '--cycle-run-min-minutes' $CycleRunMinMinutes '--cycle-run-max-minutes' $CycleRunMaxMinutes '--cycle-rest-min-minutes' $CycleRestMinMinutes '--cycle-rest-max-minutes' $CycleRestMaxMinutes
       $RunExitCode=$LASTEXITCODE
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Stop is active; no new cycle will start.';break}
       if($RunExitCode -eq 5){Write-Warning '[Cycle supervisor] Redis lease safety stop: local data is preserved and the unfinished task was not acknowledged. Restore Redis, then start this worker again.';break}

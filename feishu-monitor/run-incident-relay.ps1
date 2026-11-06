@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([switch]$Once,[switch]$SelfTest,[switch]$Check,[switch]$Resolve,[string]$Platform,[string]$Machine,[string]$WorkerId,[string]$IncidentId)
+param([switch]$Once,[switch]$SelfTest,[switch]$Check,[switch]$Resolve,[string]$Platform,[string]$Machine,[string]$WorkerId,[string]$IncidentId,[string]$WatchConfig)
 $ErrorActionPreference='Stop'
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -35,6 +35,7 @@ try{
   if(-not $Platform -or -not $Machine -or -not $WorkerId -or -not $IncidentId){throw 'Resolve requires exact Platform, Machine, WorkerId and IncidentId from the alert.'}
   $IncidentArgs=@((Join-Path $PSScriptRoot 'resolve-incident.py'),'--platform',$Platform,'--machine',$Machine,'--worker',$WorkerId,'--incident-id',$IncidentId)
  }
+ if($WatchConfig){$IncidentArgs+=@('--watch-config',$WatchConfig)}
  if($Once){$IncidentArgs+='--once'}
  if($Check){$IncidentArgs+='--check'}
  & $IncidentPython @IncidentArgs

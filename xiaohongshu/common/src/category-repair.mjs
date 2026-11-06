@@ -4,6 +4,7 @@ import mysql from "mysql2/promise";
 import { POST_FIELDS, COMMENT_FIELDS } from "./schema.mjs";
 import { mysqlConnectionOptions } from "./import-mysql.mjs";
 import { writeJsonAtomic } from "./checkpoint.mjs";
+import { retryImportBatch } from "./import-recovery.mjs";
 
 const PROJECTS = new Set(["全国地产设计产品力监测", "北京臻澐项目口碑"]);
 const csvCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
@@ -78,38 +79,62 @@ export async function normalizeLocalCategoryFiles(runsRoot) {
   return { files, normalizedRows, postIds, commentIds, errors };
 }
 
-async function updateExactIds(connection, table, idField, groupedIds) {
-  let affectedRows = 0;
-  for (const [project, idSet] of groupedIds) {
-    const ids = [...idSet];
-    for (let offset = 0; offset < ids.length; offset += 200) {
-      const chunk = ids.slice(offset, offset + 200);
-      const placeholders = chunk.map(() => "?").join(",");
-      const [result] = await connection.execute(
-        `UPDATE \`${table}\` SET \`分类\`=NULL WHERE \`平台\`='小红书' AND \`项目\`=? AND \`${idField}\` IN (${placeholders}) AND \`分类\` IS NOT NULL`,
-        [project, ...chunk]
-      );
-      affectedRows += Number(result.affectedRows || 0);
+// Explicit maintenance only. The collector must never scan/rewrite historical
+// categories at startup. Use the same named lock as regular distributed imports.
+export async function repairCategoryDatabase(local, {
+  connect = () => mysql.createConnection(mysqlConnectionOptions()),
+  batchRows = 50, sleep, random,
+} = {}) {
+  if (!Number.isInteger(batchRows) || batchRows < 1 || batchRows > 100) throw new Error('CATEGORY_BATCH_INVALID');
+  const counts = { postsUpdated: 0, commentsUpdated: 0 };
+  for (const [table, field, groups, count] of [
+    ['ods_social_media_post', '文章id', local.postIds, 'postsUpdated'],
+    ['ods_social_media_comment', '评论id', local.commentIds, 'commentsUpdated'],
+  ]) {
+    for (const [project, values] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+      if (!PROJECTS.has(project)) throw new Error('CATEGORY_PROJECT_REJECTED');
+      const ids = [...values].map(String).sort();
+      for (let offset = 0; offset < ids.length; offset += batchRows) {
+        const batch = ids.slice(offset, offset + batchRows);
+        counts[count] += await retryImportBatch(async () => {
+          const connection = await connect();
+          let locked = false, transaction = false;
+          try {
+            const [lock] = await connection.query("SELECT GET_LOCK('social_xhs_distributed_import', ?) AS acquired", [10]);
+            if (Number(lock[0]?.acquired) !== 1) throw Object.assign(new Error('CATEGORY_IMPORT_LOCK_TIMEOUT'), {code: 'MYSQL_IMPORT_LOCK_TIMEOUT'});
+            locked = true;
+            await connection.query('SET SESSION innodb_lock_wait_timeout=15');
+            // Nonlocking lookup, then deterministic primary-key updates. Never
+            // update a wide category-index range in one long transaction.
+            const [rows] = await connection.execute(
+              `SELECT \`id\` FROM \`${table}\` WHERE \`平台\`='小红书' AND \`项目\`=? AND \`${field}\` IN (${batch.map(() => '?').join(',')}) AND \`分类\` IS NOT NULL ORDER BY \`id\``,
+              [project, ...batch]);
+            await connection.beginTransaction(); transaction = true;
+            let changed = 0;
+            for (const row of rows) {
+              const [result] = await connection.execute(`UPDATE \`${table}\` SET \`分类\`=NULL WHERE \`id\`=? AND \`平台\`='小红书' AND \`项目\`=? AND \`分类\` IS NOT NULL`, [row.id, project]);
+              changed += Number(result.affectedRows || 0);
+            }
+            await connection.commit(); transaction = false;
+            return changed;
+          } catch (error) {
+            if (transaction) await connection.rollback().catch(() => {});
+            throw error;
+          } finally {
+            if (locked) await connection.query("SELECT RELEASE_LOCK('social_xhs_distributed_import')").catch(() => {});
+            await connection.end();
+          }
+        }, {sleep, random}); // Locks/connections are released before retry delay.
+      }
     }
   }
-  return affectedRows;
+  return counts;
 }
 
-export async function repairCategoryNull({ runsRoot, stateRoot }) {
+export async function repairCategoryNull({ runsRoot, stateRoot, explicitMaintenance = false, ...options }) {
+  if (!explicitMaintenance) throw new Error('CATEGORY_EXPLICIT_MAINTENANCE_REQUIRED');
   const local = await normalizeLocalCategoryFiles(runsRoot);
-  const connection = await mysql.createConnection(mysqlConnectionOptions());
-  let postsUpdated = 0, commentsUpdated = 0;
-  try {
-    await connection.beginTransaction();
-    postsUpdated = await updateExactIds(connection, "ods_social_media_post", "文章id", local.postIds);
-    commentsUpdated = await updateExactIds(connection, "ods_social_media_comment", "评论id", local.commentIds);
-    await connection.commit();
-  } catch (error) {
-    await connection.rollback().catch(() => {});
-    throw error;
-  } finally {
-    await connection.end();
-  }
+  const {postsUpdated, commentsUpdated} = await repairCategoryDatabase(local, options);
   const status = { status: "success", scannedAt: new Date().toISOString(), localFilesNormalized: local.files, localRowsNormalized: local.normalizedRows, localFileErrors: local.errors, postsUpdated, commentsUpdated };
   await writeJsonAtomic(path.join(stateRoot, "category_null_repair.json"), status);
   return status;

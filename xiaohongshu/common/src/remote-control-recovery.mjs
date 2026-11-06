@@ -4,7 +4,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 
 const names=['supervisor.stop','stop.requested'];
-export const recoveryVersion='xhs-control-recovery-20261022-v1';
+export const recoveryVersion='xhs-control-recovery-20261105-v2';
 export function failureCode(error) {
   const code=String(error?.code||'')+' '+String(error?.message||'');
   if(/TIMEOUT|ETIMEDOUT/i.test(code))return 'CONTROL_TIMEOUT';
@@ -63,7 +63,12 @@ export async function recoverControlFailure(ctx,verifyNoHold) {
   const items=await Promise.all(names.map(n=>snapshot(path.join(state,n))));
   const owned=item=>{try{return isControlFailure(JSON.parse(item.bytes.toString('utf8').replace(/^\uFEFF/,'')),ctx);}catch{return false;}};
   if(!items.some(item=>item&&owned(item)))return {version:recoveryVersion,archived:[]};
-  if(items.some(item=>item&&!owned(item)))throw new Error('CONTROL_RECOVERY_PROTECTED_STOP');
+  // Retain a collector's cooldown latch unchanged. The original cooldown gate
+  // must still wait for Redis to report ready before consuming this marker.
+  // No manual/login/captcha/unknown marker is eligible for this mixed case.
+  const retained=item=>item&&path.basename(item.file)==='stop.requested'&&
+    item.bytes.toString('utf8')==='RATE_LIMIT_COOLDOWN_ACTIVE';
+  if(items.some(item=>item&&!owned(item)&&!retained(item)))throw new Error('CONTROL_RECOVERY_PROTECTED_STOP');
   await assertIdle(state);
   const lockFile=path.join(state,'remote-control-recovery.lock');
   const lock=await fs.open(lockFile,'wx');const moved=[];let restoreFailed=false;
@@ -76,14 +81,19 @@ export async function recoverControlFailure(ctx,verifyNoHold) {
     }
     const archive=path.join(state,'remote-control-recovery',new Date().toISOString().replace(/[:.]/g,'-')+'-'+randomUUID());
     await fs.mkdir(archive,{recursive:true});
-    for(const item of items.filter(Boolean)){
+    for(const item of items.filter(item=>item&&owned(item))){
       const saved=path.join(archive,path.basename(item.file));
       await fs.rename(item.file,saved);moved.push({original:item.file,saved});
       if(!same(item,await snapshot(saved)))throw new Error('CONTROL_RECOVERY_MARKER_CHANGED');
     }
     await verifyNoHold();await assertIdle(state);
-    for(const name of names)if(await snapshot(path.join(state,name)))throw new Error('CONTROL_RECOVERY_NEW_STOP');
-    return {version:recoveryVersion,archived:moved.map(item=>item.saved)};
+    for(let i=0;i<names.length;i++){
+      const current=await snapshot(path.join(state,names[i]));
+      if(retained(items[i])){if(!same(items[i],current))throw new Error('CONTROL_RECOVERY_NEW_STOP');}
+      else if(current)throw new Error('CONTROL_RECOVERY_NEW_STOP');
+    }
+    return {version:recoveryVersion,archived:moved.map(item=>item.saved),
+      retained:items.filter(retained).map(item=>path.basename(item.file))};
   }catch(error){
     // Restore without overwriting any stop that arrived during recovery. Keep
     // all archived evidence, including on rollback or an ambiguous outcome.

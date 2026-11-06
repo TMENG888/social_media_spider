@@ -7,6 +7,8 @@ import {writeJsonAtomic} from './checkpoint.mjs';
 import {OperationalGate,classifyRestriction} from './operational-gate.mjs';
 import {COOLDOWN_SCOPE_LUA} from './cooldown-scope.mjs';
 import {isStorageFull,storageStopMarker} from './local-storage-stop.mjs';
+import os from 'node:os';
+import {machineCooldownGroup,IMPORT_MACHINE_COOLDOWN,MACHINE_COOLDOWN_VERSION} from './machine-cooldown.mjs';
 
 export const COOLDOWN_EXIT = 76;
 export const MANUAL_COOLDOWN_EXIT = 77;
@@ -70,6 +72,8 @@ else
   return result()
 end
 s.workerId=ARGV[3]
+s.machine=ARGV[6]
+s.scope=ARGV[7]
 s.lastIncidentAt=now
 redis.call('HSET',KEYS[1],'timedState',cjson.encode(s))
 -- Old-version nodes still see timed holds through 'state'. Never overwrite
@@ -92,7 +96,7 @@ return cjson.encode(cooldown_scope(redis.call('HGET',KEYS[1],'state'),KEYS[2],AR
 export class CooldownActiveError extends Error {
   constructor(state) {
     super(state.manualRequired ? 'COOLDOWN_MANUAL_REQUIRED：平台限制需人工确认，禁止自动恢复'
-      : 'RATE_LIMIT_COOLDOWN_ACTIVE：共享冷却中，不访问平台、不领取新任务');
+      : 'RATE_LIMIT_COOLDOWN_ACTIVE：本机冷却中，不访问平台、不领取新任务');
     this.code=state.manualRequired?'COOLDOWN_MANUAL_REQUIRED':'RATE_LIMIT_COOLDOWN_ACTIVE';
     this.state=state;
   }
@@ -114,19 +118,26 @@ export class RateLimitCooldown {
     const policy=config.rateLimitCooldown || {};
     onStage('CONNECT_REDIS');
     const client=await connectRedis(settings);
-    try { return new RateLimitCooldown({client,campaign,stateRoot,workerId,group:policy.group || 'shared',
-      delaysMs:policy.delaysMs || [7200000,14400000]}); }
+    try {
+      const controller=new RateLimitCooldown({client,campaign,stateRoot,workerId,group:policy.group || 'shared',
+        scope:policy.scope || 'machine',delaysMs:policy.delaysMs || [7200000,14400000]});
+      await controller.prepareMachineScope();
+      return controller;
+    }
     catch(error){await client.close();throw error;}
   }
-  constructor({client,campaign,stateRoot,workerId,group='shared',delaysMs=[7200000,14400000]}) {
+  constructor({client,campaign,stateRoot,workerId,group='shared',scope='machine',machine=os.hostname(),delaysMs=[7200000,14400000]}) {
     if(!/^[A-Za-z0-9_-]{1,160}$/.test(campaign) || !/^[A-Za-z0-9_-]{1,64}$/.test(group))
       throw new Error('Invalid cooldown campaign/group');
     if(delaysMs.length!==2 || !delaysMs.every(n=>Number.isSafeInteger(n)&&n>0))
       throw new Error('Cooldown needs two positive delays');
-    Object.assign(this,{client,campaign,stateRoot,workerId,group,delaysMs});
-    this.key=`xhs:{${campaign}}:rate-limit-cooldown:${group}`;
+    if(!['machine','group'].includes(scope))throw new Error('Invalid cooldown scope');
+    const effectiveGroup=scope==='machine'?machineCooldownGroup(group,machine):group;
+    Object.assign(this,{client,campaign,stateRoot,workerId,group:effectiveGroup,baseGroup:group,scope,machine,delaysMs});
+    this.key=`xhs:{${campaign}}:rate-limit-cooldown:${effectiveGroup}`;
+    this.legacyKey=`xhs:{${campaign}}:rate-limit-cooldown:${group}`;
     this.writes=Promise.resolve();
-    this.operations=new OperationalGate({client,workerId,platform:'小红书',keys:[`xhs:{${campaign}}:monitor:incidents`,`xhs:{${campaign}}:monitor:outbox`]});
+    this.operations=new OperationalGate({client,workerId,machine,platform:'小红书',keys:[`xhs:{${campaign}}:monitor:incidents`,`xhs:{${campaign}}:monitor:outbox`]});
     this.last=null;
   }
   async evaluate(script,args=[]) {
@@ -135,7 +146,7 @@ export class RateLimitCooldown {
       state=JSON.parse(await this.client.eval(script,{keys:[this.key,this.operations.keys[0]],arguments:args.map(String)}));
       if(!Number.isFinite(state.serverTime)||typeof state.active!=='boolean')throw new Error('Invalid cooldown response');
     } catch(cause){throw Object.assign(new Error('COOLDOWN_STATE_UNAVAILABLE：无法确认共享冷却状态，停止自动访问',{cause}),{code:'COOLDOWN_STATE_UNAVAILABLE'});}
-    this.last={...state,campaign:this.campaign,group:this.group};
+    this.last={...state,campaign:this.campaign,group:this.group,cooldownScope:this.scope,cooldownMachine:this.machine,scopeVersion:MACHINE_COOLDOWN_VERSION};
     const snapshot=this.last;
     if(this.stateRoot){
       const write=this.writes.catch(()=>{}).then(()=>writeJsonAtomic(path.join(this.stateRoot,'rate-limit-cooldown.json'),snapshot));
@@ -144,7 +155,13 @@ export class RateLimitCooldown {
     }
     return snapshot;
   }
-  read(){return this.evaluate(READ_SCOPED_COOLDOWN,[this.operations.field]);}
+  async prepareMachineScope(){
+    if(this.scope!=='machine')return;
+    try{
+      return JSON.parse(await this.client.eval(IMPORT_MACHINE_COOLDOWN,{keys:[this.key,this.legacyKey,this.operations.keys[0]],arguments:[this.machine]}));
+    }catch(cause){throw Object.assign(new Error('COOLDOWN_STATE_UNAVAILABLE：旧冷却归属或本机保护无法确认，保留保护并停止访问',{cause}),{code:'COOLDOWN_STATE_UNAVAILABLE'});}
+  }
+  async read(){await this.prepareMachineScope();return this.evaluate(READ_SCOPED_COOLDOWN,[this.operations.field]);}
   bindQueue(queue){
     // Author pools have another cluster tag and use assertReady directly.
     if(queue.namespace!==`xhs:{${this.campaign}}`)return false;
@@ -165,7 +182,8 @@ export class RateLimitCooldown {
       return this.read();
     }
     const id=createHash('sha256').update(String(eventId)).digest('hex');
-    const state=await this.evaluate(RECORD,[id,kind,this.workerId,...this.delaysMs]);
+    await this.prepareMachineScope();
+    const state=await this.evaluate(RECORD,[id,kind,this.workerId,...this.delaysMs,this.machine,this.scope]);
     await this.operations.record(message,{cooldownMs:kind==='rate'?Math.max(1,state.untilMs-state.serverTime):this.delaysMs[0]});
     return this.read();
   }

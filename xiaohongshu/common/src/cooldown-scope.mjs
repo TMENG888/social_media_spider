@@ -1,7 +1,7 @@
 // Shared by the read-only status check and the atomic task-claim guard. Keys
 // are explicit and stay in the campaign's Redis Cluster slot. No migration or
 // deletion of legacy shared state is performed here.
-export const COOLDOWN_SCOPE_VERSION='xhs-node-isolation-20261021-v1';
+export const COOLDOWN_SCOPE_VERSION='xhs-machine-cooldown-20261104-v1';
 export const COOLDOWN_SCOPE_LUA=`
 local function cooldown_scope(raw, incidents_key, field, now, shared_key)
  local s=raw and cjson.decode(raw) or {count=0,untilMs=0,manualRequired=false}
