@@ -45,17 +45,21 @@ try {
     & $Node (Join-Path $Common 'src\remote-stop-control.mjs') --action gate --root $Common --worker-root $Worker
     if($LASTEXITCODE -ne 0){throw 'Remote stop hold or control unavailable. Collection not started.'}
   }
-  Remove-Item -LiteralPath $Stop,$SupervisorStop -Force -ErrorAction SilentlyContinue
+  if(-not $Test){[void](Wait-ControlFailureRecovery)}
+  if((Test-Path -LiteralPath $SupervisorStop) -or (Test-Path -LiteralPath $Stop)){throw 'Stop flag retained; collection not started.'}
   if(-not $Test){Start-MonitorSupervisor}
   $Cycle=0
   while($true){
     Assert-RemoteControlAvailable
+    if(-not $Test -and (Wait-ControlFailureRecovery)){continue}
     if(Test-Path -LiteralPath $SupervisorStop){break}
     if(-not $Test){
       Set-MonitorSupervisorState 'cooldown'
       & $Node (Join-Path $Common 'src\operational-gate.mjs') --root $Common --worker-root $Worker --platform '抖音' --action wait
-      if($LASTEXITCODE -eq 20){break}
-      if($LASTEXITCODE -ne 0){throw 'Operational incident state unavailable. Collection not started.'}
+      $GateExit=$LASTEXITCODE
+      if($GateExit -ne 0 -and (Wait-ControlFailureRecovery)){continue}
+      if($GateExit -eq 20){break}
+      if($GateExit -ne 0){throw 'Operational incident state unavailable. Collection not started.'}
     }
     $Cycle++
     $Minutes=Get-Random -Minimum 45 -Maximum 61
@@ -66,6 +70,7 @@ try {
     & $Node @WorkerArgs
     $WorkerExitCode=$LASTEXITCODE
     Write-MonitorSupervisorDiagnostic 'worker_exited' $WorkerExitCode
+    if(-not $SingleCycle -and -not $Test -and (Wait-ControlFailureRecovery)){continue}
     if($WorkerExitCode -ne 0){throw ('Worker exited abnormally (code '+$WorkerExitCode+'). Automatic restart is disabled. Check runs/worker-process-*.jsonl and this supervisor session log.')}
     if($SingleCycle -or $Test -or (Test-Path -LiteralPath $SupervisorStop)){break}
     $Status=Get-Content -LiteralPath (Join-Path $Worker 'runs\worker_status.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -79,8 +84,9 @@ try {
     Set-MonitorSupervisorState 'resting' $Resume.ToUniversalTime().ToString('o')
     Write-Host "[Cycle supervisor] Resting $Rest minutes. Resume at $Resume."
     while((Get-Date) -lt $Resume){Assert-RemoteControlAvailable;if(Test-Path -LiteralPath $SupervisorStop){break};Start-Sleep -Milliseconds 500}
+    if(-not $Test -and (Wait-ControlFailureRecovery)){continue}
     if(Test-Path -LiteralPath $SupervisorStop){break}
-    Remove-Item -LiteralPath $Stop -Force -ErrorAction SilentlyContinue
+    if(Test-Path -LiteralPath $Stop){break}
   }
   $RemoteFinalState='stopped'
 } finally {Close-MonitorSupervisor $RemoteFinalState;foreach($Name in $SavedEnv.Keys){[Environment]::SetEnvironmentVariable($Name,$SavedEnv[$Name],'Process')}}

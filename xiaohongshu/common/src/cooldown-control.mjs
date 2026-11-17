@@ -1,3 +1,6 @@
+import {transientControlError} from './control-read-retry.mjs';
+import {markControlFailure} from './remote-control-recovery.mjs';
+import {controlContext} from './remote-stop-control.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {RateLimitCooldown} from './rate-limit-cooldown.mjs';
@@ -12,7 +15,9 @@ const stopFile=process.env.XHS_SUPERVISOR_STOP_FILE || path.join(workerRoot,'.st
 const shouldStop=()=>fs.access(stopFile).then(()=>true).catch(()=>false);
 let controller;
 try {
-  controller=await RateLimitCooldown.open({root,stateRoot,workerId:queue.workerId});
+  let diagnosticKeyword='';
+  try{diagnosticKeyword=JSON.parse(await fs.readFile(path.join(workerRoot,'runs','worker_status.json'),'utf8')).currentKeyword||'';}catch{}
+  controller=await RateLimitCooldown.open({root,stateRoot,workerId:queue.workerId,diagnosticContext:()=>({keyword:diagnosticKeyword})});
   console.log(`[保护作用域] ${COOLDOWN_SCOPE_VERSION}；本节点=${queue.workerId}；定时冷却=${controller.scope} / ${controller.machine}；登录/验证码按机器节点隔离。`);
   if(args.action==='reset-confirmed'){
     await controller.resetConfirmed();
@@ -40,5 +45,12 @@ try {
       }catch(e){if(e.code!=='ENOENT')throw e;}
     }
   }
-}catch(error){console.warn(error.message);process.exitCode=1;}
+}catch(error){
+  controller?.diagnostics.event('wait_process_exit',{exitCode:1,reason:error.code||'UNCLASSIFIED'});
+  if(error.code==='COOLDOWN_STATE_UNAVAILABLE'||transientControlError(error)){
+    await markControlFailure(await controlContext(root,workerRoot),error);
+    console.warn('[Cooldown] Redis state unavailable; supervisor will verify recovery.');
+  }else console.warn(error.message);
+  process.exitCode=1;
+}
 finally{await controller?.close();}

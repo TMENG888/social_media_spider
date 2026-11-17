@@ -1,5 +1,8 @@
+import {inspectLoginFeedback,classifyLoginFeedback} from './login-feedback.mjs';
+import {smsPlatformHost,inspectSmsVerification} from './sms-verification.mjs';
 // Explicit, human-authorized SMS login only. Never handles sliders or face checks.
 import {generateKeyPairSync,privateDecrypt,constants,randomUUID} from 'node:crypto';
+export const SMS_LOGIN_VERSION='sms-feedback-separated-20261116-v1';
 
 const visible=async l=>l.isVisible().catch(()=>false);
 async function unique(l){const found=[];for(let i=0;i<Math.min(await l.count(),30);i++)if(await visible(l.nth(i)))found.push(l.nth(i));return found.length===1?found[0]:null;}
@@ -10,31 +13,42 @@ async function submitButton(region){return await unique(region.getByRole('button
 export function smsLabel(s,c){return Buffer.from([s.sessionId,s.machine,s.platform,s.workerId,c].join('|'));}
 export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now}){
  let challenge=null,key=null,selected=false,requested=false,attempts=0,submittedAt=0,armedAt=0,lastRequestAt=0,receipt=null,sendClickAttempted=false,selectionAt=0;
- const requests=new WeakMap();let disposed=false;
- const matches=url=>{try{const u=new URL(url);return u.protocol==='https:'&&/(^|\.)douyin\.com$/i.test(u.hostname)&&/send[_-]?(?:sms[_-]?)?(?:code|otp)|(?:sms|otp).*send|send.*(?:sms|otp)/i.test(u.pathname);}catch{return false;}};
- const onRequest=r=>{if(armedAt&&now()-armedAt<15000&&matches(r.url())&&['GET','POST'].includes(r.method()))requests.set(r,now());};
+ // Carry only an already observed response when attaching to the same live session.
+ const prior=session.smsRequest;
+ if(prior?.source==='platform_send_response'&&prior.path==='/api/redcaptcha/v2/vc/send'&&prior.accepted===false){receipt={...prior};sendClickAttempted=true;lastRequestAt=Number(prior.requestedAt)||0;armedAt=lastRequestAt;}
+ else if(session.ack?.action==='request_sms'&&session.ack.ok&&Number.isFinite(session.ack.at)){lastRequestAt=session.ack.at;armedAt=lastRequestAt;sendClickAttempted=true;}
+ const requests=new WeakMap();let disposed=false,submitFeedback=null,ignoredVisibleFeedback=null,submitEpoch=0;
+ const verificationRequests=new WeakMap();
+ const verificationPath=url=>{try{const u=new URL(url);return u.protocol==='https:'&&smsPlatformHost(platform,u.hostname)&&/\/(?:redcaptcha\/v2\/vc|passport[^?]*)\/(?:verify|check|validate)(?:\/|$)/i.test(u.pathname);}catch{return false;}};
+ const matches=url=>{try{const u=new URL(url);return u.protocol==='https:'&&smsPlatformHost(platform,u.hostname)&&(/send[_-]?(?:sms[_-]?)?(?:code|otp)|(?:sms|otp).*send|send.*(?:sms|otp)/i.test(u.pathname)||platform==='小红书'&&/^\/api\/redcaptcha\/v2\/vc\/send\/?$/.test(u.pathname));}catch{return false;}};
+ const onRequest=r=>{if(armedAt&&now()-armedAt<15000&&matches(r.url())&&['GET','POST'].includes(r.method()))requests.set(r,now());if(submittedAt&&verificationPath(r.url()))verificationRequests.set(r,{epoch:submitEpoch,at:now()});};
  const onResponse=async response=>{
-  const r=response.request(),at=requests.get(r);if(!at||at<armedAt||disposed)return;
-  const u=new URL(r.url()),value={observedAt:now(),requestedAt:at,host:u.hostname,path:u.pathname,method:r.method(),httpStatus:response.status(),accepted:false};
+  const r=response.request();
+  const verification=verificationRequests.get(r);
+  if(!disposed&&submittedAt&&verification?.epoch===submitEpoch&&verification.at>=submittedAt&&now()-submittedAt<30000){try{const body=await response.json();const feedback=classifyLoginFeedback(body.msg||body.message||body.data?.message);if(feedback&&!disposed&&verification.epoch===submitEpoch)submitFeedback={...feedback,at:now(),source:'platform_response'};}catch{}}
+  const at=requests.get(r);if(!at||at<armedAt||disposed)return;
+  const u=new URL(r.url()),value={observedAt:now(),requestedAt:at,host:u.hostname,path:u.pathname,method:r.method(),httpStatus:response.status(),accepted:false,source:'platform_send_response'};
   try{
    const text=await response.text();if(text.length>65536)throw Error('OVERSIZED_SMS_RESPONSE');const data=JSON.parse(text);
    const codes=[data.error_code,data.status_code,data.code,data.data?.error_code,data.data?.status_code,data.data?.code].filter(v=>v!==null&&v!==undefined).map(v=>typeof v==='number'?v:typeof v==='string'&&/^-?\d+$/.test(v)?Number(v):NaN);
    value.platformCode=codes.find(v=>v!==0)??codes[0]??null;
+   value.platformMessage=String(data.msg||data.message||'').replace(/https?:\/\/\S+/g,'[url]').replace(/\d{4,}/g,'[number]').replace(/[A-Za-z0-9_-]{24,}/g,'[redacted]').slice(0,160);
+   value.restartRequired=platform==='小红书'&&value.platformCode!==0&&/退出应用重新操作|重新登录|登录态.*失效/.test(value.platformMessage);
    value.accepted=response.status()>=200&&response.status()<300&&codes.every(v=>Number.isFinite(v)&&v===0)&&(codes.length>0||data.message==='success');
   }catch{value.reason='PLATFORM_RESPONSE_UNCONFIRMED';}
   if(!disposed&&armedAt&&at>=armedAt)receipt=value;
  };
- if(platform==='抖音'){page.on('request',onRequest);page.on('response',onResponse);}
+ if(['抖音','小红书'].includes(platform)){page.on('request',onRequest);page.on('response',onResponse);}
  const publish=()=>challenge?{...challenge,attempts}:null;
  function clear(){key=null;challenge=null;disposed=true;page.off('request',onRequest);page.off('response',onResponse);}
- function outcome(phase,extra={}){return {phase,sms:publish(),request:receipt?{...receipt}:null,...extra};}
+ function outcome(phase,extra={}){return {phase,policyVersion:SMS_LOGIN_VERSION,sms:publish(),request:receipt?{...receipt}:sendClickAttempted?{accepted:false,source:'send_click_only',requestedAt:lastRequestAt}:null,...extra};}
  async function locate(){
-  if(platform!=='抖音'||page.isClosed())return null;
-  const u=new URL(page.url());if(u.protocol!=='https:'||!/(^|\.)douyin\.com$/i.test(u.hostname))return null;
+  if(!['抖音','小红书'].includes(platform)||page.isClosed())return null;
+  const u=new URL(page.url());if(u.protocol!=='https:'||!smsPlatformHost(platform,u.hostname))return null;
   const results=[];
   for(const frame of page.frames()){
    let url;try{url=new URL(frame.url());}catch{continue;}
-   if(url.protocol!=='https:'||!/(^|\.)douyin\.com$/i.test(url.hostname))continue;
+   if(url.protocol!=='https:'||!smsPlatformHost(platform,url.hostname))continue;
    const heading=await unique(frame.getByText(/^(身份验证|短信验证|短信验证码验证|手机验证)$/)) || await unique(frame.getByText('接收短信验证码',{exact:true}));
    if(!heading)continue;
    let region=heading,choice=null,entry=null;
@@ -57,12 +71,33 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
   }
   return results.length===1?results[0]:null;
  }
+ function renewChallenge(){
+  const pair=generateKeyPairSync('rsa',{modulusLength:2048,publicKeyEncoding:{type:'spki',format:'pem'}});
+  key=pair.privateKey;challenge={challengeId:randomUUID(),publicKey:pair.publicKey,issuedAt:now(),expiresAt:now()+300000};
+ }
+ async function currentFeedback(){
+  let feedback=await inspectLoginFeedback(page,platform);
+  if(ignoredVisibleFeedback){if(feedback?.type===ignoredVisibleFeedback)feedback=null;else ignoredVisibleFeedback=null;}
+  if(submitFeedback?.type==='sms_code_expired')return submitFeedback;
+  return feedback||submitFeedback;
+ }
  async function observe(){
   await assertAllowed();let dom=await locate();
   if(!dom){if(challenge){clear();return {phase:'sms_submitted'};}return null;}
   if(!dom.input){
    if(selected)return {phase:'sms_manual',reason:'SMS_INPUT_NOT_FOUND'};
    selected=true;selectionAt=now();armedAt=selectionAt;lastRequestAt=selectionAt;await dom.option.click({timeout:2500});return outcome('sms_opening');
+  }
+  if(platform==='小红书'&&!requested&&!sendClickAttempted){
+   // QR sign-in may already have sent the SMS before this bridge attached.
+   // Adopt only the visible, masked-phone sent form; never click resend here.
+   const proof=await inspectSmsVerification(page,platform);
+   if(proof?.sent){
+    requested=true;lastRequestAt=now();
+    receipt={accepted:true,source:'visible_existing_sms_challenge',observedAt:now(),requestedAt:null,phoneTail:proof.phoneTail};
+   }else if(!proof?.willSend)return outcome('sms_send_unconfirmed',{reason:'EXISTING_SMS_SEND_NOT_VISIBLE'});
+   // An explicit “will send” form needs its first send click. The shared
+   // sendClickAttempted guard below consumes that attempt before clicking.
   }
   if(!requested){
    // Set before clicking: a timeout must never cause another SMS to be sent.
@@ -85,28 +120,36 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
   if(!challenge){
    // Request is confirmed by the page before advertising a code challenge.
    if(!receipt?.accepted)return outcome('sms_send_unconfirmed',{reason:'NO_FRESH_PLATFORM_SEND_RECEIPT'});
-   const pair=generateKeyPairSync('rsa',{modulusLength:2048,publicKeyEncoding:{type:'spki',format:'pem'}});
-   key=pair.privateKey;challenge={challengeId:randomUUID(),publicKey:pair.publicKey,issuedAt:now(),expiresAt:now()+300000};
+   renewChallenge();
   }
-  if(now()>=challenge.expiresAt||attempts>=3){key=null;return outcome('sms_expired');}
+  const feedback=await currentFeedback();
+  if(feedback?.type==='sms_code_expired')return outcome('sms_expired',{feedback,reason:'PLATFORM_CODE_EXPIRED'});
+  // Local encryption-key lifetime is independent of the platform SMS lifetime.
+  // Renew only the local challenge: never send SMS or refresh the page here.
+  let renewed=false;
+  if(platform==='小红书'&&now()>=challenge.expiresAt){renewChallenge();renewed=true;}
+  if(platform!=='小红书'&&(now()>=challenge.expiresAt||attempts>=3)){key=null;return outcome('sms_expired',{reason:'LOCAL_CHALLENGE_EXPIRED'});}
+  if(feedback?.type==='sms_code_incorrect')return outcome('sms_rejected',{feedback,reason:'PLATFORM_CODE_INCORRECT'});
   if(submittedAt&&now()-submittedAt<15000)return outcome('sms_submitted');
-  const error=await unique(dom.region.getByText(/验证码错误|验证码不正确|验证码已过期|验证码失效/));
-  return outcome(error?'sms_rejected':'waiting_sms');
+  return outcome('waiting_sms',renewed?{reason:'LOCAL_CHALLENGE_RENEWED'}:{});
  }
  async function requestFresh(){
   await assertAllowed();if(disposed)throw Error('SMS_SESSION_CLOSED');
   const dom=await locate();if(!dom?.input)throw Error('SMS_INPUT_NOT_VISIBLE');
+  if(receipt?.restartRequired)throw Error('SMS_SESSION_RESTART_REQUIRED');
   if(lastRequestAt&&now()-lastRequestAt<60000)throw Error('SMS_REQUEST_RATE_LIMIT_60_SECONDS');
   if(submittedAt&&now()-submittedAt<15000)throw Error('SMS_SUBMISSION_PENDING');
   const send=await unique(dom.region.getByText(sendText));if(!send||!await send.isEnabled())throw Error('SMS_SEND_CONTROL_NOT_READY');
-  key=null;challenge=null;receipt=null;attempts=0;submittedAt=0;requested=false;
+  ignoredVisibleFeedback=(await inspectLoginFeedback(page,platform))?.type||null;
+  submitEpoch++;key=null;challenge=null;receipt=null;attempts=0;submittedAt=0;requested=false;submitFeedback=null;
   sendClickAttempted=true;armedAt=now();lastRequestAt=armedAt;
   await send.click({timeout:2500});return outcome('sms_requesting');
  }
  async function submit(c){
   await assertAllowed();
-  if(!challenge||!key||now()>=challenge.expiresAt||c.challengeId!==challenge.challengeId||attempts>=3)throw Error('SMS_CHALLENGE_EXPIRED_OR_CHANGED');
+  if(disposed||!challenge||!key||now()>=challenge.expiresAt||c.challengeId!==challenge.challengeId||(platform!=='小红书'&&attempts>=3))throw Error('SMS_CHALLENGE_EXPIRED_OR_CHANGED');
   if(submittedAt&&now()-submittedAt<15000)throw Error('SMS_SUBMISSION_PENDING');
+  if((await currentFeedback())?.type==='sms_code_expired')throw Error('SMS_PLATFORM_CODE_EXPIRED');
   const dom=await locate();if(!dom?.input)throw Error('SMS_INPUT_NOT_VISIBLE');
   const button=await submitButton(dom.region);
   if(!button)throw Error('SMS_SUBMIT_BUTTON_NOT_UNIQUE');
@@ -116,7 +159,7 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
   catch{throw Error('SMS_DECRYPT_REJECTED');}
   try{
    if(!/^\d{4,8}$/.test(bytes.toString('ascii')))throw Error('SMS_CODE_FORMAT');
-   await assertAllowed();attempts++;submittedAt=now();
+   await assertAllowed();attempts++;submitEpoch++;submittedAt=now();submitFeedback=null;
    // Deliberately use evaluate rather than Playwright fill: operation errors and
    // call logs must not include the code argument. No tracing/screenshots here.
    await dom.input.evaluate((n,value)=>{const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;set.call(n,value);n.dispatchEvent(new Event('input',{bubbles:true}));n.dispatchEvent(new Event('change',{bubbles:true}));},bytes.toString('ascii'));

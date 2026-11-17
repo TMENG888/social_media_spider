@@ -1,3 +1,6 @@
+import {FRONTEND_BUDGET_VERSION,ForegroundBudget,withForegroundBudget,checkForegroundBudget,isForegroundTimeout,withoutForegroundBudget,frontendClosed} from './foreground-budget.mjs';
+import {completeForegroundTimeout} from './foreground-completion.mjs';
+import {pausePlaywright} from './collection-cycle-pause.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -7,6 +10,7 @@ import mysql from 'mysql2/promise';
 import {openCheckpoint,saveCandidates,checkpointCandidates,markCompleted,markSkipped,markFailed,markBaseImported,markImportPending,recoverSavedImportFailures,migrateCheckpointCommentThreads,setMeta,completedResults,exportCheckpoint,asrJobStats,writeJsonAtomic,mediaSourceRecoveryIds,settleExpiredMediaGaps} from './checkpoint.mjs';
 import {mergeCommentResults} from './comment-threads.mjs';
 import {YearBoundary,inTargetYear,searchExhaustionEvidence,verifiedAnnualSearchEnd} from './collection-policy.mjs';
+import {assessAnnualRangeBoundary} from './annual-range-boundary.mjs';
 import {postFromAweme,DouyinResponseObserver,shanghaiTime} from './douyin-data.mjs';
 import {assertAccess,navigateSearch,selectLatestWithRecovery,visibleCards,openCard,restoreSearch,collectComments,ensureSingleColumn,searchEndUi,scrollSearchResults} from './douyin-browser.mjs';
 import {AsrService} from './asr.mjs';
@@ -25,7 +29,7 @@ import {verifyCheckpointCoverage} from './coverage-gate.mjs';
 import {searchScrollProgress} from './search-scroll.mjs';
 import {readTaskVolume,validateVolumeSnapshot} from './volume-acceptance.mjs';
 import {finalizeAsr} from './asr-finalization.mjs';
-import {createPersistenceGate,persistenceConnection} from './persistence-gate.mjs';
+import {createPersistenceGate,persistenceConnection,PERSISTENCE_BUDGET_VERSION} from './persistence-gate.mjs';
 import {planObservedSearchItems} from './search-response-recovery.mjs';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function patchTranscript(result, persistenceGate) {
@@ -53,6 +57,9 @@ export async function collectKeyword(options){
  return timed('keyword',()=>collectKeywordTimingImpl(options));
 }
 async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,outputDir,shouldStop,persistenceGate=null,sampleLimit=0,commit=true,allowManualLogin=false,importer=importRows,prepareLatest=selectLatestWithRecovery,onContentImported=async()=>{}}) {
+ console.log(`[单篇前台预算] ${FRONTEND_BUDGET_VERSION}：每篇30分钟；后台转写、入库、取锁排队不计时且不阻塞下一篇`);
+ console.log(`[入库预算版本] ${PERSISTENCE_BUDGET_VERSION}：转写等待和取锁排队不扣入库收尾5分钟；实际数据库操作仍计时，单次SQL最多30秒`);
+ page=pausePlaywright(page,{beforeAction:async()=>{},activeNow:Date.now});
  persistenceGate ||= createPersistenceGate({stopCollecting:shouldStop,verifyLease:()=>assertLocalLease(),verifyControl:async()=>{if(commit&&process.env.DY_DISPATCH==='redis')throw new Error('PERSISTENCE_CONTROL_UNAVAILABLE');}});
  const volumeMode=commit&&!sampleLimit&&process.env.SOCIAL_VOLUME_ENABLED==='1';
  const volumeSnapshot=volumeMode?validateVolumeSnapshot(JSON.parse(await fs.readFile(process.env.SOCIAL_VOLUME_SNAPSHOT,'utf8')),{platform:'抖音'}):null;
@@ -61,7 +68,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
  const db=openCheckpoint(path.join(stateDir,'checkpoint.sqlite'));
  const retryBefore=timedSync('checkpoint_read',()=>retrySnapshot(db,task.keyword));timingProgress('keyword_baseline',{priorRetained:retryBefore.retainedArticleIds?.length||0});
  const observer=new DouyinResponseObserver(page),boundary=new YearBoundary(config.targetYear||2026,task.searchStopWindow||8);
- const seen=new Set(),summary={keyword:task.keyword,topic:task.topic,status:'running',posts:0,comments:0,verified:0,old:0,error:null,sortConfirmed:false,stopReason:null};
+ const seen=new Set(),deferredCommentIds=new Set(),summary={keyword:task.keyword,topic:task.topic,status:'running',posts:0,comments:0,verified:0,old:0,error:null,sortConfirmed:false,stopReason:null};
  Object.assign(summary,{taskId:task.redisTaskId||task.id,projectName:task.projectName,
   startedAt:new Date().toISOString(),checkpointDb:path.join(stateDir,'checkpoint.sqlite')});
  const diagnostics=createPageDiagnostics({page,platform:'抖音',keyword:task.keyword,outputDir,
@@ -74,8 +81,9 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
   }
  };
  if(sampleLimit)summary.sampleNoteIds=[];
- let service=null,asr=null,error=null,baseImported=false,finalizing=false;
- const stop=async()=>{await assertLocalLease();return shouldStop?await shouldStop():false;};
+ let service=null,asr=null,error=null,baseImported=false,finalizing=false,importQueue=Promise.resolve();
+ const enqueueImport=results=>{const held=results.map(r=>structuredClone(r));importQueue=withoutForegroundBudget(()=>importQueue.then(async()=>{try{await importResults(held);baseImported=true;releaseJobs();asr?.start().catch(e=>{summary.asrError=String(e.message);});await onContentImported();}catch(e){summary.backgroundImportError=e.code||'IMPORT_PENDING';console.warn('[后台入库待补] 本地数据已保留，前台继续下一篇');}}));return importQueue;};
+ const stop=async()=>{await assertLocalLease();const stopped=shouldStop?await shouldStop():false;if(!stopped)checkForegroundBudget();return stopped;};
  const check=async()=>{if(await stop())throw new Error('STOP_REQUESTED：已安全停止');};
  const releaseJobs=()=>db.prepare("UPDATE asr_job SET status='pending' WHERE status='waiting_import' AND EXISTS (SELECT 1 FROM candidate c WHERE c.keyword=asr_job.keyword AND c.note_id=asr_job.note_id AND c.status='completed' AND (c.import_status='imported' OR ?=1))").run(commit?0:1);
  const importResults=async results=>{
@@ -109,8 +117,9 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
    service=new AsrService({pythonExecutable:path.join(commonRoot,'runtime/python/python.exe'),model:path.resolve(commonRoot,config.asrModelPath),device:config.asrDevice||'cpu',computeType:config.asrComputeType||'int8_float32',cpuThreads:config.asrCpuThreads||1,beamSize:config.asrBeamSize||1,localFilesOnly:true,tempDir:path.join(stateDir,'media'),cacheDir:path.join(stateDir,'asr-cache')});
    asr=new AsrJobProcessor({db,service,mediaDir:path.join(stateDir,'media'),keepMedia:config.asrKeepMedia===true,shouldStop:stop,onCompleted:async(_job,_output,result)=>{if(commit&&baseImported){await patchTranscript(result,persistenceGate);return true;}return false;}});
   }
-  await importSaved();
-  asr?.start().catch(e=>{summary.asrError=String(e.message);});
+  // Historical backfill shares the durable queue; acquiring its SQL lock must
+  // not delay opening the first new video. ASR is released after base import.
+  enqueueImport(completedResults(db));
   const initialSearch=await navigateSearch(page,task.keyword,{shouldStop:stop,timeoutMs:config.navigationTimeoutMs||45000,allowManualLogin,
    onObservation:audit=>{summary.searchNavigation=audit;}});
   if(allowManualLogin){
@@ -139,7 +148,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
   console.log(`[筛选确认] ${task.keyword}: 最新发布，全年日期不限；${prepared.layout==='empty'?'搜索响应与页面均确认零结果':`单列已生效，已读到${prepared.cards}张卡片`}；后续不逐帖重选筛选`);
   // Quantity/annual-low mode retries only the original keyword from its search
   // origin. It never schedules a separate old-post or subtitle recovery pass.
-  const mediaRecoveryIds=new Set(volumeMode?[]:mediaSourceRecoveryIds(db,task.keyword));
+  const mediaRecoveryIds=new Set(volumeMode?[]:mediaSourceRecoveryIds(db,task.keyword).filter(id=>!frontendClosed(checkpointCandidates(db,task.keyword).find(n=>n.noteId===id)?.result)));
   const recoveryIds=new Set(volumeMode?[]:[...incompleteCandidates(checkpointCandidates(db,task.keyword)).map(n=>n.noteId),...mediaRecoveryIds]);
   let recovering=recoveryIds.size>0;
   summary.recoveredDetailNotes=[];summary.recoveredOldNotes=[];
@@ -147,6 +156,17 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
   let stagnant=0,round=0,done=false,layoutRecovered=false,endKey=null,endChecks=0,handled=0;
   let recoverySearchRounds=0,recoverySearchMs=0;
   let scrollProgress={};summary.searchScrollDiagnostics=[];
+  const acceptAnnualBoundary=()=>{
+   if(sampleLimit||recovering||!boundary.recent.some(n=>n.date&&Number(n.date.slice(0,4))<(config.targetYear||2026)))return false;
+   const annual=assessAnnualRangeBoundary({keyword:task.keyword,year:config.targetYear||2026,cutoff:task.cutoff||'2026-01-01',
+    after:prepared.at,sortConfirmed:summary.sortConfirmed,pages:observer.searchPages,items:observer.searchItems,failures:observer.searchFailures,
+    candidates:checkpointCandidates(db,task.keyword),visitedOldIds:boundary.recent.filter(n=>n.date&&Number(n.date.slice(0,4))<(config.targetYear||2026)).map(n=>n.noteId)});
+   summary.annualRangeBoundary=annual;
+   if(!annual.confirmed)return false;
+   summary.stopReason='annual_range_complete';
+   console.log(`[年度边界完成] ${task.keyword}: 最新排序日期连续核验，已发现的今年帖子及评论已入库，已进入往年；收尾后直接年度结案，不等待关键词三次重试`);
+   return true;
+  };
   const advanceSearch=async()=>{
    const searchStarted=Date.now();
    const snapshot=await scrollSearchResults(page,{keyword:task.keyword});
@@ -162,7 +182,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
    // Register current response-only gaps before evaluating exhaustion, not
    // just after the endpoint proof has already been recorded.
    saveCandidates(db,task.keyword,observedLatestSearchCandidates(observer.searchPages,{keyword:task.keyword,after:prepared.at}),seen.size);
-   if(volumeMode&&!process.env.SOCIAL_RECOLLECT_ONCE){const quantity=await volumeRead();if(quantity.ok){summary.stopReason='volume_threshold';summary.volumeAcceptance=quantity;done=true;break;}}
+   // Article inventory is diagnostic only: never stop a keyword by quantity.
    if(recovering&&!recoveryIds.size){
     // Recovery may have scrolled past newer cards. Restart this search once,
     // then reconfirm latest; never reopen individual articles by direct URL.
@@ -176,7 +196,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
     continue;
    }
    const cards=await visibleCards(page);
-   const candidates=cards.filter(n=>!seen.has(n.noteId)&&(!recovering||recoveryIds.has(n.noteId)));
+   const candidates=cards.filter(n=>!seen.has(n.noteId)&&!deferredCommentIds.has(n.noteId)&&(!recovering||recoveryIds.has(n.noteId)));
    saveCandidates(db,task.keyword,cards,seen.size);
    // Reuse only already-observed, matching-ID creation dates. This avoids
    // reopening known old-year cards; unknown dates/IDs still require detail.
@@ -186,6 +206,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
     ...settleObservedOldCandidates(db,task.keyword,observer.awemes,config.targetYear||2026,task.cutoff||'2026-01-01',{excludedIds:responsePlan.conflictingIds})];
    summary.observedOldCandidateDispositions.push(...observedOld);
    if(recovering)for(const old of observedOld)if(recoveryIds.delete(old.noteId))summary.recoveredOldNotes.push(old.noteId);
+   if(acceptAnnualBoundary()){done=true;break;}
    if(!candidates.length){
     // Still inside this original keyword scan: a current search response may
     // carry the complete base article even when its virtual card never mounts.
@@ -195,7 +216,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
      const {note,result,evidence}=responsePlan.recoverable[0];
      const job=config.asrEnabled&&result.post.文章视频链接?{keyword:task.keyword,noteId:note.noteId,articleId:note.noteId,mediaUrl:result.post.文章视频链接,referer:result.post.文章链接,prompt:null,sourceObserved:true}:null;
      markCompleted(db,task.keyword,note,result,{asrJob:job,observedSearchEvidence:evidence});
-     await importResults([result]);baseImported=true;releaseJobs();asr?.wake();
+     enqueueImport([result]);
      seen.add(note.noteId);summary.posts++;summary.verified++;
      summary.searchResponseRecoveredNotes||=[];summary.searchResponseRecoveredNotes.push({noteId:note.noteId,evidence});
      console.log(`[当前搜索响应入库] ${task.keyword} / ${note.noteId}：同ID、年度、作者、媒体及相关性核对通过；不声明已采集评论`);
@@ -242,6 +263,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
     if(!recovering&&boundary.observe(note.noteId,prior.publishedAt))summary.oldDateWindowObserved=true;
     continue;
    }
+   if(prior?.status==='front_timeout'||frontendClosed(prior?.result)){seen.add(note.noteId);summary.foregroundSkipped=(summary.foregroundSkipped||0)+1;continue;}
    if(prior?.status==='completed'&&prior.result?.audit?.commentsComplete!==false&&!mediaRecoveryIds.has(note.noteId)){
     timingProgress('checkpoint_skip',{articleId:note.noteId,reason:'local_completed',priorStatus:prior.status});
     summary.verified++;summary.posts++;
@@ -251,13 +273,15 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
     if(sampleLimit&&summary.posts>=sampleLimit){summary.stopReason='sample_limit';done=true;}
     continue;
    }
-   let opened=false,result=null,noteError=null,durable=false,dateExcluded=false;
+   let opened=false,result=null,noteError=null,durable=false,dateExcluded=false,commentError=null;
+   const frontBudget=new ForegroundBudget({articleId:note.noteId});
    await contentTiming({articleId:note.noteId},async()=>{
    timingProgress('content_resume',{priorStatus:prior?.status||'unseen',beforeCount:prior?.result?.comments?.length||0,newToLocal:!prior?.result});
    console.log(`[详情开始] ${task.keyword} / ${note.noteId}`);
    await writeJsonAtomic(path.join(outputDir,'collector_progress.json'),{...summary,currentNote:note.noteId,updatedAt:new Date().toISOString()});
    try{
-    await openCard(page,note);opened=true;
+    try{await withForegroundBudget(frontBudget,async()=>{
+    opened=true;await openCard(page,note);
     for(let attempt=0;attempt<10&&!observer.awemes.has(note.noteId);attempt++){await check();await pause(500);await observer.flush();}
     const raw=observer.awemes.get(note.noteId);
     if(!raw||String(raw.aweme_id)!==String(note.noteId))throw new Error('DETAIL_DATA_NOT_OBSERVED：详情响应未取得对应帖子');
@@ -268,22 +292,30 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
      if(!recovering&&boundary.observe(note.noteId,date))summary.oldDateWindowObserved=true;
      console.log(`[日期跳过] ${note.noteId}: ${date}`);
     }else{
-     let commentError=null;
      if(task.collectComments){
       try{const output=await collectComments(page,observer,result.post,{shouldStop:stop,maxRounds:Number(config.maxCommentScrolls)||0,priorResult:prior?.result,pacingConfig:config,onDiagnostic});result.comments=output.rows;result.commentAudits=output.commentAudits||[];result.audit.comments=output.audit;result.audit.commentsComplete=output.audit.complete;}
       catch(e){
        const merged=mergeCommentResults(result.post,prior?.result,{comments:e.partialComments||[],commentAudits:e.partialCommentAudits||[],audit:{comments:e.commentAudit}});
-       result.comments=merged.rows;result.commentAudits=merged.commentAudits;result.audit.comments={...e.commentAudit,status:'incomplete',complete:false,aggregation_mode:'comment_thread',aggregation_version:1,collected:merged.rawCommentCount,raw_comment_count:merged.rawCommentCount,thread_count:merged.threadCount,orphan_comment_ids:merged.orphanCommentIds,unattached_comments:merged.unattachedComments};result.audit.commentsComplete=false;result.audit.commentsError=e.message;commentError=e;
+       result.comments=merged.rows;result.commentAudits=merged.commentAudits;result.audit.comments={...e.commentAudit,status:'incomplete',complete:false,aggregation_mode:'comment_thread',aggregation_version:1,collected:merged.rawCommentCount,raw_comment_count:merged.rawCommentCount,thread_count:merged.threadCount,orphan_comment_ids:merged.orphanCommentIds,unattached_comments:merged.unattachedComments};result.audit.commentsComplete=false;result.audit.commentsError=e.message;commentError=e;if(isForegroundTimeout(e))throw e;
       }
      }
+    }
+    });}catch(e){
+     if(!isForegroundTimeout(e))throw e;
+     const evidence=e.foregroundCompletion;
+     if(result?.post)result={...result,audit:{...result.audit,commentsComplete:false,foregroundCompletion:evidence}};
+     else result=completeForegroundTimeout(db,task.keyword,note,e,{prior:prior?.result});
+     commentError=null;deferredCommentIds.add(note.noteId);
+     (summary.foregroundTimeouts||=[]).push(evidence);timingProgress('content_foreground_timeout',{articleId:note.noteId,elapsedMs:evidence.activeMs,reason:'single_content_30min'});
+     console.warn(`[单篇前台超时] ${note.noteId}：已结束前台采集，保留正文及已获评论，继续下一篇；后台任务单独处理`);
+    }
+    if(result?.post&&!dateExcluded){
      const job=config.asrEnabled&&result.post.文章视频链接?{keyword:task.keyword,noteId:note.noteId,articleId:note.noteId,mediaUrl:result.post.文章视频链接,referer:result.post.文章链接,prompt:null,sourceObserved:true}:null;
      markCompleted(db,task.keyword,note,result,{asrJob:job});
      durable=true;timingProgress('content_saved',{newToLocal:!prior?.result,beforeCount:prior?.result?.comments?.length||0,afterCount:result.comments.length,deltaCount:Math.max(0,result.comments.length-(prior?.result?.comments?.length||0))});
-     await importResults([result]);
-     if(commit&&!commentError)await onContentImported();
-     baseImported=true;releaseJobs();asr?.wake();
-     summary.posts++;summary.comments+=result.comments.length;if(!recovering)boundary.observe(note.noteId,date);
-     console.log(`[详情完成] ${result.post.文章标题}；评论讨论串${result.comments.length}条；文章已持久化${commit?'并入库':''}`);
+     enqueueImport([result]);
+     summary.posts++;summary.comments+=result.comments.length;if(!recovering)boundary.observe(note.noteId,result.post.文章时间地点);
+     console.log(`[详情完成] ${result.post.文章标题}；评论讨论串${result.comments.length}条；文章已持久化${commit?'，后台入库已排队':''}`);
      await writeJsonAtomic(path.join(outputDir,'collector_progress.json'),{...summary,currentNote:note.noteId,asr:asrJobStats(db),updatedAt:new Date().toISOString()});
      if(commentError)throw commentError;
      if(sampleLimit&&!recovering)summary.sampleNoteIds.push(note.noteId);
@@ -294,6 +326,13 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
     if(!durable)markFailed(db,task.keyword,note,e);
     if(!recovering)boundary.observe(note.noteId,null);
     if(!recoverableContentGap(e))throw e;
+    if(e.commentAudit?.loadRetry?.exhausted===true){
+     // A later fresh scan in this same invocation must not reopen the video
+     // we just exhausted. Keep its durable incomplete audit for future review.
+     deferredCommentIds.add(note.noteId);
+     summary.commentLoadSkippedNotes||=[];summary.commentLoadSkippedNotes.push({noteId:note.noteId,attempts:e.commentAudit.loadRetry.attempts.length});
+     console.warn(`[评论缺口跳过] ${note.noteId}：三轮延迟滚动仍不完整，已保留现有数据，继续下一条视频；本次关键词执行不再反复打开该视频`);
+    }
     summary.contentGaps||=[];summary.contentGaps.push({noteId:note.noteId,reason:String(e.message).split('：')[0]});
     console.warn(`[单帖缺口保留] ${note.noteId}: 不计入成功；继续搜索并在最后核对80%入库率`);
    }finally{
@@ -312,6 +351,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
    // of imported current-year posts. The eighth visit rests exactly once.
    handled++;
    if(done)continue;
+   if(acceptAnnualBoundary()){done=true;continue;}
    const delay=itemPause(config,'posts',handled);
    console.log(`[采集休息] ${delay.kind}: ${Math.round(delay.ms/1000)}秒`);
    await waitForPacing(delay.ms,{shouldStop:stop});
@@ -333,7 +373,7 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
   if(e.searchReadiness)summary.searchReadiness=e.searchReadiness;
   if(e.searchPreparationRecovery)summary.searchPreparationRecovery=e.searchPreparationRecovery;
   summary.firstFailureAt=new Date().toISOString();
-  (summary.pageDiagnostics||=[]).push(await diagnostics.capture('collector_failure',e,{sortConfirmed:summary.sortConfirmed,firstFailureAt:summary.firstFailureAt,searchReadiness:e.searchReadiness}));
+  (summary.pageDiagnostics||=[]).push(await diagnostics.capture('collector_failure',e,{sortConfirmed:summary.sortConfirmed,firstFailureAt:summary.firstFailureAt,searchReadiness:e.searchReadiness,searchNavigation:e.searchNavigation||summary.searchNavigation,searchSubmission:(e.searchNavigation||summary.searchNavigation)?.attempts?.at(-1)}));
   console.error(`[采集异常] ${task.keyword}: ${summary.error}；当前媒体或入库收尾后退出`);
   await page.screenshot({path:path.join(outputDir,'failure-page.png'),timeout:4000,
     mask:[page.locator('input,canvas,iframe,[class*="qr"],[class*="QR"],[data-e2e*="qr"]')]}).catch(()=>{});
@@ -344,9 +384,14 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
  finally{
   const collectionStopped=async()=>{try{return await stop();}catch(e){error ||= e;return true;}};
   finalizing=true;persistenceGate.beginDrain();
+  console.log(`[入库收尾计时] ${PERSISTENCE_BUDGET_VERSION}：入库收尾最多5分钟；等待后台转写不占此额度，单次SQL最多30秒`);
   observer.detach();await observer.flush().catch(()=>{});
-  if(asr){try{summary.asrFinalization=await timed('asr_finalize',async()=>finalizeAsr(asr,{volumeMode,closeOnly:Boolean(await collectionStopped()||error&&!recoverableContentGap(error)),readStats:()=>asrJobStats(db)}));}catch(e){summary.asrError=String(e.message);}}
-  await service?.close().catch(()=>{});
+  await timed('background_import_drain',()=>importQueue,{lane:'persistence'});
+  await persistenceGate.withoutDrainBudget(async()=>{
+   if(asr){try{summary.asrFinalization=await timed('asr_finalize',async()=>finalizeAsr(asr,{volumeMode,closeOnly:Boolean(await collectionStopped()||error&&!recoverableContentGap(error)),readStats:()=>asrJobStats(db)}));}catch(e){summary.asrError=String(e.message);}}
+   await service?.close().catch(()=>{});
+  });
+  timingProgress('persistence_budget_after_asr',persistenceGate.status());
   try{await persistenceGate.assert();const totals=await timed('preservation_import',()=>importSaved());summary.persistence={...persistenceGate.status(),status:'confirmed'};summary.savedPosts=totals.posts;summary.savedComments=totals.comments;}catch(e){summary.importError=String(e.message);summary.persistence={...persistenceGate.status(),status:'pending',reason:e.code||e.message};if(!error||e.code==='LEASE_LOST')error=e;summary.status=/STOP_REQUESTED/.test(error.message)?'partial_stopped':'incomplete';}
   summary.imports=db.prepare('SELECT import_status AS status,COUNT(*) AS count FROM candidate WHERE keyword=? AND status=\'completed\' GROUP BY import_status').all(task.keyword);
   const retryKey=`import_retry_cycles/${task.keyword}`;
@@ -379,10 +424,9 @@ async function collectKeywordTimingImpl({page,task,config,commonRoot,stateDir,ou
    pendingAsr:summary.asr.pendingTotal||0});
   if(volumeMode&&!await collectionStopped()){
    try{summary.volumeAcceptance=await volumeRead();
-    if(summary.volumeAcceptance.ok){summary.previousCollectionError=error?.message||null;
-     summary.mustStopNode=Boolean(error&&/LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION/.test(error.message));
-     summary.status='completed';summary.accepted=true;summary.error=null;error=null;}
-    else if(!error){error=new Error(summary.volumeAcceptance.reason);summary.status='incomplete';summary.error=error.message;}
+    // Preserve real failures. A quantity readback can never turn them into success.
+    summary.quantityCompletionEnabled=false;
+    summary.completionPolicy='douyin-no-quantity-20261110-v1';
    }catch(e){error=e;summary.status='incomplete';summary.error='VOLUME_DATABASE_READBACK_FAILED';}
   }else if(commit&&!sampleLimit&&!error){
    try{summary.coverage=await verifyCheckpointCoverage({checkpointDb:path.join(stateDir,'checkpoint.sqlite'),keyword:task.keyword,scanComplete:verifiedAnnualSearchEnd(summary),year:config.targetYear||2026,cutoff:task.cutoff||'2026-01-01'});}

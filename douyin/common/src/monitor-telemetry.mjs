@@ -1,3 +1,5 @@
+import {publishOpsState,refreshOpsCopies} from './ops-state.mjs';
+let opsRefreshPending=null;
 // Monitoring writes are restricted to new :monitor: keys; never import a dispatcher.
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -6,7 +8,9 @@ import {randomUUID} from 'node:crypto';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createClient} from 'redis';
 import {redisSettings} from './redis-connection.mjs';
-import {RemoteStopControl} from './remote-stop-control.mjs';
+import {pauseHeartbeatState} from './collection-cycle-pause.mjs';
+import {RemoteStopControl,controlContext} from './remote-stop-control.mjs';
+import {markControlFailure} from './remote-control-recovery.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const platformDirectory=path.basename(path.dirname(root));
@@ -190,6 +194,7 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
       try {
         stage='read_supervisor_state';
         const state=await readState();
+        if(!runtime.context){publishOpsState(stateFile,state);if(!opsRefreshPending){opsRefreshPending=refreshOpsCopies(ctx.worker).catch(()=>{}).finally(()=>{opsRefreshPending=null;});}}
         if(state.supervisorPid!==parentPid||state.sessionId!==sessionId){exitReason='supervisor_identity_changed';break;}
         if(!runtime.context||runtime.controlFactory){
           try{
@@ -198,7 +203,7 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
             await control.poll({terminal:['stopped','exit_unconfirmed'].includes(state.state)?state.state:null});
           }catch(error){
             // No restart if the control channel cannot be checked while resting.
-            for(const name of ['supervisor.stop','stop.requested'])await writeJson(path.join(ctx.worker,'.state',name),{source:'remote_control',reason:'REMOTE_CONTROL_UNAVAILABLE'});
+            await markControlFailure(control?.ctx||await controlContext(root,workerRoot),error);
             if(control){await control.flags({reason:'REMOTE_CONTROL_UNAVAILABLE'});await control.close().catch(()=>{});control=null;}
             throw error;
           }
@@ -208,8 +213,13 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
         stage='read_server_time';
         const serverTime=await monitoringCommand(client,ctx.namespace,'TIME',null,[]);
         const lastSeenAt=new Date(Number(serverTime[0])*1000+Number(serverTime[1])/1000).toISOString();
+        let reportedState=state;
+        if(!runtime.context||runtime.readPause){
+          try{reportedState=pauseHeartbeatState(state,await (runtime.readPause?runtime.readPause():fs.readFile(path.join(ctx.worker,'.state','collection-cycle-pause.json'),'utf8').then(JSON.parse)),clock());}catch{}
+        }
         const record={schemaVersion:1,platform:ctx.platform,campaign:ctx.campaign,computer:ctx.computer,worker:ctx.workerId,
-          supervisorPid:parentPid,sessionId,lastSeenAt,heartbeatIntervalSeconds:3,state:state.state,resumeAt:state.resumeAt||null};
+          supervisorPid:parentPid,sessionId,lastSeenAt,heartbeatIntervalSeconds:3,state:reportedState.state,resumeAt:reportedState.resumeAt||null,
+          ...(reportedState.pauseMode?{pauseMode:reportedState.pauseMode,pauseRound:reportedState.pauseRound}:{})};
         stage='write_heartbeat';
         await monitoringCommand(client,ctx.namespace,'HSET','workers',[ctx.computer+'/'+ctx.workerId,JSON.stringify(record)]);
         stage='write_readiness';

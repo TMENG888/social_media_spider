@@ -54,8 +54,8 @@ test('independent heartbeat persists every three seconds through rest and flushe
    writes.push(args);return 1;
  },destroy(){this.isOpen=false;}};
  await heartbeatLoop('unused',123,'session',{context:async()=>ctx,parentAlive:()=>true,now:()=>1000,
-   readState:async()=>({supervisorPid:123,sessionId:'session',state:phases[index++],resumeAt:'2026-10-13T05:00:00Z'}),
-   connect:async()=>client,sleep:async ms=>{sleeps.push(ms);},flushOutbox:async()=>{flushes++;}});
+   readState:async()=>({supervisorPid:123,sessionId:'session',state:phases[index],resumeAt:'2026-10-13T05:00:00Z'}),
+   connect:async()=>client,sleep:async ms=>{sleeps.push(ms);index++;},flushOutbox:async()=>{flushes++;}});
  assert.equal(writes.length,4);assert.deepEqual(sleeps,[3000,3000,3000]);assert.equal(flushes,4);
  assert.deepEqual(writes.map(w=>JSON.parse(w[3]).state),phases);
  assert.ok(writes.every(w=>w[0]==='HSET'&&w[1]==='xhs:{production}:monitor:workers'));

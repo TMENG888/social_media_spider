@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>爬虫运维台</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<aside class="sidebar"><a class="brand" href="/" aria-label="爬虫运维台首页"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="10" height="8" rx="2"/><rect x="19" y="5" width="10" height="8" rx="2"/><rect x="11" y="21" width="10" height="8" rx="2"/><path d="M8 13v4h16v-4M16 17v4"/></svg><span>爬虫运维台<small>专题一 · 文章与评论</small></span></a><nav aria-label="页面导航"><a class="selected" href="#machines">机器运行</a><a href="#verification">登录与验证 <span id="navCount">0</span></a><a href="#restrictions">限制时间线</a><a href="#receipts">操作回执</a><a href="#definitions">统计口径</a></nav><div class="side-note"><span class="tiny-dot"></span>独立运维模块<p>沿用现有采集与飞书推送规则。仅在点击操作后发送控制指令。</p></div></aside>
+<main><header class="top"><div><div class="breadcrumb">采集集群 / 运行总览</div><h1>机器运行</h1><p>查看当前采集位置，处理掉线和登录验证。</p></div><div class="refresh-box"><span id="sampled">正在读取集群状态…</span><div><span id="countdown">每 5 分钟更新</span><button id="refresh" class="button">立即更新<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 7a6 6 0 1 0 0 6M16 3v4h-4"/></svg></button></div></div></header>
+<div id="notice" class="notice" role="status" hidden></div>
+<div class="platform-switch"><div class="filters" role="group" aria-label="平台筛选"><button class="filter active" data-filter="xhs" aria-pressed="true">小红书</button><button class="filter" data-filter="douyin" aria-pressed="false">抖音</button></div></div>
+<section id="overview" class="overview" aria-label="平台采集增量"><div class="section-heading"><h2>专题一入库概览</h2><span>北京时间 <span id="today">—</span></span></div><div class="summary-head"><span>平台</span><span>近 1 小时新增帖子</span><span>今日新增帖子</span><span>近 1 小时评论净增</span><span>今日评论净增</span></div><div id="summary"><div class="empty">正在核对入库流水…</div></div><div class="metric-note">平台合计包含 work01—work04；评论为库存净增。</div></section>
+<div class="workspace"><section class="machine-section" id="machines"><div class="section-heading"><div><h2>集群机器 <span id="onlineCount" class="subtle">—</span></h2></div></div><div class="legend"><span><i class="dot green"></i>采集中</span><span><i class="dot blue"></i>休息／冷却</span><span><i class="dot amber"></i>需关注</span><span><i class="dot gray"></i>停采／未确认</span></div><div id="machineTable"><div class="empty">正在读取机器状态…</div></div></section>
+<aside class="verification-section" id="verification"><div class="section-heading"><h2>登录与验证</h2><span id="challengeCount" class="count">—</span></div><div id="challenges"><div class="empty">正在读取验证会话…</div></div></aside></div>
+<section id="keywords" class="keyword-section" aria-label="检索词任务进度">
+ <div class="section-heading"><h2>专题一检索词进度</h2><span id="keywordSource">最新词表</span></div>
+ <div id="keywordSummary"></div>
+ <div class="keyword-tools"><label for="keywordSearch" class="sr-only">搜索品牌</label><input id="keywordSearch" type="search" placeholder="搜索品牌"><span id="keywordMatches"></span></div>
+ <div class="keyword-scroll"><table class="keyword-table brand-table"><caption class="sr-only">各品牌检索词状态数量与累计入库文章、评论</caption><thead><tr><th scope="col">品牌</th><th scope="col">总词数</th><th scope="col">待领取</th><th scope="col">执行／等待</th><th scope="col">待重试</th><th scope="col">已结案</th><th scope="col">已结案待补库</th><th scope="col">异常／待核实</th><th scope="col">结案进度</th><th scope="col">入库文章</th><th scope="col">入库评论</th></tr></thead><tbody id="keywordRows"></tbody></table></div>
+ <div id="brandInventoryNote" class="metric-note"></div>
+ <div class="keyword-pages"><span id="keywordPageInfo"></span><div><button id="keywordPrev" class="button">上一页</button><button id="keywordNext" class="button">下一页</button></div></div>
+</section>
+
+<section id="restrictions" class="restriction-section" hidden aria-label="平台限制时间线">
+ <div class="restriction-tools"><div><h2>平台限制时间线</h2><p>登录、验证码、滑块及安全限制</p></div><div class="restriction-filters"><label>时间范围<select id="restrictionDays"><option value="1">近一天</option><option value="7">近一周</option></select></label><label>机器<select id="restrictionMachine"><option value="all">全部机器</option><option>work01</option><option>work02</option><option>work03</option><option>work04</option></select></label></div></div>
+ <div id="restrictionSummary" class="restriction-summary" role="status">正在读取限制记录…</div>
+ <div class="restriction-head" aria-hidden="true"><span>发生时间（北京）</span><span>机器</span><span>平台限制</span><span>检索词</span><span>距上次限制</span><span>处理状态</span></div>
+ <ol id="restrictionRows" class="restriction-list" aria-live="polite"></ol>
+ <div class="restriction-pages"><span id="restrictionPageInfo"></span><div><button id="restrictionPrev" class="button">上一页</button><button id="restrictionNext" class="button">下一页</button></div></div>
+ <p id="restrictionCoverage" class="restriction-note"></p>
+ <p class="restriction-note">间隔按同平台、同机器的相邻已记录限制计算；重复提醒与二维码刷新合并。未核验解除的历史记录显示“解除待核验”。</p>
+</section>
+<section id="receipts" class="receipts"><div class="section-heading"><h2>操作回执</h2><span>仅记录本面板发起的操作</span></div><div id="jobs"><div class="empty small">尚未发起操作。启动请求被接收后，会继续等待新心跳核验。</div></div></section>
+<details id="definitions"><summary>统计口径与使用说明</summary><div id="metricDetails"></div><p>“心跳已过期”指独立监督心跳超过 30 秒未更新，不能直接判定进程已退出；恢复按钮会重新核对远程控制保护、运行锁、监督进程和原桌面计划任务。保留现有安全冷却和停止标记。</p><p>单台机器的评论新增暂无可靠入库计数，暂不分摊平台评论净增。当前优先采集专题一，抖音单条前台上限 30 分钟。面板每 5 分钟采样一次，显示的是注明时间的采样结果。</p><p>页面更新只读取状态。不会因此刷新平台页面或重发短信；这些操作需要单独点击。验证码提交后立即清空，面板不保存验证码。</p></details>
+<footer><span>专题一爬虫运维</span><span>北京时间 · 每 5 分钟采样</span></footer></main>
+<dialog id="loginDialog" aria-labelledby="dialogTitle"><div class="dialog-head"><div><h2 id="dialogTitle">登录与验证</h2><p id="dialogSubtitle"></p></div><button class="button icon-button" id="closeDialog" aria-label="关闭登录面板">×</button></div><div id="dialogStatus" role="status"></div><div id="qrBox" hidden><img id="qrImage" alt="当前机器的登录二维码" width="240" height="240"><p>使用对应平台 App 扫码。手机确认期间请保留页面。</p></div><div id="humanBox" hidden></div><p id="loginFeedback" class="login-feedback" role="alert" hidden></p><form id="smsForm" hidden><label for="smsCode">手机收到的短信验证码</label><div class="sms-entry"><input id="smsCode" aria-describedby="loginFeedback" type="password" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{4,8}" minlength="4" maxlength="8" required><button type="submit" class="button primary">提交验证码</button></div><p>请勿填写滑块或点选答案；仅接受当前短信验证会话。</p></form><div class="dialog-actions"><button id="refreshQr" class="button" hidden>刷新二维码</button><button id="requestSms" class="button" hidden>获取／重发短信</button><button id="checkLogin" class="button">核验当前状态</button></div><p id="dialogMessage" class="dialog-message" role="status"></p></dialog>
+<div id="toast" role="status" class="toast" hidden></div>
+</body></html>

@@ -1,0 +1,87 @@
+{
+  "package_root": "..",
+  "monitor_root": "../feishu-monitor",
+  "output_dir": "E:/Codex/outputs/crawler-ops",
+  "temp_dir": "E:/Codex/temp/crawler-ops",
+  "ssh_config": "E:/Codex/config/crawler-ssh-config",
+  "python": "python",
+  "node": "node",
+  "listen_host": "127.0.0.1",
+  "lan_address": "127.0.0.1",
+  "port": 54176,
+  "interval": 300,
+  "projects": [
+    "全国地产设计产品力监测"
+  ],
+  "active_topic": "专题一",
+  "machines": [
+    {
+      "label": "work01",
+      "computer": "WORK01",
+      "share": "\\\\work01\\collector",
+      "alias": "work01",
+      "startupRoot": "D:\\Collectors\\startup",
+      "platformStatus": [
+        {
+          "platform": "xhs",
+          "worker": "worker-01"
+        },
+        {
+          "platform": "douyin",
+          "worker": "worker-01"
+        }
+      ]
+    },
+    {
+      "label": "work02",
+      "computer": "WORK02",
+      "share": "\\\\work02\\collector",
+      "alias": "work02",
+      "startupRoot": "D:\\Collectors\\startup",
+      "platformStatus": [
+        {
+          "platform": "xhs",
+          "worker": "worker-01"
+        },
+        {
+          "platform": "douyin",
+          "worker": "worker-01"
+        }
+      ]
+    },
+    {
+      "label": "work03",
+      "computer": "WORK03",
+      "share": "\\\\work03\\collector",
+      "alias": "work03",
+      "startupRoot": "D:\\Collectors\\startup",
+      "platformStatus": [
+        {
+          "platform": "xhs",
+          "worker": "worker-01"
+        },
+        {
+          "platform": "douyin",
+          "worker": "worker-01"
+        }
+      ]
+    },
+    {
+      "label": "work04",
+      "computer": "WORK04",
+      "share": "\\\\work04\\collector",
+      "alias": "work04",
+      "startupRoot": "D:\\Collectors\\startup",
+      "platformStatus": [
+        {
+          "platform": "xhs",
+          "worker": "worker-01"
+        },
+        {
+          "platform": "douyin",
+          "worker": "worker-01"
+        }
+      ]
+    }
+  ]
+}

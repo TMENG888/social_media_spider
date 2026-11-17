@@ -160,10 +160,13 @@ try {
     $CycleNumber=0
     while($true){
       Assert-RemoteControlAvailable
+      if(Wait-ControlFailureRecovery){$RunExitCode=0;continue}
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Manual stop requested; no new cycle will start.';break}
       Set-MonitorSupervisorState 'cooldown'
       & $Node 'src\cooldown-control.mjs' '--root' $Common '--worker-root' $Worker '--action' 'wait'
       $CooldownExitCode=$LASTEXITCODE
+      Write-MonitorSupervisorDiagnostic 'cooldown_wait_exited' $CooldownExitCode
+      if($CooldownExitCode -ne 0 -and (Wait-ControlFailureRecovery)){$RunExitCode=0;continue}
       if($CooldownExitCode -eq 20){$RunExitCode=0;break}
       if($CooldownExitCode -ne 0){Write-Warning '[Cycle supervisor] Shared cooldown requires manual review or cannot be verified; no restart.';$RunExitCode=1;break}
       $CycleNumber+=1
@@ -173,6 +176,8 @@ try {
       $CycleId=[Guid]::NewGuid().ToString('N')
       & $Node 'src\run-worker.mjs' '--mode' 'run' '--queue' $Queue '--dispatch' $Dispatch '--phase' $Phase '--skip-import' $env:XHS_SKIP_IMPORT '--max-runtime-minutes' $CycleRuntime '--cycle-id' $CycleId '--cycle-run-min-minutes' $CycleRunMinMinutes '--cycle-run-max-minutes' $CycleRunMaxMinutes '--cycle-rest-min-minutes' $CycleRestMinMinutes '--cycle-rest-max-minutes' $CycleRestMaxMinutes
       $RunExitCode=$LASTEXITCODE
+      Write-MonitorSupervisorDiagnostic 'worker_exited' $RunExitCode
+      if(Wait-ControlFailureRecovery){$RunExitCode=0;continue}
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Stop is active; no new cycle will start.';break}
       if($RunExitCode -eq 5){Write-Warning '[Cycle supervisor] Redis lease safety stop: local data is preserved and the unfinished task was not acknowledged. Restore Redis, then start this worker again.';break}
       if($RunExitCode -eq 76){Write-Host '[Cycle supervisor] Rate limit recorded. Entering shared cooldown before any next cycle.';$RunExitCode=0;continue}
@@ -209,11 +214,13 @@ try {
         if(Test-Path -LiteralPath $SupervisorStop){break}
         Start-Sleep -Seconds ([Math]::Min(5,$RestSeconds-$Elapsed))
       }
+      if(Wait-ControlFailureRecovery){$RunExitCode=0;continue}
       if(Test-Path -LiteralPath $SupervisorStop){Write-Host '[Cycle supervisor] Manual stop received during rest; no new cycle will start.';break}
     }
   }
   if($RunExitCode -eq 0){$RemoteFinalState='stopped'}
 } finally {
+  Write-MonitorSupervisorDiagnostic ('supervisor_final_'+$RemoteFinalState) $RunExitCode
   Close-MonitorSupervisor $RemoteFinalState
   foreach($Name in $SavedEnv.Keys){[Environment]::SetEnvironmentVariable($Name,$SavedEnv[$Name],'Process')}
   Set-Location -LiteralPath $OldLocation.Path

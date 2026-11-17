@@ -15,7 +15,7 @@ async function fixture(run){
  const db=openCheckpoint(path.join(root,'state.sqlite'));
  try{
   saveCandidates(db,keyword,[note]);
-  const old={post:{文章id:note.noteId,文章标题:'',文章内容:'',文章标签:'广州',文章时间地点:'2026-06-01',平台:'小红书',项目:'test'},comments:[]};
+  const old={post:{文章id:note.noteId,文章标题:'',文章内容:'',文章标签:'',文章时间地点:'2026-06-01',平台:'小红书',项目:'test'},comments:[]};
   markCompleted(db,keyword,note,old);
   recordScope(db,keyword,note,old,assessKeywordScope(keyword,old));
   await run(db,root,old);
@@ -33,7 +33,7 @@ test('uncertain cached exclusion is recovered; fresh detail replaces it only aft
  assert.equal(verifiedScopeExclusion(notes[0],keyword),null);
  assert.equal(incompleteCandidates(notes,{keyword}).length,1);
  const fresh={outsideScope:true,publishedAt:'2026-06-01',scopeEvidence:{title:'广州天河现房',body:'广州现房介绍',tags:'广州'},comments:[]};
- recordScope(db,keyword,note,fresh,assessKeywordScope(keyword,fresh,{excludedEntities:['广州天河']}),{fresh:true});
+ recordScope(db,keyword,note,fresh,{policy:'legacy',status:'out_of_scope'},{fresh:true});
  const after=db.prepare('SELECT * FROM candidate').get();
  assert.deepEqual(JSON.parse(after.result_json),fresh);
  assert.equal(after.attempts,before.attempts+1);
@@ -42,8 +42,8 @@ test('uncertain cached exclusion is recovered; fresh detail replaces it only aft
  assert.equal(history.previous_scope_json,JSON.stringify(beforeScope));
  assert.deepEqual(JSON.parse(JSON.parse(history.previous_candidate_json).result_json),old);
  notes=attachScopeAudits(db,checkpointCandidates(db,keyword),keyword);
- assert.ok(verifiedScopeExclusion(notes[0],keyword));
- assert.equal(incompleteCandidates(notes,{keyword}).length,0);
+ assert.equal(verifiedScopeExclusion(notes[0],keyword),null);
+ assert.equal(incompleteCandidates(notes,{keyword}).length,1);
  assert.equal(incompleteCandidates(notes,{keyword:'中海 住宅'}).length,1);
  await exportCheckpoint(db,path.join(root,'out'),{targetYear:2026});
  const exported=JSON.parse((await fs.readFile(path.join(root,'out/scope_evidence_history.jsonl'),'utf8')).trim());
@@ -54,7 +54,7 @@ test('archival failure rolls back fresh exclusion rather than losing old evidenc
  const before=db.prepare('SELECT * FROM candidate').get(),scope=db.prepare('SELECT * FROM scope_audit').get();
  db.exec('DROP TABLE scope_evidence_history');
  const fresh={outsideScope:true,scopeEvidence:{title:'广州楼盘'},comments:[]};
- assert.throws(()=>recordScope(db,keyword,note,fresh,assessKeywordScope(keyword,fresh,{excludedEntities:['广州楼盘']}),{fresh:true}),/scope_evidence_history/);
+ assert.throws(()=>recordScope(db,keyword,note,fresh,{policy:'legacy',status:'out_of_scope'},{fresh:true}),/scope_evidence_history/);
  assert.deepEqual(db.prepare('SELECT * FROM candidate').get(),before);
  assert.deepEqual(db.prepare('SELECT * FROM scope_audit').get(),scope);
 }));
@@ -73,7 +73,7 @@ test('old lexical exclusions are reopened for original-detail recovery with old 
  const previous=db.prepare('SELECT * FROM candidate').get(),scope=db.prepare('SELECT * FROM scope_audit').get();
  auditExistingScope(db,keyword);
  const after=db.prepare('SELECT * FROM candidate').get();
- assert.equal(after.status,'pending');assert.equal(after.attempts,previous.attempts);assert.equal(after.result_json,previous.result_json);
+ assert.equal(after.status,'completed');assert.equal(after.attempts,previous.attempts);assert.equal(after.result_json,previous.result_json);
  const archived=db.prepare('SELECT * FROM scope_evidence_history').get();
  assert.equal(archived.previous_candidate_json,JSON.stringify(previous));assert.equal(archived.previous_scope_json,JSON.stringify(scope));
 }));

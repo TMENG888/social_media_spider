@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(dir=str(_test_temp)) as t:
  resumed={**s,'phase':'resumed','resume':{'keyword':'测试词'}}
  with patch('login_bridge.with_resume',return_value=resumed):
   b.poll_once('work03');b.poll_once('work03')
- assert len(l.calls)==2 and l.calls[1][0][1]=='+messages-edit'
+ assert len(l.calls)==2 and l.calls[1][0][:3]==['im','messages','patch']
  assert '确认入库' in l.calls[1][1]['stdin']
  assert l.calls[1][0][l.calls[1][0].index('--message-id')+1]=='fixture-1'
  # Wrong-group history does not enable a success push in this group.

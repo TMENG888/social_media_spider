@@ -18,7 +18,7 @@ export async function automaticRecoveryCheck(context,platform,{keyword='',watch,
   if(!login.ok)return login;
   if(keyword){const search=await verifyManualSearch(context,watch,platform,keyword,{settleMs});if(!search.ok)return {...search,loginVerified:true,searchDiagnostics:watch.diagnostics?.()};}
   if(!await clearPages(context,platform))return {ok:false,reason:'LOGIN_OR_SECURITY_STILL_VISIBLE'};
-  return {ok:true,loginVerified:true,reason:keyword?'LOGIN_AND_SEARCH_VERIFIED':'LOGIN_VERIFIED'};
+  return {ok:true,loginVerified:true,credentialVerified:login.credentialVerified===true,proofVersion:login.proofVersion,credentialCheckedAt:login.credentialCheckedAt,reason:keyword?'LOGIN_AND_SEARCH_VERIFIED':'LOGIN_VERIFIED'};
  }catch(error){if(navigationRace(error))return {ok:false,reason:'PAGE_CHANGED_DURING_CHECK'};throw error;}
 }
 export async function waitForAutomaticRecovery(context,platform,{assertNoNewStop=async()=>{},onState=()=>{},pollMs=1500,searchProbeIntervalMs=30000,maxSearchProbes=2,navigateRecoverySearch,...options}={}){

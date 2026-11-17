@@ -177,7 +177,17 @@ export async function retryMysqlDeadlock(operation,{attempts=3,delayMs=300,shoul
     }
   }
 }
-export async function acquireImportLock(...args){return timed('database_lock',()=>acquireImportLockTimingImpl(...args),{});}
+export async function acquireImportLock(connection, options = {}) {
+  const operation = () => timed('database_lock', () => acquireImportLockTimingImpl(connection, options), {});
+  const gate = options.persistenceGate;
+  if (!gate) return operation();
+  const started = Date.now(), before = gate.remainingMs();
+  console.log(`[入库排队开始] 排队不扣收尾额度；本次取锁最多等待${Math.max(0, Number(options.maxLockWaitMs ?? 600000)) / 1000}秒`);
+  try { return await gate.withoutDrainBudget(operation, {reason: 'lock_wait'}); }
+  finally {
+    console.log(`[入库排队结束] 排队${Date.now() - started}毫秒；收尾剩余${Math.round(gate.remainingMs())}毫秒；排队前剩余${Math.round(before)}毫秒`);
+  }
+}
 async function acquireImportLockTimingImpl(connection,{lockTimeoutSeconds=10,maxLockWaitMs=600000,shouldStop=null,verifyLease=async()=>{}}={}){
   const started=Date.now(),deadline=started+Math.max(0,Number(maxLockWaitMs)||0);
   let warnedAt=0;
@@ -199,10 +209,13 @@ async function importRowsTimingImpl({ posts = [], comments = [], verify = false,
   posts = repairArticleLinks(forceNullCategory(posts.map(normaliseDouyinPostFields)));
   comments = repairArticleLinks(forceNullCategory(comments.map(normaliseDouyinCommentFields)));
   return retryMysqlDeadlock(()=>withImportLease(async verifyLease => {
-  const connection = persistenceConnection(await mysql.createConnection(mysqlConnectionOptions()),persistenceGate);
+  const rawConnection = await mysql.createConnection(mysqlConnectionOptions());
+  const connection = persistenceConnection(rawConnection, persistenceGate);
+  // Only GET_LOCK uses the non-charging connection; all real writes still count.
+  const lockConnection = persistenceConnection(rawConnection, persistenceGate, {chargeDrainBudget: false});
   let importLockAcquired = false;
   try {
-    await acquireImportLock(connection,{lockTimeoutSeconds,maxLockWaitMs,shouldStop,verifyLease});
+    await acquireImportLock(lockConnection,{lockTimeoutSeconds,maxLockWaitMs,shouldStop,verifyLease,persistenceGate});
     importLockAcquired = true;
     if(await shouldStop?.())throw new Error('STOP_REQUESTED：已取得入库锁但请求安全停止，数据保留在本地');
     await verifyLease();

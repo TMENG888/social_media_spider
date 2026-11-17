@@ -1,3 +1,4 @@
+import {inspectLoginFeedback,classifyLoginFeedback} from './login-feedback.mjs';
 // Explicit, human-authorized SMS login only. Never handles sliders or face checks.
 import {generateKeyPairSync,privateDecrypt,constants,randomUUID} from 'node:crypto';
 
@@ -10,11 +11,13 @@ async function submitButton(region){return await unique(region.getByRole('button
 export function smsLabel(s,c){return Buffer.from([s.sessionId,s.machine,s.platform,s.workerId,c].join('|'));}
 export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now}){
  let challenge=null,key=null,selected=false,requested=false,attempts=0,submittedAt=0,armedAt=0,lastRequestAt=0,receipt=null,sendClickAttempted=false,selectionAt=0;
- const requests=new WeakMap();let disposed=false;
+ const requests=new WeakMap();let disposed=false,submitFeedback=null;
  const matches=url=>{try{const u=new URL(url);return u.protocol==='https:'&&/(^|\.)douyin\.com$/i.test(u.hostname)&&/send[_-]?(?:sms[_-]?)?(?:code|otp)|(?:sms|otp).*send|send.*(?:sms|otp)/i.test(u.pathname);}catch{return false;}};
  const onRequest=r=>{if(armedAt&&now()-armedAt<15000&&matches(r.url())&&['GET','POST'].includes(r.method()))requests.set(r,now());};
  const onResponse=async response=>{
-  const r=response.request(),at=requests.get(r);if(!at||at<armedAt||disposed)return;
+  const r=response.request();
+  if(!disposed&&submittedAt&&now()-submittedAt<30000){try{const u=new URL(r.url());if(u.protocol==='https:'&&smsPlatformHost(platform,u.hostname)&&/\/(?:redcaptcha\/v2\/vc|passport[^?]*)\/(?:verify|check|validate)(?:\/|$)/i.test(u.pathname)){const body=await response.json();const feedback=classifyLoginFeedback(body.msg||body.message||body.data?.message);if(feedback)submitFeedback={...feedback,at:now(),source:'platform_response'};}}catch{}}
+  const at=requests.get(r);if(!at||at<armedAt||disposed)return;
   const u=new URL(r.url()),value={observedAt:now(),requestedAt:at,host:u.hostname,path:u.pathname,method:r.method(),httpStatus:response.status(),accepted:false};
   try{
    const text=await response.text();if(text.length>65536)throw Error('OVERSIZED_SMS_RESPONSE');const data=JSON.parse(text);
@@ -88,6 +91,9 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
    const pair=generateKeyPairSync('rsa',{modulusLength:2048,publicKeyEncoding:{type:'spki',format:'pem'}});
    key=pair.privateKey;challenge={challengeId:randomUUID(),publicKey:pair.publicKey,issuedAt:now(),expiresAt:now()+300000};
   }
+  const feedback=submitFeedback||await inspectLoginFeedback(page,platform);
+  if(feedback?.type==='sms_code_expired')return outcome('sms_expired',{feedback});
+  if(feedback?.type==='sms_code_incorrect')return outcome('sms_rejected',{feedback});
   if(now()>=challenge.expiresAt||attempts>=3){key=null;return outcome('sms_expired');}
   if(submittedAt&&now()-submittedAt<15000)return outcome('sms_submitted');
   const error=await unique(dom.region.getByText(/验证码错误|验证码不正确|验证码已过期|验证码失效/));
@@ -99,7 +105,7 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
   if(lastRequestAt&&now()-lastRequestAt<60000)throw Error('SMS_REQUEST_RATE_LIMIT_60_SECONDS');
   if(submittedAt&&now()-submittedAt<15000)throw Error('SMS_SUBMISSION_PENDING');
   const send=await unique(dom.region.getByText(sendText));if(!send||!await send.isEnabled())throw Error('SMS_SEND_CONTROL_NOT_READY');
-  key=null;challenge=null;receipt=null;attempts=0;submittedAt=0;requested=false;
+  key=null;challenge=null;receipt=null;attempts=0;submittedAt=0;requested=false;submitFeedback=null;
   sendClickAttempted=true;armedAt=now();lastRequestAt=armedAt;
   await send.click({timeout:2500});return outcome('sms_requesting');
  }
@@ -116,7 +122,7 @@ export function createSmsLogin({page,platform,session,assertAllowed,now=Date.now
   catch{throw Error('SMS_DECRYPT_REJECTED');}
   try{
    if(!/^\d{4,8}$/.test(bytes.toString('ascii')))throw Error('SMS_CODE_FORMAT');
-   await assertAllowed();attempts++;submittedAt=now();
+   await assertAllowed();attempts++;submittedAt=now();submitFeedback=null;
    // Deliberately use evaluate rather than Playwright fill: operation errors and
    // call logs must not include the code argument. No tracing/screenshots here.
    await dom.input.evaluate((n,value)=>{const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;set.call(n,value);n.dispatchEvent(new Event('input',{bubbles:true}));n.dispatchEvent(new Event('change',{bubbles:true}));},bytes.toString('ascii'));

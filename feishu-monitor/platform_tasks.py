@@ -60,7 +60,7 @@ def queue_observation(c, namespace, campaign, tasks=()):
     seconds, micros = c.command('TIME')
     now_ms = int(seconds) * 1000 + int(micros) / 1000
     counts = collections.Counter()
-    for state in all_states:
+    for state in ([] if tasks else all_states):
         if state == 'excluded':
             counts['excluded'] += 1
         else:
@@ -74,11 +74,15 @@ def queue_observation(c, namespace, campaign, tasks=()):
     missing_payloads = 0
     matched = collections.Counter()
     pending_values = c.command('ZRANGE', namespace + ':pending', 0, -1) or []
-    task_ids = {task['redisTaskId'] for task in tasks} | set(leases) | set(pending_values)
+    task_ids = {task['redisTaskId'] for task in tasks} if tasks else set(leases) | set(pending_values)
     for task_id in sorted(task_ids):
         state = c.command('HGET', namespace + ':statuses', task_id)
         if state is None:
+            if tasks: counts['total'] += 1; counts['unknown'] += 1
             continue
+        if tasks:
+            if state == 'excluded': counts['excluded'] += 1
+            else: counts['total'] += 1; counts[state if state in QUEUE_STATES else 'unknown'] += 1
         if state == 'excluded':
             continue
         matched[state if state in QUEUE_STATES else 'unknown'] += 1
@@ -114,9 +118,11 @@ def queue_observation(c, namespace, campaign, tasks=()):
             expiry = leases.get(task_id)
             if expiry is None:
                 counts['missingLeaseEvidence'] += 1
+                row['missingLeaseEvidence'] += 1
             else:
                 kind = 'validLeases' if expiry > now_ms else 'expiredLeases'
                 counts[kind] += 1
+                row[kind] += 1
                 # Remove process UUID; never expose lease tokens or raw task results.
                 raw_owner = c.command('HGET', namespace + ':owners', task_id)
                 owner = re.sub(r'-[0-9a-f]{8}-[0-9a-f-]{27}$', '', raw_owner or '归属未确认')
@@ -193,6 +199,10 @@ def collect_platform(platform):
             from platform_telemetry import read_telemetry
             result['telemetry'] = read_telemetry(c, namespace, campaign)
         result['localManifestTaskCount'] = manifest['taskCount']
+        scope=load_json(common/'task-scope.json') if (common/'task-scope.json').exists() else {}
+        result['activeTopics']=scope.get('allowedTopics',[])
+        result['collectionPass']=next((t.get('collectionPass') for t in manifest['tasks'] if t.get('collectionPass')),None)
+        result['collectionMode']='文章＋评论'
         result['configuredWorkers'] = sorted(p.name for p in common.parent.iterdir() if p.is_dir() and re.fullmatch(r'worker-[0-9]{2}',p.name))
         result['scope'] = '配置指定的当前生产任务池；不包含旧批次、export、测试或未配置的作者队列。'
     except Exception as error:

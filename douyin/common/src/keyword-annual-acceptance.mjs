@@ -1,7 +1,8 @@
 import {createHash} from 'node:crypto';
+import {ANNUAL_RANGE_POLICY,verifiedAnnualRangeBoundary} from './annual-range-boundary.mjs';
 export const ANNUAL_COMPLETION_POLICY='20261016-keyword-p80-or-low-year-v2';
 export const ANNUAL_MINIMUM_DATABASE_COVERAGE=0.8;
-const sourcePolicies=new Set(['20261014-verified-search-end-v1','douyin-latest-pagination-and-ui-v1','20261015-bound-search-end-v1']);
+const sourcePolicies=new Set(['20261014-verified-search-end-v1','douyin-latest-pagination-and-ui-v1','20261015-bound-search-end-v1',ANNUAL_RANGE_POLICY]);
 const integer=value=>Number.isSafeInteger(value)&&value>=0;
 const stamp=value=>typeof value==='string'?Date.parse(value):NaN;
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -18,7 +19,7 @@ export function assessAnnualLowVolume(decision,{scan,inventory,error=null,year=2
   return reject('ANNUAL_SQL_EVIDENCE_INVALID');
  const checkedAt=stamp(decision.checkedAt);
  if(!Number.isFinite(checkedAt)||sqlNow-checkedAt>60000||checkedAt>sqlNow+1000)return reject('ANNUAL_SQL_EVIDENCE_STALE');
- if(decision.posts>=decision.threshold)return reject('USE_QUANTITY_COMPLETION');
+ // Annual endpoint proof applies regardless of the historical article count.
  if(error&&error!=='VOLUME_BELOW_THRESHOLD'&&error!=='KNOWN_CANDIDATES_INCOMPLETE')return reject('ANNUAL_COLLECTOR_ERROR');
  if(error&&forbiddenError.test(error))return reject('ANNUAL_COLLECTOR_ERROR');
  if(!scan||!sourcePolicies.has(scan.policy)||scan.ok!==true||scan.keyword!==decision.keyword
@@ -53,7 +54,7 @@ export function assessAnnualLowVolume(decision,{scan,inventory,error=null,year=2
  // SQL can include older saved rows outside the local checkpoint: counting all
  // SQL posts PLUS every unresolved local ID deliberately overestimates supply.
  const upperBound=decision.posts+unknown.length;
- if(upperBound>=decision.threshold)return reject('ANNUAL_SUPPLY_NOT_PROVEN_BELOW_P80');
+ // P80 is diagnostic only, never a prerequisite or an alternative to endpoint proof.
  const coverageLowerBound=upperBound===0?1:decision.posts/upperBound;
  if(coverageLowerBound<ANNUAL_MINIMUM_DATABASE_COVERAGE)return {
   ...reject('ANNUAL_DATABASE_COVERAGE_INSUFFICIENT'),annualAvailableUpperBound:upperBound,
@@ -73,6 +74,13 @@ export function assessAnnualLowVolume(decision,{scan,inventory,error=null,year=2
 
 export function douyinAnnualScan(run,task){
  const summary=run?.tasks?.findLast(row=>row.keyword===task.keyword);
+ if(verifiedAnnualRangeBoundary(summary)){
+  const safeStatus=['completed','failed'].includes(run?.status)&&(!run.fatalError||['VOLUME_BELOW_THRESHOLD','KNOWN_CANDIDATES_INCOMPLETE'].includes(run.fatalError));
+  return {ok:Boolean(safeStatus&&run.currentKeyword===task.keyword&&summary.annualRangeBoundary.year===(task.year||2026)),
+   policy:ANNUAL_RANGE_POLICY,taskId:task.taskId,keyword:task.keyword,projectName:task.projectName,year:task.year||2026,
+   startedAtTop:true,latestConfirmed:true,scope:'platform_current_visible_results',observations:summary.annualRangeBoundary.observations,
+   startedAt:run.startedAt,finishedAt:run.finishedAt,rawEvidenceDigest:summary.annualRangeBoundary.evidenceDigest};
+ }
  const proof=summary?.searchExhaustion;
  const safeStatus=['completed','failed'].includes(run?.status)
   &&(!run.fatalError||run.fatalError==='VOLUME_BELOW_THRESHOLD'||run.fatalError==='KNOWN_CANDIDATES_INCOMPLETE');

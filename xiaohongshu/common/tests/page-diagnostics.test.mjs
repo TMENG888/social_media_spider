@@ -174,9 +174,10 @@ test('context failure plus later runtime timeout remains distinct from an ordina
   assert.equal(cooldownWorkerExit({status:{tasks,...summary},fatalError:null}),1);
   assert.equal(cooldownWorkerExit({status:{tasks:[{status:'partial_stopped',importExitCode:0,redisReleased:true}],failedCount:0},fatalError:null}),0);
 });
-test('both platform deployments expose the same safe standalone diagnostic interface',async()=>{
+test('both platforms retain the shared safe diagnostic interface with optional platform helpers',async()=>{
   const modules=await Promise.all(['小红书','抖音'].map(p=>load(p,'page-diagnostics.mjs')));
-  assert.deepEqual(Object.keys(modules[0]).sort(),Object.keys(modules[1]).sort());
+  const shared=['DIAGNOSTIC_VERSION','appendDiagnosticEvent','captureDiagnosticHtml','createPageDiagnostics','diagnosticError','diagnosticReasons','safeText','safeUrl'];
+  for(const module of modules)assert.ok(shared.every(key=>key in module));
   for(const module of modules){
     assert.equal(typeof module.createPageDiagnostics,'function');
     assert.equal(typeof module.appendDiagnosticEvent,'function');

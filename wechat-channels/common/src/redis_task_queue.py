@@ -138,6 +138,9 @@ def flatten_queue(queue: dict[str, Any]) -> list[dict[str, Any]]:
             task_id = f"{task['id']}:{hashlib.sha256(keyword.encode('utf-8')).hexdigest()[:20]}"
             one_task = {key: value for key, value in task.items() if key != "keywordAllowList"}
             one_task["keywordAllowList"] = [keyword]
+            one_task["collectComments"] = True
+            if task.get("collectionPass"):
+                task_id += ":" + task["collectionPass"]
             output.append({
                 "task_id": task_id,
                 "topic": task["id"],
@@ -1044,7 +1047,8 @@ def run_task(
         env['SOCIAL_VOLUME_ENABLED'] = '1'
         env['SOCIAL_VOLUME_TARGET_POSTS'] = str(args.volume_runtime.snapshot['threshold'])
         fresh_volume = args.volume_runtime.read(str(item.get('source_task_id') or item['task_id']))
-        env['SOCIAL_VOLUME_INITIAL_POSTS'] = str(fresh_volume['posts'])
+        comment_pass=(item.get('queue') or {}).get('tasks',[{}])[0].get('collectionPass')
+        env['SOCIAL_VOLUME_INITIAL_POSTS'] = '0' if comment_pass else str(fresh_volume['posts'])
         env['SOCIAL_VOLUME_SNAPSHOT'] = str(args.volume_runtime.snapshot_file)
     env["WECHAT_QUEUE_FILE"] = str(task_queue_path)
     env["WECHAT_WORKER_ROOT"] = str(args.worker_root)

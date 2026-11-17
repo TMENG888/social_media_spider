@@ -27,7 +27,7 @@ local function retry_or_fail(id, now, max_attempts, retry_delay, reason)
   clear_lease(id)
   redis.call('HSET', KEYS[9], id, reason)
   local baseline=KEYS[14] and (tonumber(redis.call('HGET',KEYS[14],id)) or 0) or 0
-  if attempt-baseline >= max_attempts then
+  if not string.find(reason,'ANNUAL_',1,true) and attempt-baseline >= max_attempts then
     redis.call('HSET', KEYS[2], id, 'failed')
     redis.call('ZREM', KEYS[6], id)
     redis.call('ZADD', KEYS[10], now, id)
@@ -73,6 +73,7 @@ return cjson.encode({added = added, existing = existing, total = redis.call('HLE
 
 const CLAIM = PRELUDE + COOLDOWN_SCOPE_LUA + `
 local owner, token = ARGV[1], ARGV[2]
+local annual=ARGV[8]=='annual_date_resume'
 local lease_ms, max_attempts, retry_delay = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
 local now = now_ms()
 -- Bounded recovery keeps a single claim from monopolizing Redis after a large outage.
@@ -100,7 +101,7 @@ for _, id in ipairs(expired) do
   if not ARGV[6] or ARGV[6] == '' or id == ARGV[6] then
   if redis.call('HGET', KEYS[2], id) == 'leased' then
     retry_or_fail(id, now, max_attempts, retry_delay,
-      cjson.encode({message = 'Lease expired before confirmation', code = 'LEASE_EXPIRED', at = now}))
+      cjson.encode({message = annual and 'ANNUAL_LEASE_EXPIRED' or 'Lease expired before confirmation', code = 'LEASE_EXPIRED', at = now}))
   else
     clear_lease(id)
   end
@@ -121,7 +122,7 @@ while true do
     local payload = redis.call('HGET', KEYS[1], id)
     local previous = tonumber(redis.call('HGET', KEYS[3], id)) or 0
     local baseline=KEYS[14] and (tonumber(redis.call('HGET',KEYS[14],id)) or 0) or 0
-    if not payload or previous-baseline >= max_attempts then
+    if not payload or (not annual and previous-baseline >= max_attempts) then
       redis.call('HSET', KEYS[2], id, 'failed')
       redis.call('ZADD', KEYS[10], now, id)
       redis.call('HSET', KEYS[9], id, cjson.encode({message = 'Missing task payload or attempt limit reached', code = 'INVALID_PENDING_TASK', at = now}))
@@ -160,6 +161,12 @@ local now = now_ms()
 if not check_lease(id, token, now) then return redis.error_reply('LEASE_LOST') end
 local result=cjson.decode(ARGV[3])
 ${COVERAGE_REDIS_GUARD}
+if result.acceptedBy=='article_comment_target' then
+ local payload=cjson.decode(redis.call('HGET',KEYS[1],id) or '{}')
+ local t=result.articleCommentTarget
+ if payload.keyword~=t.keyword or payload.projectName~=t.projectName or payload.cutoff~=t.cutoff
+  or payload.collectComments~=true then return redis.error_reply('ARTICLE_COMMENT_TASK_MISMATCH') end
+end
 if type(result)=='table' and result.disposition=='no_change' then
  local e=result.noChangeEvidence
  if result.status~='completed_with_skips' or result.accepted~=false or type(e)~='table'
@@ -325,6 +332,21 @@ function jsonPayload(value, name) {
 
 /** A node-redis client must be connected by the caller; credentials never enter this module. */
 export class RedisTaskQueue {
+  async continueAnnual(taskId,token,result={}) {
+    return this.evaluate(PRELUDE+`
+local id,token=ARGV[1],ARGV[2];local now=now_ms()
+if not check_lease(id,token,now) then return redis.error_reply('LEASE_LOST') end
+local evidence=cjson.decode(ARGV[3]);evidence.accepted=false;evidence.annualContinuation=true
+-- Keep the cumulative attempt history. Operational interruptions do not close a year.
+local n=redis.call('HINCRBY',KEYS[11],id,1)
+clear_lease(id);redis.call('HSET',KEYS[2],id,'pending')
+redis.call('HSET',KEYS[8],id,cjson.encode(evidence))
+redis.call('HSET',KEYS[9],id,cjson.encode({code='ANNUAL_CONTINUE',message=evidence.error or evidence.status,at=now}))
+redis.call('ZREM',KEYS[10],id)
+redis.call('ZADD',KEYS[6],now+math.min(3600000,tonumber(ARGV[4])*math.pow(2,math.min(n-1,5))),id)
+return cjson.encode({taskId=id,status='pending',continuation=true,deferrals=n})`,
+      [identity(taskId,'taskId'),identity(token,'token'),jsonPayload(result,'result'),String(this.retryDelayMs)],taskId);
+  }
   async defer(taskId,token,result={}) {
     return this.evaluate(DEFER,[identity(taskId,'taskId'),identity(token,'token'),jsonPayload(result,'result'),String(this.retryDelayMs)],taskId);
   }
@@ -371,7 +393,7 @@ export class RedisTaskQueue {
     if(this.cooldownKey&&this.cooldownIncidentKey&&this.cooldownNodeField)keys.push(this.cooldownIncidentKey);
     if(this.volumeBaselineKey){while(keys.length<13)keys.push(this.namespace+':volume-unused');keys.push(this.volumeBaselineKey);}
     let raw;
-    try{raw=await this.client.eval(CLAIM,{keys,arguments:[identity(workerId,"workerId"),randomUUID(),this.leaseMs,this.maxAttempts,this.retryDelayMs,taskId==null?'':identity(taskId,'taskId'),this.cooldownNodeField||''].map(String)});}
+    try{raw=await this.client.eval(CLAIM,{keys,arguments:[identity(workerId,"workerId"),randomUUID(),this.leaseMs,this.maxAttempts,this.retryDelayMs,taskId==null?'':identity(taskId,'taskId'),this.cooldownNodeField||'',this.annualResume?'annual_date_resume':''].map(String)});}
     catch(error){
       if(/RATE_LIMIT_COOLDOWN_ACTIVE/.test(String(error.message)))error.code='RATE_LIMIT_COOLDOWN_ACTIVE';
       throw error;

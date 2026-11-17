@@ -36,11 +36,11 @@ with tempfile.TemporaryDirectory(dir=temp) as tmp:
  s.update(phase='waiting_scan',generation=1,updatedAt=(now+128)*1000,image={'filename':filename,'sha256':hashlib.sha256(data).hexdigest(),'capturedAt':(now+128)*1000})
  atomic(root/'session.json',s)
  with patch('login_bridge.time.time',return_value=now+128), patch('login_bridge.qr_has_symbol',return_value=True):b.poll_once('work04')
- assert [c[0][1] for c in l.calls].count('+messages-edit')==1
- edit=next(c for c in l.calls if c[0][1]=='+messages-edit');assert edit[0][edit[0].index('--message-id')+1]=='om_1'
+ assert sum(c[0][:3]==['im','messages','patch'] for c in l.calls)==1
+ edit=next(c for c in l.calls if c[0][:3]==['im','messages','patch']);assert edit[0][edit[0].index('--message-id')+1]=='om_1'
  assert '这条提醒已解除' in edit[1]['stdin']
  with patch('login_bridge.time.time',return_value=now+136):b.poll_once('work04')
- assert [c[0][1] for c in l.calls].count('+messages-edit')==1
+ assert sum(c[0][:3]==['im','messages','patch'] for c in l.calls)==1
  # Recovery, a new session or a >45s observation gap starts a fresh grace period.
  s.update(phase='qr_unavailable',updatedAt=(now+140)*1000)
  assert not b._qr_warning_due(s,now+140)
@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(dir=temp) as tmp:
  # Closing a session replaces its original QR post instead of another send.
  s.update(sessionId=sid,phase='cancelled',updatedAt=(now+230)*1000,image=None)
  before=len(l.calls);b._invalidate_closed_qr(s);assert len(l.calls)==before+1
- assert l.calls[-1][0][1]=='+messages-edit' and '原二维码不再使用' in l.calls[-1][1]['stdin']
+ assert l.calls[-1][0][:3]==['im','messages','patch'] and '原二维码不再使用' in l.calls[-1][1]['stdin']
  assert 'image_key' not in l.calls[-1][1]['stdin']
  b._invalidate_closed_qr(s);assert len(l.calls)==before+1
  print(json.dumps({'transientWarningSuppressed':True,'persistentWarningAfter120s':True,'previousWarningEditedOnQrReady':True,'editDeduplicated':True,'gapsAndSessionChangesResetGrace':True}))

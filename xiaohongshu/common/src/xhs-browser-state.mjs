@@ -124,15 +124,36 @@ async function openFilterPanel(page) {
 
 export async function ensureLatestSort(page, keyword, { assertSafe = async () => {}, attempts = 3, log = console.log } = {}) {
   let snapshot = null;
+  const totalAttempts = attempts + 1;
+  let refreshed = false;
   await assertSafe(page);
   await page.locator('div.filter:visible,button.filter:visible,[class~="filter"]:visible').first()
     .waitFor({state:'visible',timeout:12000}).catch(() => {});
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
     if (page.isClosed()) throw new Error('STOP_BROWSER_CLOSED：确认排序时浏览器已关闭');
     await assertSafe(page);
     if (!isKeywordSearchUrl(page.url(), keyword)) throw new Error(`STOP_SEARCH_CONTEXT_LOST：排序时页面不属于关键词“${keyword}”`);
+    if (attempt === totalAttempts) {
+      log(`[筛选恢复] ${keyword}：前${attempts}次未确认最新排序，刷新当前检索词页面，执行最后1次核验`);
+      try {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+      } catch (error) {
+        if (page.isClosed()) throw new Error('STOP_BROWSER_CLOSED：刷新排序页面时浏览器已关闭', { cause: error });
+        await assertSafe(page);
+        if (!isKeywordSearchUrl(page.url(), keyword)) throw new Error('STOP_SEARCH_CONTEXT_LOST：刷新排序后离开当前关键词搜索页', { cause: error });
+        log(`[筛选恢复] ${keyword}：最终刷新失败，类型=${error.name || 'Error'}；保留断点并停止`);
+        throw new Error(`STOP_SORT_NOT_CONFIRMED：${attempts}次核验失败，最终刷新未完成；停止本节点，保留断点`, { cause: error });
+      }
+      refreshed = true;
+      await assertSafe(page);
+      if (!isKeywordSearchUrl(page.url(), keyword)) throw new Error('STOP_SEARCH_CONTEXT_LOST：刷新排序后离开当前关键词搜索页');
+      await page.locator('div.filter:visible,button.filter:visible,[class~="filter"]:visible').first()
+        .waitFor({ state: 'visible', timeout: 12000 }).catch(() => {});
+      // A delayed login or challenge must be handled before any filter action.
+      await assertSafe(page);
+    }
     if (!await openFilterPanel(page)) {
-      log(`[筛选核验] ${keyword}：第${attempt}/${attempts}次未发现可见“排序依据/最新”控件`);
+      log(`[筛选核验] ${keyword}：第${attempt}/${totalAttempts}次未发现可见“排序依据/最新”控件`);
       await page.waitForTimeout(400); continue;
     }
     snapshot = await latestSortSnapshot(page);
@@ -160,12 +181,12 @@ export async function ensureLatestSort(page, keyword, { assertSafe = async () =>
       await assertSafe(page);
       if (!isKeywordSearchUrl(page.url(), keyword)) throw new Error('STOP_SEARCH_CONTEXT_LOST：确认排序后离开当前关键词搜索页');
       log(`[筛选] ${keyword}：重新读取当前DOM，最新选中状态已确认（第${attempt}次核验）`);
-      return { keyword, selected: true, verifiedAt: Date.now(), searchUrl: page.url(), className: snapshot.className };
+      return { keyword, selected: true, verifiedAt: Date.now(), searchUrl: page.url(), className: snapshot.className, attempts: attempt, refreshed };
     }
-    log(`[筛选核验] ${keyword}：第${attempt}/${attempts}次，面板=${snapshot.panelVisible}，最新可见=${snapshot.latestVisible}，class=${snapshot.className || '无'}`);
+    log(`[筛选核验] ${keyword}：第${attempt}/${totalAttempts}次，面板=${snapshot.panelVisible}，最新可见=${snapshot.latestVisible}，class=${snapshot.className || '无'}`);
   }
   await assertSafe(page);
-  throw new Error(`STOP_SORT_NOT_CONFIRMED：${attempts}次有限核验后仍未确认最新选中；停止本节点，保留断点`);
+  throw new Error(`STOP_SORT_NOT_CONFIRMED：${attempts}次核验及刷新后最后1次核验仍未确认最新选中；停止本节点，保留断点`);
 }
 
 export async function captureSearchState(page, keyword) {

@@ -391,7 +391,7 @@ class Store:
         return status
 
     def next(self, login_commands=False):
-        login_filter = "(question LIKE '刷新登录%' OR question LIKE '登录截图%' OR question LIKE '登录状态%')"
+        login_filter = "(question = '刷新' OR question LIKE '刷新登录%' OR question LIKE '登录截图%' OR question LIKE '登录状态%')"
         partition = login_filter if login_commands else "NOT " + login_filter
         with self.connect() as db:
             return db.execute("SELECT * FROM events WHERE status IN ('queued','ready') AND next_send<=? AND " + partition + " ORDER BY created LIMIT 1", (time.time(),)).fetchone()
@@ -743,7 +743,7 @@ class Model:
         raise BotError("model_temporarily_unavailable")
 
 
-HELP = "短信验证：@我 验证码 work01 抖音 加上短信验证码（由固定程序处理，不进入模型与聊天存储）。\n登录控制：@我 刷新登录 work01 小红书；也支持登录截图、登录状态。填写机器和平台即可，自动匹配对应登录节点，只控制既有登录窗口，保留人工停止与安全冷却。\nLuna 试运行助手：请 @我 后提问。支持连续对话，也会参考本群近24小时的普通讨论及近30天的相关消息和最新监控报告（有读取权限时）。发送“清除记忆”可清除你在当前群/话题下的个人对话记忆，发送“状态”查看覆盖情况。已接入工作知识库的文档和电子表格，回答会附检索来源。提问、相关群聊及有权限的知识库片段会发送至配置的 Luna 代理。"
+HELP = "短信验证：@我 验证码 work01 抖音 加上短信验证码（由固定程序处理，不进入模型与聊天存储）。\n登录控制：回复当前二维码卡片并 @我 刷新，自动定位机器平台；也可 @我 刷新登录 work01 小红书；也支持登录截图、登录状态。填写机器和平台即可，自动匹配对应登录节点，只控制既有登录窗口，保留人工停止与安全冷却。\nLuna 试运行助手：请 @我 后提问。支持连续对话，也会参考本群近24小时的普通讨论及近30天的相关消息和最新监控报告（有读取权限时）。发送“清除记忆”可清除你在当前群/话题下的个人对话记忆，发送“状态”查看覆盖情况。已接入工作知识库的文档和电子表格，回答会附检索来源。提问、相关群聊及有权限的知识库片段会发送至配置的 Luna 代理。"
 
 
 class Bot:
@@ -844,7 +844,7 @@ class Bot:
             if not documents:
                 return note + '目前无法确认可读取的资料目录。'
             return ('目前已接入的知识库中可读取 ' + str(len(documents)) + ' 份资料，涵盖切片打标规则、有效数据、广告判定、情绪评分、数据统计和采集监控：\n\n'
-                    + '\n'.join(str(n) + '. [' + x['title'] + '](' + self.cfg.get('wiki_base_url','https://example.feishu.cn/wiki/') + x['token'] + ')'
+                    + '\n'.join(str(n) + '. [' + x['title'] + '](' + self.cfg.get('wiki_base_url','https://example.feishu.cn/wiki/') + '' + x['token'] + ')'
                                 for n, x in enumerate(documents, 1)) + '\n\n' + note)
         facts, history = self.store.memory(row['session'], question, self.cfg['recent_turns'])
         if time.time() - self.group_sync["updated"] > self.cfg.get("group_context_sync_seconds", 60):
@@ -852,7 +852,7 @@ class Bot:
         group = self.store.group_context(event, question, self.cfg, row["session"]) if self.cfg.get("group_context_enabled") else []
         search_question = retrieval_question(question, history)
         fragments, kb_note = self.knowledge.retrieve(search_question, event["sender_id"])
-        system = ("你是飞书群内的 Luna 助手，使用简洁中文回答。登录控制只支持程序预设的“刷新登录、登录截图、登录状态”固定命令，需要本群人工@并指定机器和平台；这些命令由程序独立处理。你本身没有执行工具，不能声称已执行采集、命令或修改文档。"
+        system = ("你是飞书群内的 Luna 助手，使用简洁中文回答。登录控制只支持程序预设的“刷新登录、登录截图、登录状态”固定命令，需要本群人工@；刷新二维码也支持回复当前二维码卡片后发送“刷新”，自动匹配机器平台。这些命令由程序独立处理。你本身没有执行工具，不能声称已执行采集、命令或修改文档。"
                   "先正面回答用户的实际问题，再给必要的解释与依据。问规则就直接说明规则与流程，问能否就先给结论；不能用介绍文档名称、让用户自行查看资料或只给链接代替答案。"
                   "证据只支持部分答案时，先回答已知部分，再具体说明未知部分；不要整段回避。概述两个专题时分别解释，不能把专题一的准入或字段要求套到专题二。"
                   "默认使用短段落或编号列表，可用加粗与链接；不要用Markdown表格、图片、HTML或多级标题。来源由程序在正文后附加，无需重复输出来源列表。"
@@ -876,7 +876,7 @@ class Bot:
         answer = self.model.complete(messages)
         if fragments:
             sources = list({x["token"]: x["title"] for x in fragments}.items())[:3]
-            answer += "\n\n检索来源：\n" + "\n".join('[' + title + '](' + self.cfg.get('wiki_base_url','https://example.feishu.cn/wiki/') + token + ')' for token, title in sources)
+            answer += "\n\n检索来源：\n" + "\n".join('[' + title + '](' + self.cfg.get('wiki_base_url','https://example.feishu.cn/wiki/') + '' + token + ')' for token, title in sources)
         return answer
 
     def work(self, login_commands=False):

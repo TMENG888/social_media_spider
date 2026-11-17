@@ -1,3 +1,4 @@
+import {checkForegroundBudget,suspendForegroundBudget,foregroundActionArgs,withoutForegroundBudget} from './foreground-budget.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 // Browser work pauses in the same process and call stack. No navigation,
 // browser closure, queue acceptance or protection reset belongs in this gate.
@@ -53,14 +54,15 @@ export class CollectionCyclePause {
     clearTimeout(this.timer);
     if(!this.autoTimer||this.closed||this.fault)return;
     const ms=this.state.phase==='resting'?0:Math.max(1,this.state.deadlineAtMs-this.now());
-    this.timer=setTimeout(()=>{
+    this.timer=withoutForegroundBudget(()=>setTimeout(()=>{
       // Store failures for the collecting call; never allow a rejected timer
       // promise to disappear or silently permit more browser work.
       this.beforeAction().catch(error=>{this.fault=error;});
-    },ms);
+    },ms));
     this.timer.unref?.();
   }
-  async beforeAction({reload=false}={}){
+  async beforeAction(options={}){return suspendForegroundBudget(()=>this.beforeActionTimingImpl(options));}
+  async beforeActionTimingImpl({reload=false}={}){
     if(this.closed)return;
     if(this.fault)throw this.fault;
     if(reload&&!this.waiting)await this.reload();
@@ -143,7 +145,7 @@ export function pausePlaywright(object,gate){
       const call=(...args)=>member.apply(target,args.map(unwrap));
       const fn=sync.has(key)||String(key).startsWith('getBy')
         ?(...args)=>wrap(call(...args))
-        :async(...args)=>{await gate.beforeAction();return wrap(await call(...args));};
+        :async(...args)=>{await suspendForegroundBudget(()=>gate.beforeAction());checkForegroundBudget();const result=await call(...foregroundActionArgs(key,args,String(target.constructor?.name||'').replace(/^_+/,'').replace(/\d+$/,'')));checkForegroundBudget();return wrap(result);};
       methods.set(key,fn);return fn;
     }});
     cache.set(value,proxy);raw.set(proxy,value);objectGates.set(value,gate);objectGates.set(proxy,gate);return proxy;

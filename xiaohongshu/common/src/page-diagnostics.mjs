@@ -3,8 +3,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import os from 'node:os';
+import {monitorEventLoopDelay} from 'node:perf_hooks';
+import {inspectClickPage, traceDetailClick} from './detail-click-diagnostics.mjs';
+export {traceDetailClick};
 import {inspectPlatformAccess} from './platform-access.mjs';
-export const DIAGNOSTIC_VERSION='page-diagnostics-20261105-bound-page-v4';
+import {createRiskNetworkDiagnostics} from './risk-network-diagnostics.mjs';
+export const DIAGNOSTIC_VERSION='page-diagnostics-20261113-risk-network-v6';
 
 export function safeUrl(value) {
   try {
@@ -128,12 +132,70 @@ function contextFor(url,platform,keyword) {
   }catch{return {matches:false,observedKeyword:null,expectedKeyword:safeText(keyword)};}
 }
 export function createPageDiagnostics({page,platform,keyword,outputDir,workerId='',runId='',pageRole='collection',limit=60}){
-  const timeline=[],listeners=[];let sequence=0,lastCapture=null;
+  const timeline=[],listeners=[],network=[],pending=new Map(),requests=new WeakMap();
+  let riskDiagnostics=null;
+  try{riskDiagnostics=createRiskNetworkDiagnostics({page,platform,keyword,outputDir,workerId,runId,pageRole});}catch{}
+  let sequence=0,lastCapture=null,requestSequence=0;
+  const loopDelay=monitorEventLoopDelay({resolution:50});loopDelay.enable();
+  const runtime=()=>({rssBytes:process.memoryUsage().rss,uptimeSeconds:Math.round(process.uptime()),
+    eventLoopDelayMs:{max:Math.round(loopDelay.max/1e6),mean:Number.isFinite(loopDelay.mean)?Math.round(loopDelay.mean/1e6):null}});
+  const networkState=()=>({recent:network.slice(-60),pending:[...pending.values()].slice(-30).map(r=>({...r,elapsedMs:Date.now()-r.startedMs}))});
+  const networkEvent=event=>{network.push({...stamp(),...event});if(network.length>120)network.shift();};
+  const journal=path.join(outputDir,'page-diagnostics',`detail-actions-${process.pid}-${pageRole.replace(/[^a-z0-9_-]/gi,'_')}.jsonl`);
+  const persist=async event=>{
+    try{await bounded(async()=>{
+      await fs.mkdir(path.dirname(journal),{recursive:true});
+      const size=await fs.stat(journal).then(s=>s.size).catch(()=>0);
+      if(size>8*1024*1024)await fs.rename(journal,journal+'.previous');
+      if(!await appendDiagnosticEvent(journal,{platform,keyword,workerId,runId,...event}))throw new Error('DIAGNOSTIC_JOURNAL_WRITE_FAILED');
+    },1500);}catch{console.warn('[Page diagnostics] Action journal unavailable; collection continues.');}
+  };
   const mark=(stage,details={})=>{
+    riskDiagnostics?.setStage(stage);
     const event={sequence:++sequence,...stamp(),stage,url:safeUrl(page?.url?.()),details:safeValue(details)};
     timeline.push(event);if(timeline.length>limit)timeline.shift();return event;
   };
-  const listen=(event,handler)=>{try{page.on(event,handler);listeners.push([event,handler]);}catch{}};
+  const listenOn=(target,event,handler)=>{try{target?.on(event,handler);listeners.push([target,event,handler]);}catch{}};
+  const listen=(event,handler)=>listenOn(page,event,handler);
+  const observeDetail=async(stage,details={})=>{
+    try{
+      const started=Date.now();mark(stage,details);
+      const event={...stamp(),stage,details:safeValue(details),url:safeUrl(page?.url?.()),closed:!page||page.isClosed()};
+      if(!event.closed){
+        try{event.observation=await bounded(()=>page.evaluate(inspectClickPage,{noteId:details.noteId||''}),800);}
+        catch(e){event.observationError=safeText(e.message);}
+      }
+      event.probeElapsedMs=Date.now()-started;event.runtime=runtime();event.network=networkState();
+      mark(stage+'_observed',{...details,...event});
+      await persist(event);
+      console.log('[Detail action] '+stage+' / '+safeText(details.noteId||'')+' / '+(event.observation?.state||event.observationError||'page_closed')+' / '+Math.round(details.elapsedMs||0)+'ms');
+      return event;
+    }catch(e){return {stage,observationError:safeText(e.message)};}
+  };
+  try{
+    listenOn(page.context(),'close',()=>mark('browser_context_closed'));
+    listenOn(page.context().browser(),'disconnected',()=>mark('browser_control_disconnected'));
+  }catch{}
+  listen('request',request=>{try{
+    const u=new URL(request.url()),type=request.resourceType();
+    if(!/(^|\.)(xiaohongshu\.com|xhscdn\.com)$/i.test(u.hostname)||!['document','xhr','fetch','image','script'].includes(type))return;
+    const entry={requestId:++requestSequence,url:safeUrl(request.url()),method:request.method(),resourceType:type,startedMs:Date.now()};
+    requests.set(request,entry);pending.set(entry.requestId,entry);
+    if(pending.size>200)pending.delete(pending.keys().next().value);
+  }catch{}});
+  const finish=(request,failed=false)=>{try{
+    const entry=requests.get(request);if(!entry)return;
+    pending.delete(entry.requestId);
+    if(failed||['document','xhr','fetch'].includes(entry.resourceType))networkEvent({...entry,event:failed?'request_failed':'request_finished',elapsedMs:Date.now()-entry.startedMs,
+      ...(failed?{failure:safeText(request.failure()?.errorText)}:{})});
+  }catch{}};
+  listen('requestfinished',request=>finish(request));
+  listen('requestfailed',request=>finish(request,true));
+  listen('response',response=>{try{
+    const entry=requests.get(response.request());if(!entry)return;
+    entry.httpStatus=response.status();
+    if(['document','xhr','fetch'].includes(entry.resourceType)||entry.httpStatus>=400)networkEvent({...entry,event:'response',elapsedMs:Date.now()-entry.startedMs});
+  }catch{}});
   listen('framenavigated',frame=>{try{if(frame===page.mainFrame())mark('main_frame_navigated',{url:safeUrl(frame.url())});}catch{}});
   listen('popup',popup=>{try{mark('popup_opened',{url:safeUrl(popup.url())});}catch{}});
   listen('close',()=>mark('page_closed'));
@@ -161,6 +223,11 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
         computer:os.hostname(),pid:process.pid,stage,pageRole,url:safeUrl(rawUrl),closed:!page||page.isClosed(),
         captureSource:'bound_playwright_page',
         context:(pageRole.includes('detail')||details.noteId)?{matches:null,kind:'detail',expectedKeyword:safeText(keyword)}:contextFor(rawUrl,platform,keyword),errors:diagnosticError(error),details:safeValue(details)};
+      evidence.runtime=runtime();evidence.network=networkState();evidence.actionJournal=path.basename(journal);
+      if(!evidence.closed&&details.noteId){
+        try{evidence.clickObservation=await bounded(()=>page.evaluate(inspectClickPage,{noteId:details.noteId}),800);}
+        catch(e){evidence.clickObservationError=safeText(e.message);}
+      }
       if(!evidence.closed){
         evidence.activation={attempted:true,succeeded:false};
         try{await bounded(()=>page.bringToFront(),1500);evidence.activation.succeeded=true;}
@@ -211,8 +278,11 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
         try{evidence.tabs=page.context().pages().slice(0,12).map(p=>({url:safeUrl(p.url()),closed:p.isClosed(),current:p===page}));}catch{}
       }
       evidence.reasons=diagnosticReasons(evidence);
+      if(evidence.errors?.some(e=>/locator\.click.*Timeout/s.test(e.message||''))&&evidence.clickObservation?.state==='target_url_detail_present')evidence.reasons.push('click_timeout_but_target_detail_present');
+      if(evidence.clickObservationError)evidence.reasons.push('detail_observation_unavailable');
       if(evidence.pageIdentity?.platformHostMatches===false)evidence.reasons.push('bound_page_outside_platform_or_browser_error');
       evidence.timeline=[...timeline];
+      await persist({stage:'failure_capture_started',details:safeValue(details),errors:evidence.errors,runtime:evidence.runtime,network:evidence.network});
       const directory=path.join(outputDir,'page-diagnostics');
       await fs.mkdir(directory,{recursive:true});
       const id=Date.now()+'-'+randomUUID().slice(0,8);
@@ -227,11 +297,13 @@ export function createPageDiagnostics({page,platform,keyword,outputDir,workerId=
           mask:[page.locator('input,canvas,iframe,[class*="qr"],[class*="QR"],[data-e2e*="qr"]')]}),3500);evidence.screenshot=path.basename(imageFile);}
         catch(e){evidence.screenshotError=safeText(e.message);}
       }
+      evidence.network=networkState();evidence.timeline=[...timeline];
+      if(riskDiagnostics)evidence.riskNetwork=await riskDiagnostics.flush();
       await fs.writeFile(jsonFile,JSON.stringify(safeValue(evidence),null,2),{encoding:'utf8',flag:'wx'});
       lastCapture={jsonFile,htmlFile:evidence.html?htmlFile:null,screenshot:evidence.screenshot?imageFile:null,at:evidence.at,stage,reasons:evidence.reasons};
       console.warn('[Page diagnostics] '+DIAGNOSTIC_VERSION+' '+platform+' '+stage+' / '+evidence.reasons.join(',')+' / '+jsonFile);
       return lastCapture;
     }catch(e){console.warn('[Page diagnostics] Capture unavailable; original collection error retained.');return {stage,captureError:safeText(e.message)};}
   };
-  return {mark,capture,get lastCapture(){return lastCapture;},dispose(){for(const [event,handler]of listeners){try{page.off(event,handler);}catch{}}}};
+  return {mark,capture,observeDetail,get lastCapture(){return lastCapture;},dispose(){riskDiagnostics?.dispose();loopDelay.disable();for(const [target,event,handler]of listeners){try{target.off(event,handler);}catch{}}}};
 }

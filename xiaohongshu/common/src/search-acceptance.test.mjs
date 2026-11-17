@@ -20,27 +20,27 @@ test('scope/endpoint failures cannot become exhausted content skips',()=>{
   for(const error of ['SCOPE_UNVERIFIED','SEARCH_END_UNVERIFIED','SEARCH_EXHAUSTION_UNCONFIRMED'])
     assert.equal(maySkipExhausted({status:'incomplete',error:'DETAILS_INCOMPLETE | '+error}),false);
 });
-test('confirmed cross-city examples excluded by explicit entity policy',()=>{
+test('legacy explicit word exclusions no longer filter collected details',()=>{
   for(const title of ['广州天河现房！ 省一级300出 原450','天河精装 3＋1房 260w出 一梯队']){
     const result=assessKeywordScope(keyword,{post:{文章标题:title,文章内容:'体育东均和小学 天河外国语均和学校',文章标签:'广州买房 广州天河'}},{excludedEntities:['广州天河','天河外国语均和学校']});
-    assert.equal(result.status,'out_of_scope');assert.equal(result.reason,'configured_other_entity_observed');
+    assert.equal(result.status,'accepted');assert.equal(result.lexicalMatchEnabled,false);
   }
 });
 test('anchor in title, body, or tags accepted; intent word not mandatory',()=>{
   for(const field of ['文章标题','文章内容','文章标签'])assert.equal(assessKeywordScope(keyword,{post:{[field]:'北京 保利·熙瑞 户型'}}).status,'accepted');
-  assert.equal(assessKeywordScope(keyword,{post:{文章标题:'保利天瑞 看房'}}).status,'uncertain');
+  assert.equal(assessKeywordScope(keyword,{post:{文章标题:'保利天瑞 看房'}}).status,'accepted');
 });
-test('task labels and other users comments are never relevance evidence',()=>{
-  assert.equal(assessKeywordScope(keyword,{post:{关键词:keyword,项目:keyword,文章标题:'别的楼盘'},comments:[{评论内容:'保利熙瑞'}]}).status,'uncertain');
+test('detail observed without requiring task labels or query words',()=>{
+  assert.equal(assessKeywordScope(keyword,{post:{关键词:keyword,项目:keyword,文章标题:'别的楼盘'},comments:[{评论内容:'保利熙瑞'}]}).status,'accepted');
 });
 test('empty or missing detail must be reobserved, not silently excluded',()=>{
   assert.equal(assessKeywordScope(keyword,{post:{}}).status,'unobserved');
-  assert.throws(()=>assessKeywordScope('',{}),/SCOPE_ANCHOR_INVALID/);
+  assert.equal(assessKeywordScope('',{}).status,'unobserved');
 });
 test('generic descriptions and ambiguous brand references are collected instead of excluded',()=>{
   for(const title of ['家人们，保利这个给我都去看','西四环改善｜南北双阳台','海淀第四代住宅']){
     const result=assessKeywordScope(keyword,{scopeEvidence:{title,body:'西四环的保利新房，低密洋房'}});
-    assert.equal(result.status,'uncertain');assert.equal(result.reason,'entity_relevance_uncertain');
+    assert.equal(result.status,'accepted');assert.equal(result.semanticRelevance,'not_evaluated');
   }
 });
 const snapshot={contextValid:true,rendered:true,loading:false,loadFailed:false,count:20,height:3000,lastId:'n20',atBottom:true,terminal:false};
@@ -62,7 +62,7 @@ for(const change of [{loading:true},{loadFailed:true},{contextValid:false},{rend
     assert.equal(gate.observe({...snapshot,...change}).ok,false);
   });
 }
-test('interleaved old dates cannot prove annual completion',()=>{
+test('unverified old windows and interleaved dates cannot prove annual completion',()=>{
   const boundary=new YearBoundary(2026,8);
   for(let i=0;i<8;i++)boundary.observe('old'+i,'2025-09-09');
   assert.equal(boundary.reached,true);
@@ -90,18 +90,18 @@ function fixture(){
 }
 test('legacy scope exclusion preserves full records and retry history',()=>{
   const {db,old}=fixture();try{
-    const audit=auditExistingScope(db,keyword,{excludedEntities:['广州天河']});assert.equal(audit.out_of_scope,1);assert.equal(audit.legacyImportedExcluded,1);
-    const row=db.prepare('SELECT * FROM candidate').get();assert.equal(row.status,'skipped_irrelevant');assert.equal(row.attempts,3);
+    const audit=auditExistingScope(db,keyword,{excludedEntities:['广州天河']});assert.equal(audit.out_of_scope,0);assert.equal(audit.accepted,1);assert.equal(audit.legacyImportedExcluded,0);
+    const row=db.prepare('SELECT * FROM candidate').get();assert.equal(row.status,'completed');assert.equal(row.attempts,3);
     assert.deepEqual(JSON.parse(row.result_json),old);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM import_batch').get().n,1);
-    assert.equal(incompleteCandidates([{status:row.status}]).length,1);assert.equal(asrJobStats(db).dead_letter,undefined);
+    assert.equal(incompleteCandidates([{status:row.status}]).length,0);assert.equal(asrJobStats(db).dead_letter,1);
   }finally{db.close();}
 });
-test('fresh exclusion records one real detail observation and no repeat acquisition',()=>{
+test('detail assessment alone does not invent a fresh acquisition or consume attempts',()=>{
   const {db,old}=fixture();try{
     db.exec("UPDATE candidate SET status='pending',attempts=0,result_json=NULL");
     const assessment=assessKeywordScope(keyword,old,{excludedEntities:['广州天河']});recordScope(db,keyword,{noteId:'old'},old,assessment,{fresh:true});
-    assert.equal(db.prepare('SELECT attempts FROM candidate').get().attempts,1);
-    auditExistingScope(db,keyword,{excludedEntities:['广州天河']});assert.equal(db.prepare('SELECT attempts FROM candidate').get().attempts,1);
+    assert.equal(db.prepare('SELECT attempts FROM candidate').get().attempts,0);
+    auditExistingScope(db,keyword,{excludedEntities:['广州天河']});assert.equal(db.prepare('SELECT attempts FROM candidate').get().attempts,0);
   }finally{db.close();}
 });
 test('missing evidence remains unresolved and is not allowed by scope summary',()=>{
@@ -111,7 +111,7 @@ test('missing evidence remains unresolved and is not allowed by scope summary',(
     assert.equal(incompleteCandidates([{status:db.prepare('SELECT status FROM candidate').get().status}]).length,1);
   }finally{db.close();}
 });
-test('full checkpoint export excludes foreign content but durably retains its evidence and ASR history',async()=>{
+test('checkpoint export retains observed content and ASR without lexical exclusions',async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'xhs-scope-regression-'));
   const db=openCheckpoint(path.join(root,'checkpoint.sqlite'));
   try{
@@ -123,12 +123,11 @@ test('full checkpoint export excludes foreign content but durably retains its ev
     db.prepare(`INSERT INTO asr_job(keyword,note_id,article_id,media_url,status,attempts,max_attempts,created_at,updated_at)
       VALUES(?,?,?,?,'retry_pending',2,3,'old','old')`).run(keyword,notes[1].noteId,notes[1].noteId,'https://example.invalid/video');
     auditExistingScope(db,keyword,{excludedEntities:['广州天河']});
-    assert.equal(claimAsrJob(db),null);assert.equal(asrJobStats(db).pendingTotal,0);
+    assert.equal(asrJobStats(db).pendingTotal,1);
     assert.equal(db.prepare('SELECT attempts FROM asr_job').get().attempts,2);
     const exported=await exportCheckpoint(db,path.join(root,'out'),{targetYear:2026,cutoff:'2026-01-01'});
-    assert.equal(exported.posts.length,1);assert.equal(exported.posts[0]['文章id'],notes[0].noteId);
-    const excluded=JSON.parse((await fs.readFile(path.join(root,'out/excluded_scope_records.jsonl'),'utf8')).trim());
-    assert.equal(excluded.result.post['文章id'],notes[1].noteId);
+    assert.equal(exported.posts.length,2);assert.equal(exported.posts[0]['文章id'],notes[0].noteId);
+    assert.equal((await fs.readFile(path.join(root,'out/excluded_scope_records.jsonl'),'utf8')).trim(),'');
     assert.equal((await fs.readFile(path.join(root,'out/scope_audit.jsonl'),'utf8')).trim().split('\n').length,2);
   }finally{
     db.close();
@@ -139,13 +138,13 @@ test('full checkpoint export excludes foreign content but durably retains its ev
 test('crawler and worker cannot use legacy year windows or no-change to bypass the new gates',async()=>{
   const source=await fs.readFile(new URL('./index.mjs',import.meta.url),'utf8');
   assert.doesNotMatch(source,/progress\.reason = "year_window"/);
-  assert.match(source,/if\(boundary\.reached\)progress\.oldDateWindowObserved=true/);
+  assert.match(source,/await consumeSearchCandidates\(source,/);
   assert.match(source,/process\.env\.XHS_ASR_CPU_THREADS/);
   assert.match(source,/processNote\(note, false, true\)/);
   assert.doesNotMatch(source,/visited\.has/);
   assert.match(source,/const remaining = incompleteCandidates\(attachScopeAudits\(checkpoint,checkpointCandidates\(checkpoint,task.keyword\),task.keyword\),\{keyword:task.keyword\}\);/);
   assert.match(source,/await detail\.goto\(note.url,[\s\S]*?await ensureLogin\(detail\)/);
-  assert.match(source,/if\(recoverSaved\)\{detailDiagnostics\?\.dispose\(\);pageDiagnosticContexts\.delete\(detail\);await detail\.close\(\)/);
+  assert.match(source,/if\(recoverSaved\)\{[^}]*?await detail\.close\(\)/);
   const worker=await fs.readFile(new URL('./run-worker.mjs',import.meta.url),'utf8');
   assert.match(worker,/collector\.searchAcceptance\?\.ok===true&&coverage\.ok===true/);
   assert.doesNotMatch(worker,/if\(noChange&&acceptanceVerified\)/);

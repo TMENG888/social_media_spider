@@ -119,6 +119,7 @@ export async function applyVolumeDecision(queue,snapshot,decision,{generation,to
  const {checkedAt:ignored,...actual}=decision;
  if(!isDeepStrictEqual(actual,expected))throw new Error('VOLUME_DECISION_INVALID');
  if(decision.action==='requires_policy_choice')return {status:'requires_policy_choice',changed:false};
+ if(decision.action==='complete_by_volume')return {status:'quantity_completion_disabled',changed:false,acceptedByVolume:false};
  if(!commit)return {status:'preview',changed:false,decision};
  const keys=[...queue.keys,queue.namespace+':volume-policy-history',queue.namespace+':volume-attempt-baseline',queue.namespace+':recollection-once',queue.namespace+':recollection-history'];
  const evidence={...decision,checkedAtMs:Date.parse(checkedAt)};

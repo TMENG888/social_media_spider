@@ -1,3 +1,4 @@
+import {frontendClosed} from './foreground-budget.mjs';
 import {createHash} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import mysql from 'mysql2/promise';
@@ -13,7 +14,7 @@ const contentFields=['文章链接','文章标题','文章内容','文章视频�
 export function usableResult(note,{strictMedia=false}={}){
  const r=note.result,p=r?.post,a=r?.postTextAudit||{};
  if(note.status!=='completed'||!p?.文章id||String(p.文章id)!==String(note.noteId)||!p.文章链接||!p.项目)return false;
- if(!String(p.文章标题||p.文章内容||'').trim()||r.audit?.commentsComplete===false)return false;
+ if(!String(p.文章标题||p.文章内容||'').trim()||(r.audit?.commentsComplete===false&&!frontendClosed(r)))return false;
  if(p.内容类型==='视频'){
   if(strictMedia&&!(r.mediaProvenance?.identityVerified===true&&r.mediaProvenance.version==='20261015-note-bound-media-v1'))return false;
   if(!['extracted','no_speech'].includes(a.subtitle_status))return false;
@@ -44,7 +45,7 @@ export function assessCoverage(notes,{scanComplete=false,verifiedIds=[],year=202
   excludedWithScopeEvidence:scopeExcluded.length,scopeExclusions:scopeExcluded,scopeExclusionsDigest:hash(scopeExcluded),
   unverifiedScopeExclusions:eligible.filter(n=>n.status==='skipped_irrelevant').length,
   uncertainRelevanceCount:eligible.filter(n=>!observedScopeRelevance(n,keyword)).length,
-  unresolved:denominator-numerator,ratio:denominator?numerator/denominator:null,
+  foregroundTimedOut:eligible.filter(n=>frontendClosed(n.result)||n.status==='front_timeout').length,unresolved:denominator-numerator,ratio:denominator?numerator/denominator:null,
   emptyScope:denominator===0,discoveredDigest:hash(eligible.map(n=>n.noteId).sort()),usableDigest:hash(usable.map(n=>n.noteId).sort()),
   reason:!scanComplete?'SEARCH_END_UNVERIFIED':ok?'COVERAGE_ACCEPTED':'USABLE_DB_COVERAGE_BELOW_80'};
 }

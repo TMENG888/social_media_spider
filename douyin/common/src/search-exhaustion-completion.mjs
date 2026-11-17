@@ -12,9 +12,9 @@ const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('h
 const reject=reason=>({ok:false,policy:SEARCH_EXHAUSTION_POLICY,reason});
 
 export function assessSearchExhaustion(decision,task,record,{now=Date.now(),sqlNow=now}={}){
- if(decision?.platform!=='抖音'||decision.dbReadbackVerified!==true||decision.ok!==false
-  ||decision.reason!=='VOLUME_BELOW_THRESHOLD'||!Number.isSafeInteger(decision.posts)||decision.posts<0
-  ||!Number.isSafeInteger(decision.threshold)||decision.threshold<1||decision.posts>=decision.threshold)
+ if(decision?.platform!=='抖音'||decision.dbReadbackVerified!==true
+  ||!Number.isSafeInteger(decision.posts)||decision.posts<0
+  ||!Number.isSafeInteger(decision.threshold)||decision.threshold<1)
   return reject('SEARCH_CLOSURE_SQL_INVALID');
  const checkedAtMs=Date.parse(decision.checkedAt);
  if(!Number.isFinite(checkedAtMs)||sqlNow-checkedAtMs>60000||checkedAtMs>sqlNow+1000)return reject('SEARCH_CLOSURE_SQL_STALE');
@@ -71,7 +71,7 @@ local e,d,record=cjson.decode(ARGV[5]),cjson.decode(ARGV[6]),cjson.decode(ARGV[7
 local time=redis.call('TIME');local now=tonumber(time[1])*1000+math.floor(tonumber(time[2])/1000)
 if e.policy~='${SEARCH_EXHAUSTION_POLICY}' or e.ok~=true or e.taskId~=id or e.snapshotId~=snapshot_id
  or e.keyword~=d.keyword or e.projectName~=d.projectName or e.posts~=d.posts or e.threshold~=d.threshold
- or d.dbReadbackVerified~=true or d.posts>=d.threshold or e.quantityAccepted~=false
+ or d.dbReadbackVerified~=true or e.quantityAccepted~=false
  then
  return redis.error_reply('SEARCH_CLOSURE_EVIDENCE_INVALID') end
 ${evidenceTimeGuardLua('SEARCH_CLOSURE','e.checkedAtMs')}

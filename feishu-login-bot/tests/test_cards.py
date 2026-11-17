@@ -9,7 +9,8 @@ rows=[[{'tag':'text','text':'请在手机扫码'}],[{'tag':'img','image_key':'te
 for phase in ['waiting_scan','manual_captcha','waiting_sms','sms_send_unconfirmed']:
  c=notice_content('work03 · 抖音',rows,phase)
  assert c['header']['template']=='orange'
- assert c['elements'][1]['img_key']=='test_image'
+ image=c['elements'][1]['columns'][0]['elements'][0]
+ assert image['img_key']=='test_image' and image['preview'] is True
 for phase in ['verified','resumed']:
  assert notice_content('work03 · 抖音',rows,phase)['header']['template']=='green'
 old=notice_content('work03 · 抖音',rows,'cancelled','post')

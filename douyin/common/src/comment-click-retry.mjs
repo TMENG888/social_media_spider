@@ -1,9 +1,9 @@
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import {waitForPacing} from './collection-pacing.mjs';
 
-export const COMMENT_CLICK_RETRY_DELAYS_MS=Object.freeze([10000,20000,40000]);
+export const COMMENT_CLICK_RETRY_DELAYS_MS=Object.freeze([30000,60000,120000]);
 export function retryableCommentClick(error){
-  return !/STOP_|LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|LEASE_LOST/.test(String(error?.message))
+  return !/STOP_|LOGIN_REQUIRED|SECURITY_CHALLENGE|PLATFORM_RESTRICTION|LEASE_LOST/.test(String(error?.code||'')+' '+String(error?.message))
     && (error?.name==='TimeoutError'||/Timeout \d+ms exceeded|element.*detached|Element is not attached/i.test(String(error?.message)));
 }
 
@@ -12,7 +12,7 @@ export function retryableCommentClick(error){
 export async function clickCommentExpansionWithRetry({findControl,check,flush=async()=>{},onFailure=async()=>{},
   retryDelaysMs=COMMENT_CLICK_RETRY_DELAYS_MS,timeoutMs=10000,
   wait=ms=>waitForPacing(ms,{shouldStop:async()=>{await check();return false;}})}){
-  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>3||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>60000))throw new Error('COMMENT_CLICK_RETRY_BUDGET_INVALID');
+  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>3||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>120000))throw new Error('COMMENT_CLICK_RETRY_BUDGET_INVALID');
   const audit={maxRetries:retryDelaysMs.length,attempts:[]};
   for(let attempt=0;attempt<=retryDelaysMs.length;attempt++){
     await check();await flush();

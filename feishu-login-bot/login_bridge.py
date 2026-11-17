@@ -21,25 +21,47 @@ ACTIVE = {'sms_requesting','sms_send_failed','sms_send_unconfirmed','waiting_sms
 TERMINAL = {'verified','cancelled'}
 LABELS = {'sms_requesting':'正在请求平台发送短信，尚未确认受理','sms_send_failed':'平台未确认接受本次短信发送，请检查验证页面','sms_send_unconfirmed':'未取得本次短信发送的成功响应，无法确认短信已发送','waiting_sms':'平台已确认受理本次短信发送，请查看绑定手机；实际送达以手机为准','sms_opening':'正在打开短信验证','sms_submitted':'短信验证码已提交，等待登录和原搜索核验','sms_rejected':'页面提示验证码错误或失效，请检查最新短信后重新提供','sms_expired':'短信验证等待已超时，请在该机器检查登录页面','sms_manual':'未确认短信发送结果，请在该机器检查验证页面，程序不会重复发送','opening':'正在打开登录页面','waiting_scan':'请扫码登录','qr_expired':'二维码过期，请刷新登录',
  'qr_unavailable':'尚未识别到可分享的二维码，请在该机器检查登录窗口',
- 'verifying':'正在核验账号和原检索词访问权限','manual_captcha':'需要在该机器完成人工验证码',
+ 'verifying':'正在核验账号和原检索词访问权限','manual_captcha':'需要在该机器浏览器完成页面安全验证',
  'manual_security':'出现安全限制，保留保护，不允许刷新解除','manual_gateway':'平台网关暂时异常',
  'unavailable':'登录会话暂不可用，保护保持原样','verified':'登录核验通过；采集恢复尚待确认',
  'cancelled':'登录窗口已关闭或恢复取消，未解除保护','resumed':'原监督器已启动后续 worker，并已进入关键词采集'}
 
-def notice_content(title, rows, phase, message_type='interactive'):
+def captcha_notice(s):
+    challenge=s.get('challenge') or {}
+    kind=challenge.get('type') if isinstance(challenge,dict) else None
+    action={
+        'slider':('需要处理滑块验证','请在该机器的浏览器手动拖动滑块完成验证。这不是手机短信验证码，无需在群里发送数字。'),
+        'rotation':('需要处理图片旋转验证','请在该机器的浏览器手动旋转图片完成验证。这不是手机短信验证码，无需在群里发送数字。'),
+        'click':('需要处理点选验证','请在该机器的浏览器按页面提示手动点选完成验证。这不是手机短信验证码，无需在群里发送数字。'),
+    }.get(kind,('需要页面安全验证','页面验证类型尚未识别，请在该机器浏览器查看并处理；仅在“请提供短信验证码”卡片下向机器人提交短信数字。'))
+    return kind if kind in {'slider','rotation','click'} else 'unknown',action[0],action[1]
+
+def notice_content(title, rows, phase, message_type='interactive', challenge_type=None):
     if message_type=='post':return {'zh_cn':{'title':title,'content':rows}}
     elements=[]
     for row in rows:
         for part in row:
             if part['tag']=='text':elements.append({'tag':'markdown','content':part['text']})
-            elif part['tag']=='img':elements.append({'tag':'img','img_key':part['image_key'],'alt':{'tag':'plain_text','content':'登录二维码'}})
+            elif part['tag']=='img':
+                image={'tag':'img','img_key':part['image_key'],'alt':{'tag':'plain_text','content':'登录二维码'},'mode':'fit_horizontal','preview':True}
+                elements.append({'tag':'column_set','flex_mode':'none','columns':[
+                    {'tag':'column','width':'weighted','weight':1,'elements':[image]},
+                    {'tag':'column','width':'weighted','weight':2,'elements':[]}]})
     color='green' if phase in {'verified','resumed'} else 'grey' if phase in {'cancelled','resolved'} else 'orange'
-    label={'waiting_scan':'请扫码登录','qr_expired':'二维码已过期','waiting_sms':'请提供短信验证码','sms_rejected':'请核对短信验证码','manual_captcha':'需要人工验证','manual_security':'需要检查安全限制','verified':'登录核验通过','resumed':'采集已恢复'}.get(phase)
+    label={'waiting_scan':'请扫码登录','qr_expired':'二维码已过期','waiting_sms':'请提供短信验证码','sms_rejected':'请核对短信验证码','manual_captcha':'需要页面安全验证','manual_security':'需要检查安全限制','verified':'登录核验通过','resumed':'采集已恢复'}.get(phase)
+    if phase=='manual_captcha':label=captcha_notice({'challenge':{'type':challenge_type}})[1]
     header_title=title+('｜'+label if label else '')
     return {'config':{'wide_screen_mode':True},'header':{'template':color,'title':{'tag':'plain_text','content':header_title}},'elements':elements}
 
-def read_json(p):
-    if p.stat().st_size > 65536:
+def edit_notice(lark, message_id, content, message_type):
+    if message_type=='interactive':
+        return lark.call(['im','messages','patch','--message-id',message_id,'--data','-','--as','bot'],
+                         stdin=json.dumps({'content':json.dumps(content,ensure_ascii=False)},ensure_ascii=False))
+    return lark.call(['im','+messages-edit','--message-id',message_id,'--msg-type',message_type,'--content','-','--as','bot'],
+                     stdin=json.dumps(content,ensure_ascii=False))
+
+def read_json(p, *, max_bytes=65536):
+    if p.stat().st_size > max_bytes:
         raise ValueError('oversized_state')
     return json.loads(p.read_text(encoding='utf-8-sig'))
 
@@ -63,14 +85,16 @@ def with_resume(root,s):
             and r.get('supervisor')==s.get('supervisor') and s.get('supervisor')
             and r.get('evidence')==('original_supervisor_content_imported' if s['platform']=='抖音' else 'original_supervisor_worker_entered_keyword')
             and s.get('verifiedAt',float('inf'))<=r['at']<=time.time()*1000
-            and time.time()*1000-r['at']<300000):
+            and time.time()*1000-r['at']<86400000):
             if s['platform']=='抖音':
                 # A claimed task is not progress, and an old receipt must not
                 # announce success after the same worker has hit a challenge.
                 run=read_json(root.parent.parent/'runs'/'worker_status.json')
                 sup=read_json(root.parent/'monitor-supervisor.json')
+                lock=read_json(root.parent/'worker.lock')
                 sup_at=datetime.fromisoformat(sup['updatedAt'].replace('Z','+00:00')).timestamp()*1000
-                if (run.get('status')!='running' or run.get('operationalHold') or run.get('fatalError')
+                if (lock.get('pid')!=r.get('workerPid') or sup.get('supervisorPid')!=s['supervisor'].get('pid')
+                    or run.get('status')!='running' or run.get('operationalHold') or run.get('fatalError')
                     or run.get('currentKeyword')!=r.get('keyword')
                     or not datetime.fromisoformat(run['startedAt'].replace('Z','+00:00')).timestamp()*1000<=r['at']
                     or sup.get('sessionId')!=s['supervisor']['sessionId'] or sup.get('state')!='collecting'
@@ -110,7 +134,9 @@ class LoginBridge:
         self.cache = Path(cache or cfg.get('login_cache_dir') or Path(cfg.get('runtime_dir',Path(__file__).parent/'runtime'))/'login-bridge')
         self.cache.mkdir(parents=True, exist_ok=True)
         self.state_file = self.cache/'delivery-state.json'
-        self.state = read_json(self.state_file) if self.state_file.exists() else {}
+        # Delivery history grows across sessions; retain it for message deduplication.
+        # Browser sessions and commands keep the stricter 64 KiB limit.
+        self.state = read_json(self.state_file, max_bytes=8_000_000) if self.state_file.exists() else {}
         self.reminder_file = self.cache/'qr-reminders.json'
         self.reminders = read_json(self.reminder_file) if self.reminder_file.exists() else {}
         self.observation_file = self.cache/'qr-observations.json'
@@ -162,6 +188,7 @@ class LoginBridge:
         # A QR version is one delivery regardless of automatic polling or the
         # human command that caused it. Both paths share the same persisted key.
         key=f"{self.cfg['chat_id']}:{s['sessionId']}:{category if image else (force_key or category)}"
+        challenge_type=captcha_notice(s)[0] if s['phase']=='manual_captcha' else None
         with self.lock:
             resume_target=None
             if s['phase']=='resumed':
@@ -173,17 +200,25 @@ class LoginBridge:
             item=self.state.get(key)
             if item and item.get('status')=='rejected_non_qr':
                 return None
-            if item and item.get('status')=='sent':
+            update_challenge=bool(item and item.get('status')=='sent' and s['phase']=='manual_captcha'
+                                  and (item.get('challengeType')!=challenge_type or s.get('platform')=='小红书' and bool(s.get('captchaRefresh'))!=bool(item.get('captchaRefreshPolicy'))))
+            if item and item.get('status')=='sent' and not update_challenge:
                 return item.get('message_id')
-            if item and time.time()-item['firstAttempt']>=3300:
+            if item and not update_challenge and time.time()-item['firstAttempt']>=3300:
                 # Never retry beyond Feishu's one-hour idempotency window.
                 raise RuntimeError('delivery_unconfirmed_requires_review')
-            if item and item.get('retryAt',0)>time.time():
+            if item and item.get('retryAt',0)>time.time() and (not update_challenge or item.get('challengeUpdatePending')):
                 raise RuntimeError('delivery_retry_backoff')
             if not item:
                 item={'status':'pending','firstAttempt':time.time(),'uuid':str(uuid.uuid5(uuid.NAMESPACE_URL,'crawler-login:'+key))}
             item['chat_id']=self.cfg['chat_id']
+            if image:item['loginTarget']={k:s[k] for k in ('machine','platform','workerId','sessionId')}
+            if image:item['qrGeneration']=s['generation']
+            if s['phase'] in {'waiting_sms','sms_rejected'}:
+                item['smsTarget']={k:s[k] for k in ('machine','platform','workerId','sessionId')}
+                item['smsTarget'].update(challengeId=s['sms']['challengeId'],attempts=s['sms'].get('attempts',0))
             if resume_target:item['resumeTarget']=resume_target
+            if update_challenge:item['challengeUpdatePending']=True
             item['retryAt']=time.time()+60
             self.state[key]=item
             atomic(self.state_file,self.state)
@@ -194,6 +229,12 @@ class LoginBridge:
             phone=account_config.get('phone','')
             if isinstance(phone,str) and re.fullmatch(r'1\d{10}',phone):title+=' · '+phone
             text=LABELS.get(s['phase'],s['phase'])
+            if s['phase']=='waiting_sms' and (s.get('smsRequest') or {}).get('source')=='visible_existing_sms_challenge':
+                tail=(s.get('smsRequest') or {}).get('phoneTail','')
+                text='小红书扫码后页面提示短信验证码已发送'+('至尾号'+tail+'的手机' if re.fullmatch(r'[0-9]{2,4}',str(tail)) else '')+'；请查看手机。程序未重复发送短信。'
+            if s['phase']=='manual_captcha':text=captcha_notice(s)[2]+'\n验证窗口保持打开，人工完成后由程序自动核验。'
+            if s['phase']=='manual_captcha' and s.get('platform')=='小红书' and s.get('captchaRefresh'):
+                text+='\n采集已暂停；依次等待15分钟、30分钟、1小时后，各刷新当前页面一次。人工提前完成则自动核验；三次后仍需验证则保留人工等待。短信输入、手机确认阶段不自动刷新。'
             if s['phase']=='verified' and not s.get('supervisor'):
                 text='登录核验通过；尚未确认采集启动'
             if s['phase']=='resumed':
@@ -202,15 +243,19 @@ class LoginBridge:
             if s['phase']=='qr_expired':
                 text+=f"\n请 {self.bot_mention} 刷新登录 {s['machine']} {s['platform']}"
             if s['phase'] in {'sms_send_failed','sms_send_unconfirmed','sms_expired'}:
-                text+=f"\n若未收到短信，请 {self.bot_mention} 重发验证码 {s['machine']} {s['platform']}。每次人工指令只尝试一次，至少间隔60秒。"
+                if (s.get('smsRequest') or {}).get('restartRequired') is True:
+                    text+=f"\n平台要求重新开始登录，请 {self.bot_mention} 刷新登录 {s['machine']} {s['platform']}，随后重新扫码；当前未确认短信发出，不要继续重发。"
+                else:
+                    text+=f"\n若未收到短信，请 {self.bot_mention} 重发验证码 {s['machine']} {s['platform']}。每次人工指令只尝试一次，至少间隔60秒。"
                 receipt=s.get('smsRequest') or {}
                 if receipt.get('httpStatus') is not None:
                     text+=f"\n平台响应 HTTP {receipt['httpStatus']}；业务状态 {receipt.get('platformCode','未识别')}。"
+                if receipt.get('platformMessage'):text+='\n平台提示：'+str(receipt['platformMessage'])
             if s['phase'] in {'waiting_sms','sms_rejected'}:
                 current=read_json(root/'session.json')
                 if not fresh(current) or current['sessionId']!=s['sessionId'] or current['phase']!=s['phase'] or current.get('sms')!=s.get('sms'):raise ValueError('sms_state_changed')
                 if (s.get('sms') or {}).get('expiresAt',0)<=time.time()*1000:raise ValueError('sms_expired')
-                text+=f"\n请 {self.bot_mention} 验证码 {s['machine']} {s['platform']} 加上短信中的数字验证码。\n验证码只用于本次登录；飞书群中原消息仍会保留。"
+                text+=f"\n请回复本卡片并 {self.bot_mention} 发送：验证码（手机收到的数字）。\n也可发送：验证码 {s['machine']} {s['platform']} 加上短信数字。\n验证码只用于本次登录；飞书群中原消息仍会保留。"
             if image:
                 captured=datetime.fromtimestamp(image['capturedAt']/1000,timezone(timedelta(hours=8)))
                 text+='\n二维码截图时间：'+captured.strftime('%Y-%m-%d %H:%M:%S')+'（北京时间）'
@@ -255,9 +300,17 @@ class LoginBridge:
                     after_scan=('扫码后核验通过，将按本次授权交回原采集监督器；安全限制和冷却保持原样。'
                                 if authorization.get('purpose')=='login_before_authorized_restart' else
                                 '扫码后仅恢复登录，采集仍暂停；安全限制及冷却保持原样。')
-                rows.append([{'tag':'text','text':f"过期请 {self.bot_mention} 刷新登录 {s['machine']} {s['platform']}\n{after_scan}"}])
+                rows.append([{'tag':'text','text':f"过期请直接回复本二维码卡片并发送：{self.bot_mention} 刷新\n也可发送：{self.bot_mention} 刷新登录 {s['machine']} {s['platform']}\n{after_scan}"}])
             message_type='interactive'
-            post=notice_content(title,rows,s['phase'])
+            post=notice_content(title,rows,s['phase'],challenge_type=challenge_type)
+            if update_challenge:
+                message_type=item.get('message_type','post')
+                content=notice_content(title,rows,s['phase'],message_type,challenge_type)
+                edit_notice(self.lark,item['message_id'],content,message_type)
+                item.update(challengeType=challenge_type,challengeUpdatedAt=time.time(),captchaRefreshPolicy=bool(s.get('captchaRefresh')))
+                item.pop('challengeUpdatePending',None)
+                atomic(self.state_file,self.state)
+                return item['message_id']
             verified_item=self.state.get(f"{self.cfg['chat_id']}:{s['sessionId']}:verified",{})
             if s['phase']=='resumed' and verified_item.get('status')=='sent' and verified_item.get('message_id'):
                 # Update the single success card when actual collection evidence
@@ -265,7 +318,7 @@ class LoginBridge:
                 message_id=verified_item['message_id']
                 message_type=verified_item.get('message_type','post')
                 post=notice_content(title,rows,s['phase'],message_type)
-                self.lark.call(['im','+messages-edit','--message-id',message_id,'--msg-type',message_type,'--content','-','--as','bot'],stdin=json.dumps(post,ensure_ascii=False))
+                edit_notice(self.lark,message_id,post,message_type)
                 item.update(status='sent',message_id=message_id,message_type=message_type,sentAt=time.time(),editedVerified=True)
                 atomic(self.state_file,self.state)
                 return message_id
@@ -274,6 +327,9 @@ class LoginBridge:
             if not message_id:
                 raise ValueError('message_delivery_not_confirmed')
             item.update(status='sent',message_id=message_id,message_type=message_type,sentAt=time.time())
+            if challenge_type is not None:
+                item['challengeType']=challenge_type
+                item['captchaRefreshPolicy']=bool(s.get('captchaRefresh'))
             atomic(self.state_file,self.state)
             return message_id
 
@@ -383,7 +439,7 @@ class LoginBridge:
             text='此后已于'+captured.strftime('%H:%M:%S')+'生成并另发二维码，先前的加载等待已结束。登录请以最新二维码消息为准；这条提醒已解除。'
             message_type=item.get('message_type','post')
             post=notice_content(title,[[{'tag':'text','text':text}]],'resolved',message_type)
-            self.lark.call(['im','+messages-edit','--message-id',item['message_id'],'--msg-type',message_type,'--content','-','--as','bot'],stdin=json.dumps(post,ensure_ascii=False))
+            edit_notice(self.lark,item['message_id'],post,message_type)
             item.update(resolvedAt=time.time(),resolvedBy=qr_message_id);atomic(self.state_file,self.state)
 
     def _invalidate_closed_qr(self, s):
@@ -402,7 +458,7 @@ class LoginBridge:
                 text='此登录会话已结束，原二维码不再使用，请勿继续扫码。需要登录时，请以该机器、该平台当前会话的新二维码为准。'
                 message_type=item.get('message_type','post')
                 post=notice_content(title,[[{'tag':'text','text':text}]],'cancelled',message_type)
-                self.lark.call(['im','+messages-edit','--message-id',item['message_id'],'--msg-type',message_type,'--content','-','--as','bot'],stdin=json.dumps(post,ensure_ascii=False))
+                edit_notice(self.lark,item['message_id'],post,message_type)
                 item['invalidatedAt']=time.time();atomic(self.state_file,self.state)
 
     def poll_once(self, machine, sessions=None):
@@ -461,10 +517,13 @@ class LoginBridge:
                     command=f"{self.bot_mention} 刷新登录 {machine} {s['platform']}"
                     if phase in {'waiting_scan','qr_expired'}:
                         action='扫码登录：请使用该节点最新二维码；过期可 '+command
-                    elif phase=='manual_captcha':action='人工验证码：请在该机器的验证页面完成处理'
+                    elif phase=='manual_captcha':action=captcha_notice(s)[1]+'：请在该机器浏览器处理'
                     elif phase=='manual_security':action='安全限制：保留保护，需人工查看该机器页面；不可通过刷新解除'
                     elif phase in {'sms_send_failed','sms_send_unconfirmed','sms_manual','sms_expired'}:
-                        action=f"短信验证：未确认可用短信；需要发送时请 {self.bot_mention} 重发验证码 {machine} {s['platform']}"
+                        if (s.get('smsRequest') or {}).get('restartRequired') is True:
+                            action=f"短信验证：平台要求重新开始登录，请 {self.bot_mention} 刷新登录 {machine} {s['platform']}，随后重新扫码"
+                        else:
+                            action=f"短信验证：未确认可用短信；需要发送时请 {self.bot_mention} 重发验证码 {machine} {s['platform']}"
                     elif phase in {'waiting_sms','sms_rejected'}:
                         if (s.get('smsRequest') or {}).get('accepted') is True:
                             action=f"短信验证：等待人工提供手机收到的验证码，请 {self.bot_mention} 验证码 {machine} {s['platform']} 加上短信数字"
@@ -537,50 +596,90 @@ class LoginBridge:
         t=threading.Thread(target=publish_loop,name='login-notify-ordered',daemon=True)
         t.start();self.threads.append(t)
 
+    def _reply_qr_card(self,event):
+        # Bind to an actual delivered QR card; thread/root IDs are not targets.
+        parent=event.get('parent_id') or event.get('reply_to')
+        if event.get('parent_id') and event.get('reply_to') and event['parent_id']!=event['reply_to']:return None
+        if not isinstance(parent,str) or not parent:return None
+        with self.lock:
+            items=[(k,dict(v)) for k,v in self.state.items()
+                   if v.get('message_id')==parent and v.get('status')=='sent' and v.get('chat_id')==self.cfg['chat_id']]
+        matches=[]
+        for key,item in items:
+            fields=key.split(':')
+            if len(fields)!=4 or fields[0]!=self.cfg['chat_id'] or fields[2]!='qr':continue
+            try:
+                if str(uuid.UUID(fields[1]))!=fields[1]:continue
+                generation=int(fields[3])
+            except (ValueError,TypeError):continue
+            if generation<1 or str(generation)!=fields[3]:continue
+            meta=item.get('loginTarget')
+            if meta is not None and (not isinstance(meta,dict) or meta.get('sessionId')!=fields[1]
+                or meta.get('machine') not in self.roots or meta.get('platform') not in {'小红书','抖音'}
+                or not re.fullmatch(r'worker-0[1-5]',str(meta.get('workerId','')))):continue
+            if item.get('qrGeneration',generation)!=generation:continue
+            matches.append({'sessionId':fields[1],'generation':generation,'target':meta})
+        return matches[0] if len(matches)==1 else None
+
+    def _reply_qr_matches(self,s,binding):
+        meta=binding.get('target')
+        return (fresh(s) and s.get('phase') in {'waiting_scan','qr_expired'}
+                and s.get('sessionId')==binding['sessionId'] and s.get('generation')==binding['generation']
+                and (not meta or all(meta.get(k)==s.get(k) for k in ('machine','platform','workerId','sessionId'))))
+
     def handle(self, question, event):
-        match=PATTERN.fullmatch(question.strip())
-        if not match:
-            if question.strip().startswith(('刷新登录','登录截图','登录状态')):
-                return f'请在 @本机器人 后填写机器和平台，例如：{self.bot_mention} 刷新登录 work01 小红书（也支持“登录截图”“登录状态”）。程序自动匹配对应登录节点，无需填写 worker 编号。'
+        text=question.strip();match=PATTERN.fullmatch(text);short=text in {'刷新','刷新登录'}
+        if not match and not short:
+            if text.startswith(('刷新登录','登录截图','登录状态')):
+                return f'请填写机器和平台，例如：{self.bot_mention} 刷新登录 work01 小红书；也可直接回复当前二维码卡片并发送：{self.bot_mention} 刷新。'
             return None
-        verb,machine,platform,worker=match.groups();machine=machine.lower()
-        # A command must be recent human input in the configured group, even on retry.
         if (event.get('sender_type')!='user' or event.get('chat_id')!=self.cfg['chat_id']
             or not any(m.get('id')==self.cfg['bot_open_id'] for m in event.get('mentions',[]))):
             return '仅接受本群人工 @本机器人的直接指令。'
         created=float(event.get('create_time',0));created=created/1000 if created>1e11 else created
         if not -5<=time.time()-created<=120:
             return '这条登录指令已过期，请重新 @本机器人发送。'
-        # UNC I/O can stall per machine. Bound the group command's response time;
-        # one existing worker per machine prevents unbounded blocked threads.
-        result=[]
-        def execute():
-            try:
-                result.append(self._command(verb,machine,platform,worker,event,deadline=command_deadline))
-            except Exception as e:
-                LOG.warning('login_command_failed machine=%s error=%s',machine,type(e).__name__)
-                result.append('登录控制未确认成功，请检查目标机器网络或登录窗口；保护保持原样。')
-        target_lock=self.target_lock(machine,platform)
+        binding=self._reply_qr_card(event) if short else None
+        if short and not binding:
+            return f'请直接回复本机器人在当前群发送的二维码卡片，再发送：{self.bot_mention} 刷新。短信及页面安全验证卡片不能用于刷新二维码。'
+        result=[];command_deadline=time.monotonic()+55
         def wrapped():
-            # Passive polling and image delivery briefly own the same node.
-            # Queue the human request instead of rejecting that normal overlap.
-            if not target_lock.acquire(timeout=12):
-                result.append('该平台的上一条登录操作仍未结束，本次未重复刷新；请查询登录状态。');return
-            try:execute()
-            finally:target_lock.release()
-        command_deadline=time.monotonic()+55
+            try:
+                if short:
+                    meta=binding.get('target');machines=[meta['machine']] if meta else list(self.roots)
+                    matches=[]
+                    for machine in machines:
+                        if self.stop.is_set() or time.monotonic()>=command_deadline:
+                            result.append('二维码目标核验未完成，本次未刷新；请稍后查询登录状态。');return
+                        try:
+                            matches.extend((r,s) for r,s in self.sessions(machine) if self._reply_qr_matches(s,binding))
+                        except OSError:continue
+                    if len(matches)!=1:
+                        result.append('该二维码卡片已失效、已换新，或当前已登录／正在验证；本次未刷新。请回复最新有效的二维码卡片。');return
+                    _,s=matches[0];verb,machine,platform,worker='刷新登录',s['machine'],s['platform'],s['workerId']
+                else:verb,machine,platform,worker=match.groups();machine=machine.lower()
+                target_lock=self.target_lock(machine,platform)
+                if not target_lock.acquire(timeout=12):
+                    result.append('该平台的上一条登录操作仍未结束，本次未重复刷新；请查询登录状态。');return
+                try:
+                    result.append(self._command(verb,machine,platform,worker,event,deadline=command_deadline,expected_reply=binding))
+                finally:target_lock.release()
+            except Exception as e:
+                LOG.warning('login_command_failed error=%s',type(e).__name__)
+                result.append('登录控制未确认成功，请检查目标机器网络或登录窗口；保护保持原样。')
         threading.Thread(target=wrapped,daemon=True).start()
         deadline=time.monotonic()+58
-        while not result and time.monotonic()<deadline and not self.stop.wait(.2):
-            pass
+        while not result and time.monotonic()<deadline and not self.stop.wait(.2):pass
         return result[0] if result else '目标机器响应超时，执行结果尚未确认；请用“登录状态”查询，勿连续刷新。'
 
-    def _command(self, verb, machine, platform, worker, event, deadline=None):
+    def _command(self, verb, machine, platform, worker, event, deadline=None, expected_reply=None):
         sessions=[(r,s) for r,s in self.sessions(machine) if s['platform']==platform and (not worker or s['workerId']==worker)
                   and ((fresh(s) and s['phase'] in ACTIVE) or (verb=='登录状态' and s['phase'] in TERMINAL))]
         if len(sessions)!=1:
             return ('找到多个登录会话，请补全 worker 编号。' if len(sessions)>1 else '没有找到该目标的活跃登录恢复会话。不会另开采集浏览器或重启任务。')
         root,s=sessions[0]
+        if expected_reply and not self._reply_qr_matches(s,expected_reply):
+            return '该卡片已不对应当前待扫码页面，本次未刷新。请回复最新二维码卡片。'
         if self.stop.is_set() or (deadline is not None and time.monotonic()>=deadline):
             return '登录请求等待过久已取消，请重新发送。'
         if verb=='登录状态':
@@ -600,7 +699,12 @@ class LoginBridge:
         if pending:
             if existing.get('action')=='refresh' and verb=='刷新登录':cid=existing['commandId']
             else:return '该平台正在完成上一项登录验证，未覆盖原请求或重复刷新。'
-        else:atomic(root/'command.json',cmd)
+        else:
+            if expected_reply:
+                latest=read_json(root/'session.json')
+                if not self._reply_qr_matches(latest,expected_reply):
+                    return '登录阶段或二维码已变化，本次未刷新；请回复最新二维码卡片。'
+            atomic(root/'command.json',cmd)
         end=time.monotonic()+38
         while not self.stop.wait(.5) and time.monotonic()<end:
             current=read_json(root/'session.json')
@@ -612,7 +716,7 @@ class LoginBridge:
             if not ack.get('ok') and ack.get('reason')=='SCAN_CONFIRMATION_PENDING':
                 return '当前已扫码，正在等待手机确认；请先在手机完成确认，未刷新页面或发送二维码。'
             if not ack.get('ok'):
-                return '未确认二维码刷新成功：'+str(ack.get('reason','未通过核验'))+'。登录与停止保护未解除。'
+                return '二维码刷新尚未确认。页面可能仍在加载，请稍后发送“刷新登录 '+machine+' '+platform+'”；已扫码时请先完成手机确认。'
             if not self._send(root,current,force_key=cid):
                 return '当前截图未通过二维码校验，未发送；若已扫码，请先在手机完成确认。'
             return f"{machine} {platform}：二维码已发到群内，请扫码。"

@@ -1,10 +1,11 @@
+import {probeRedisNetwork,NETWORK_RETRY_VERSION} from './redis-network-status.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-export const CONTROL_RETRY_VERSION='control-backoff-20261105-v2';
-export const CONTROL_RETRY_DELAYS_MS=Object.freeze([5000,10000,20000]);
-export const CONTROL_RETRY_TIMEOUT_MS=90000;
+export const CONTROL_RETRY_VERSION='control-network-backoff-20261113-v5';
+export const CONTROL_RETRY_DELAYS_MS=Object.freeze([30000,60000,120000]);
+export const CONTROL_RETRY_TIMEOUT_MS=270000;
 export function transientControlError(error){
   if(['ECONNRESET','ECONNREFUSED','EPIPE','ETIMEDOUT','ENETUNREACH','EHOSTUNREACH','REDIS_TIMEOUT'].includes(error?.code))return true;
   if(['ClientClosedError','SocketClosedUnexpectedlyError','ConnectionTimeoutError','DisconnectsClientError','ClientOfflineError'].includes(error?.constructor?.name))return true;
@@ -26,9 +27,9 @@ async function record(owner,event){
 export async function readControlWithReconnect(...args){return timed('control_channel_read',()=>readControlWithReconnectDetailedImpl(...args),{});}
 async function readControlWithReconnectDetailedImpl(owner,read,connect,options={}){
   const {retryDelaysMs=CONTROL_RETRY_DELAYS_MS,timeoutMs=CONTROL_RETRY_TIMEOUT_MS,
-    sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),now=Date.now,onDiagnostic=event=>record(owner,event)}=options;
-  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>3||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>30000)
-    ||!Number.isFinite(timeoutMs)||timeoutMs<=0||timeoutMs>90000)throw new Error('CONTROL_RETRY_BUDGET_INVALID');
+    sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),now=Date.now,onDiagnostic=event=>record(owner,event),networkProbe=probeRedisNetwork}=options;
+  if(!Array.isArray(retryDelaysMs)||retryDelaysMs.length>3||retryDelaysMs.some(ms=>!Number.isFinite(ms)||ms<0||ms>120000)
+    ||!Number.isFinite(timeoutMs)||timeoutMs<=0||timeoutMs>270000)throw new Error('CONTROL_RETRY_BUDGET_INVALID');
   const started=now(),until=started+timeoutMs;let expired=false,timer,pendingClient=null;
   const timeout=()=>Object.assign(new Error('CONTROL_TIMEOUT'),{code:'ETIMEDOUT'});
   const check=()=>{
@@ -46,14 +47,26 @@ async function readControlWithReconnectDetailedImpl(owner,read,connect,options={
   const deadline=new Promise((_,reject)=>{timer=setTimeout(()=>{
     expired=true;close(owner.client);close(pendingClient);reject(timeout());
   },timeoutMs);});
+  const ensureNetwork=async(attempt,phase)=>{
+  const network=await networkProbe(owner.ctx?.settings);check();
+  await emit('network_precheck',null,{attempt,phase,networkState:network.state,networkReason:network.reason,networkVersion:NETWORK_RETRY_VERSION});
+  if(network.state==='offline'){
+    close(owner.client);close(pendingClient);
+    await emit('network_wait_required',null,{attempt,phase,networkReason:network.reason});
+    throw Object.assign(new Error('CONTROL_NETWORK_UNAVAILABLE'),{code:'CONTROL_NETWORK_UNAVAILABLE'});
+  }
+  };
   const operation=async()=>{
     let failure;
     for(let attempt=0;attempt<=retryDelaysMs.length;attempt++){
       check();
+      if(attempt||!owner.client)await ensureNetwork(attempt,'before_wait');
       if(attempt){
         await emit('retry_scheduled',failure,{attempt,delayMs:retryDelaysMs[attempt-1]});
         close(owner.client);
         await timed('control_retry_wait',()=>wait(retryDelaysMs[attempt-1]),{attempt,plannedMs:retryDelaysMs[attempt-1],reason:'control_reconnect'});
+        // Connectivity can change during backoff; check again before connect.
+        await ensureNetwork(attempt,'before_connect');
       }
       try{
         if(attempt||!owner.client){

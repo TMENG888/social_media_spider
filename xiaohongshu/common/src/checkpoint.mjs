@@ -1,3 +1,4 @@
+import {publishOpsState} from './ops-state.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -495,8 +496,14 @@ async function exportCheckpointDetailedImpl(db, outputDir, extra = {}) {
   const excluded=db.prepare("SELECT keyword,note_id AS noteId,result_json FROM candidate WHERE status='skipped_irrelevant' ORDER BY keyword,note_id").all()
     .map(({result_json,...row})=>({...row,result:JSON.parse(result_json||'null')}));
   await atomicWrite(path.join(outputDir,'excluded_scope_records.jsonl'),excluded.map(JSON.stringify).join('\n')+(excluded.length?'\n':''));
+  const textlessReviews=db.prepare("SELECT keyword,note_id,result_json FROM candidate WHERE status='textless_review' ORDER BY keyword,candidate_index,note_id")
+    .all().map(row=>({keyword:row.keyword,noteId:row.note_id,result:JSON.parse(row.result_json)}));
+  await atomicWrite(path.join(outputDir,'textless_review_records.jsonl'),textlessReviews.map(JSON.stringify).join('\n')+(textlessReviews.length?'\n':''));
+
   const summary = { posts: posts.length, commentThreads: comments.length, checkpointedNotes: results.length, exportedAt: now(), ...extra,
-    deadLetterNotes:deadLetters.length,collectionCompleteness:deadLetters.length?'has_dead_letters':'no_dead_letters' };
+    deadLetterNotes:deadLetters.length,textlessReviewNotes:textlessReviews.length,
+    requiresHumanReview:extra.requiresHumanReview===true||textlessReviews.length>0,
+    collectionCompleteness:deadLetters.length?'has_dead_letters':textlessReviews.length?'has_textless_reviews':'no_dead_letters' };
   await atomicWrite(path.join(outputDir, "run_summary.json"), JSON.stringify(summary, null, 2));
   return { posts, comments, audits, postTextAudits, commentThreadAudits, summary };
 }
@@ -504,4 +511,5 @@ async function exportCheckpointDetailedImpl(db, outputDir, extra = {}) {
 export async function writeJsonAtomic(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   await atomicWrite(file, JSON.stringify(value, null, 2));
+  publishOpsState(file,value);
 }

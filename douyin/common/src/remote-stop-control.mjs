@@ -7,6 +7,7 @@ import {randomUUID} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {createClient} from 'redis';
 import {redisSettings} from './redis-connection.mjs';
+import {markControlFailure} from './remote-control-recovery.mjs';
 
 export function targetKey(computer,worker) {
   computer=String(computer||'').trim().toUpperCase();
@@ -77,6 +78,7 @@ export class RemoteStopControl {
   static async open(commonRoot,workerRoot){const ctx=await controlContext(commonRoot,workerRoot);const control=new RemoteStopControl(ctx,null);await readControlWithReconnect(control,client=>controlCommand(client,ctx,'HGET','stop-requests',[ctx.target]),connectControl);return control;}
   get receiptFile(){return path.join(this.ctx.workerRoot,'.state','remote-stop-receipt.json');}
   async flags(request) {
+    if(request.reason==='REMOTE_CONTROL_UNAVAILABLE'&&!request.commandId)return markControlFailure(this.ctx);
     const state=path.join(this.ctx.workerRoot,'.state');await fs.mkdir(state,{recursive:true});
     // Supervisor first; no future cycle may clear the collector stop flag.
     for(const name of ['supervisor.stop','stop.requested'])await atomicJson(path.join(state,name),{source:'redis_remote_control',...request});

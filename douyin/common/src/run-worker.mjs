@@ -1,4 +1,8 @@
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
+import {CollectionCyclePause,pausePlaywright} from './collection-cycle-pause.mjs';
+import {KeywordCycleBudget} from './keyword-cycle-budget.mjs';
+import {assertAccess} from './douyin-browser.mjs';
+import {validateInPlaceResume} from './in-place-resume.mjs';
 import {observeAccountNickname} from './account-nickname.mjs';
 import {noteTaskResumed} from './login-bridge.mjs';
 import fs from 'node:fs/promises';
@@ -15,6 +19,7 @@ import {loadTaskManifest} from './redis-task-manifest.mjs';
 import {mysqlConnectionOptions,verifyTable} from './import-mysql.mjs';
 import {POST_FIELDS,COMMENT_FIELDS,stableId} from './schema.mjs';
 import {writeJsonAtomic} from './checkpoint.mjs';
+import {WorkerStatusPublisher,WORKER_STATUS_WRITE_VERSION} from './worker-status-publisher.mjs';
 import {authorPhase} from './author-phase.mjs';
 import {keywordPause,waitForPacing} from './collection-pacing.mjs';
 import {collectionFailureAction} from './recovery-policy.mjs';
@@ -26,6 +31,8 @@ import {keywordQueueConfirmed as volumeQueueConfirmed,reconcileVolumeCompletion}
 import {OperationalGate,classifyRestriction} from './operational-gate.mjs';
 import {setAccessIncidentReporter} from './douyin-browser.mjs';
 import {installWorkerDiagnostics} from './worker-diagnostics.mjs';
+const beijingClock=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+const formatBeijingTime=value=>`${beijingClock.format(new Date(value))}（北京时间 UTC+08:00）`;
 const common=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const args={};for(let i=2;i<process.argv.length;i++){if(!process.argv[i].startsWith('--'))continue;const k=process.argv[i].slice(2),v=process.argv[i+1];args[k]=v&&!v.startsWith('--')?process.argv[++i]:true;}
 const worker=path.resolve(String(args['worker-root']||path.join(common,'../worker-01')));
@@ -60,14 +67,19 @@ const runtimeMinutes=Number(args['max-runtime-minutes']??60);
 if(!Number.isFinite(runtimeMinutes)||runtimeMinutes<0)throw new Error('MAX_RUNTIME_INVALID');
 const deadline=runtimeMinutes===0?Infinity:Date.now()+runtimeMinutes*60000;
 let requested=false,dispatcher=null,context=null,fatal=null,retryAfterRest=false;
-let remoteControl=null,operations=null;
-const shouldStop=async()=>{if(requested){timingStop('worker_stop_flag');return true;}if(Date.now()>=deadline){timingStop('runtime_deadline',{deadlineAtMs:deadline});return true;}if(await exists(stopFile)){timingStop('stop_file');return true;}return false;};
+let remoteControl=null,operations=null,collectionPause=null;
+// Only a managed production posts worker keeps its browser through round rests.
+// Tests, explicit single runs and the author phase retain their exit deadline.
+const inPlaceRest=!test&&!verificationSample&&!args['no-inplace-rest']&&phase!=='authors'&&runtimeMinutes>0&&Boolean(process.env.MONITOR_WORKER_ROOT);
+const collectionShouldStop=async()=>{await collectionPause?.beforeAction();return shouldStop();};
+const shouldStop=async()=>{if(requested){timingStop('worker_stop_flag');return true;}if(!inPlaceRest&&Date.now()>=deadline){timingStop('runtime_deadline',{deadlineAtMs:deadline});return true;}if(await exists(stopFile)){timingStop('stop_file');return true;}return false;};
 process.on('SIGINT',()=>{timingStop('os_signal');requested=true;});process.on('SIGTERM',()=>{timingStop('os_signal');requested=true;});
 const lockFile=path.join(stateRoot,'worker.lock');let lock;
 try{lock=await fs.open(lockFile,'wx');await lock.writeFile(JSON.stringify({pid:process.pid,at:new Date().toISOString()}));}
 catch(e){if(e.code!=='EEXIST')throw e;let old;try{old=await readJson(lockFile);}catch{}let alive=false;if(old?.pid){try{process.kill(old.pid,0);alive=true;}catch{}}
  if(alive)throw new Error('WORKER_ALREADY_RUNNING：同一节点禁止重复启动');await fs.rm(lockFile,{force:true});lock=await fs.open(lockFile,'wx');await lock.writeFile(JSON.stringify({pid:process.pid}));}
-const status={codeVersion:"finalize-cluster-fixes-20261105-v3",workerId,startedAt:new Date().toISOString(),phase,tasks:[],completed:0,failed:0,status:'running',fatalError:null};
+const status={codeVersion:"douyin-inplace-cycle-pause-20261107-v1",statusWriterVersion:WORKER_STATUS_WRITE_VERSION,workerId,startedAt:new Date().toISOString(),phase,tasks:[],completed:0,failed:0,status:'running',fatalError:null};
+const statusPublisher=new WorkerStatusPublisher({file:path.join(runsRoot,'worker_status.json')});
 try{
  if(!test&&commit){remoteControl=await timed('control_open',()=>RemoteStopControl.open(common,worker));await timed('control_gate',()=>remoteControl.gate());remoteControl.watch();}
  if(!test&&commit){operations=await timed('operational_gate_open',()=>OperationalGate.open({root:common,workerId,platform:'抖音'}));await timed('operational_gate_check',()=>operations.assertReady());}
@@ -82,7 +94,30 @@ try{
  if(dispatcher){dispatcher.operations=operations;dispatcher.operationalShouldStop=shouldStop;}
  context=await timed('startup',()=>chromium.launchPersistentContext(path.join(stateRoot,'browser-profile'),{executablePath:chrome,headless:false,viewport:null,timeout:45000}));
  observeAccountNickname({context,stateRoot,platform:'抖音'});
- const page=context.pages()[0]||await context.newPage();
+ const rawPage=context.pages()[0]||await context.newPage();
+ if(inPlaceRest){
+  const supervisor=await readJson(path.join(stateRoot,'monitor-supervisor.json'));
+  if(supervisor.state!=='collecting'||!Number.isSafeInteger(supervisor.supervisorPid)||!supervisor.sessionId)
+   throw new Error('COLLECTION_PAUSE_SUPERVISOR_INVALID');
+  let pauseUrl='';
+  collectionPause=await new CollectionCyclePause({workerId,cycleId:'douyin-'+process.pid+'-'+Date.now(),
+   workerPid:process.pid,supervisorPid:supervisor.supervisorPid,supervisorSessionId:supervisor.sessionId,
+   firstDeadlineAtMs:deadline,runMinMs:45*60000,runMaxMs:60*60000,restMinMs:30*60000,restMaxMs:60*60000,
+   stateFile:path.join(stateRoot,'collection-cycle-pause.json')},{
+   shouldStop:async()=>{if(dispatcher?.current)await assertLocalLease();return shouldStop();},
+   onPause:state=>{
+    pauseUrl=rawPage.url();
+    console.log(`[原位休息] 保留当前帖子、评论位置、浏览器及内存；停止页面操作，休息至${formatBeijingTime(state.resumeAtMs)}。`);
+   },
+   onResume:async()=>{
+    await validateInPlaceResume({page:rawPage,pauseUrl,shouldStop,
+     verifyLease:async()=>{if(dispatcher?.current){await dispatcher.verify();await assertLocalLease();}},
+     verifyControl:async()=>{await remoteControl?.poll();await remoteControl?.verifyPersistence();await operations?.assertReady();},checkAccess:assertAccess});
+    console.log(`[原位恢复] ${formatBeijingTime(Date.now())}：登录、页面和租约核验通过；从暂停的操作继续，不刷新、不重新搜索。`);
+   }
+  }).initialize();
+ }
+ const page=collectionPause?pausePlaywright(rawPage,collectionPause):rawPage;
  // Reject accidental popup navigation during the posts phase instead of
  // silently collecting in another tab and losing the latest search context.
  page.on('popup',popup=>{void popup.close();});
@@ -90,13 +125,14 @@ try{
   const keywords=test?String(args.keywords||'中海 住宅|北京臻澐').split('|'):null;
   const sampleTasks=test?keywords.map(keyword=>{const task=manifest.tasks.find(t=>t.keyword===keyword);if(!task)throw new Error(`TEST_KEYWORD_NOT_IN_MANIFEST：${keyword}`);return task;}):null;
   const tasks=dispatcher?dispatcher.tasks({taskIds:selectedTasks?.map(t=>t.redisTaskId||t.id)||null,...(correctionPolicy?{correctionPolicy}:{})}):(async function*(){for(let i=0;i<sampleTasks.length;i++)yield[i,sampleTasks[i]];})();
-  for await(const[,task]of tasks){
+  const budget=new KeywordCycleBudget({beforeNext:async()=>{await collectionPause?.beforeAction();}});
+  for await(const[,task]of budget.tasks(tasks)){
    if(await shouldStop())break;
    if(dispatcher)Object.assign(process.env,dispatcher.env());
-   const taskKey=stableId(`${task.topic}/${task.keyword}`),replay=dispatcher?.current?.recollectionPolicy||'',stateDir=path.join(stateRoot,'tasks',taskKey,replay),outputDir=path.join(runsRoot,taskKey,replay);
-   status.currentKeyword=task.keyword;await writeJsonAtomic(path.join(runsRoot,'worker_status.json'),status);
+   const taskKey=stableId(`${task.topic}/${task.keyword}`),replay=task.collectionPass||dispatcher?.current?.recollectionPolicy||'',stateDir=path.join(stateRoot,'tasks',taskKey,replay),outputDir=path.join(runsRoot,taskKey,replay);
+   status.currentKeyword=task.keyword;await statusPublisher.write(status);
    try{
-    const result=await collectKeyword({page,task,config,commonRoot:common,stateDir,outputDir,shouldStop,onContentImported:()=>noteTaskResumed({worker,stateRoot,keyword:task.keyword,evidence:'original_supervisor_content_imported'}).catch(()=>{}),persistenceGate:createPersistenceGate({
+    const result=await collectKeyword({page,task,config,commonRoot:common,stateDir,outputDir,shouldStop:collectionShouldStop,onContentImported:()=>noteTaskResumed({worker,stateRoot,keyword:task.keyword,evidence:'original_supervisor_content_imported'}).catch(()=>{}),persistenceGate:createPersistenceGate({
       stopCollecting:shouldStop,verifyLease:()=>assertLocalLease(),
       verifyControl:async()=>{if(!test&&commit){if(!remoteControl)throw new Error('PERSISTENCE_CONTROL_UNAVAILABLE');await remoteControl.verifyPersistence();}},
       readStop:async()=>{try{return await fs.readFile(stopFile,'utf8');}catch(e){if(e.code==='ENOENT')return '';throw e;}}
@@ -148,7 +184,7 @@ try{
    if(!test&&!verificationSample&&!finalSelected&&!await shouldStop()){
     const delay=keywordPause(config);
     console.log(`[关键词休息] 当前任务已入库并归还租约，休息${Math.round(delay.ms/1000)}秒再领取后续任务`);
-    try{await waitForPacing(delay.ms,{shouldStop});}
+    try{await waitForPacing(delay.ms,{shouldStop:collectionShouldStop});}
     catch(e){if(/STOP_REQUESTED/.test(e.message)){requested=true;break;}throw e;}
    }
   }
@@ -177,10 +213,12 @@ try{
  }else{fatal=e;status.status='failed';status.fatalError=String(e.message||e);console.error(`[节点停止] ${status.fatalError}`);}
 }
 finally{
+ // Terminal stops drain/import and close normally; scheduled rest never reaches finally.
+ await collectionPause?.close({terminal:true}).catch(e=>{fatal ||= e;});
  await context?.close().catch(e=>{fatal ||= e;});await dispatcher?.close({stopped:await shouldStop()}).catch(e=>{fatal ||= e;console.error(`[Redis收尾] ${e.code||'ERROR'}`);});
  await remoteControl?.close(fatal?'exit_unconfirmed':'collector_stopped').catch(()=>{fatal ||= new Error('REMOTE_CONTROL_FINAL_ACK_UNAVAILABLE');});
  await operations?.close().catch(()=>{fatal ||= new Error('MONITOR_STATE_UNAVAILABLE');});
  setAccessIncidentReporter(null);
- status.finishedAt=new Date().toISOString();await writeJsonAtomic(path.join(runsRoot,'worker_status.json'),status);await lock.close();await fs.rm(lockFile,{force:true});
+ status.finishedAt=new Date().toISOString();await statusPublisher.write(status);await statusPublisher.close();await lock.close();await fs.rm(lockFile,{force:true});
 }
 console.log(JSON.stringify(status,null,2));process.exitCode=fatal?1:0;

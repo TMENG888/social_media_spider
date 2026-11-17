@@ -43,16 +43,37 @@ def platform_progress_line(platform):
     counts = platform['counts']
     closed = sum(counts.get(state, 0) for state in ('completed', 'completed_with_skips', 'skipped_unresolved'))
     pending_import = platform.get('completedPendingImport', 0)
-    completed = max(0, closed - pending_import)
+    completed = closed
     pending = counts.get('pendingNew')
     retry = counts.get('retryPending')
     if counts.get('pendingUnclassified'):
         pending = retry = None
     if retry is not None:
-        retry += counts.get('leased', 0) + counts.get('failed', 0) + pending_import
+        retry += counts.get('leased', 0) + counts.get('failed', 0)
     if counts.get('unknown') or pending_import > closed:
         retry = None
-    return progress_line(platform['platform'], counts['total'], completed, retry, pending)
+    line = progress_line(platform['platform'], counts['total'], completed, retry, pending)
+    if pending_import:
+        line += f' · 已结案待补库 {pending_import}词'
+    return line
+
+
+
+def topic1_platform_progress_line(platform):
+    """Current article/comment pass: running leases are separate from waiting retries."""
+    counts=platform['counts'];name=platform['platform'];total=counts['total']
+    closed=sum(counts.get(k,0) for k in ('completed','completed_with_skips','skipped_unresolved'))
+    pending=counts.get('pendingNew');retry=counts.get('retryPending');leased=counts.get('leased',0)
+    known=sum(counts.get(k,0) for k in ('pendingNew','retryPending','leased','completed','completed_with_skips','skipped_unresolved','failed'))
+    if pending is None or retry is None or counts.get('unknown') or counts.get('pendingUnclassified') or known!=total:
+        return f'{name}：本轮进度待核实（当前清单 {total}词）'
+    active=counts.get('validLeases')
+    line=f'{name}：完成✅ {closed}/{total} · 执行／等待 {active if active is not None else "未确认"} · 待重试 {retry} · 待领取 {pending}'
+    if active is not None and leased>active:line+=f' · 租约待核 {leased-active}'
+    if counts.get('failed'):line+=f' · 失败待处理 {counts["failed"]}'
+    debt=platform.get('completedPendingImport',0)
+    if debt:line+=f' · 已结案待补库 {debt}词'
+    return line
 
 
 def topic_progress_lines(snapshot, db):
@@ -62,25 +83,29 @@ def topic_progress_lines(snapshot, db):
     if video_topics is None and not any('topicBreakdownVerified' in p for p in platforms):
         return None
     lines=[SECTION_TITLES[0]]
-    for topic,alias,label in [('专题一','topic1','全国住宅产品力'),('专题二','topic2','北京项目口碑')]:
-        lines.append(f'{topic}｜{label}')
+    for topic,alias,label in [('专题一','topic1','五品牌住宅产品'),('专题二','topic2','北京项目口碑')]:
+        active=any(topic in p.get('activeTopics',[]) and p.get('collectionPass') for p in platforms)
+        lines.append(f'{topic}｜{label}'+(' · 当前优先 · 文章＋评论' if active else ''))
         queue=(video_topics or {}).get(alias,(video_topics or {}).get(topic))
         if snapshot.get('sources',{}).get('redis')=='ok' and queue:
             line=video_progress_line({'keywordQueueCounts':queue},{'planned':queue['planned']})
         else:line='视频号：专题进度未确认'
+        if topic=='专题一' and any(p.get('collectionPass') for p in platforms):line='视频号：文章＋评论版待启动（历史文章结案不计本轮）'
         rows=[('视频号',line)]
+        if topic=='专题一' and active:lines.append('公众号：文章＋评论版待启动，进度监测尚未接入')
         for platform in platforms:
             name=platform['platform']
             counts=platform.get('topics',{}).get(topic,platform.get('topics',{}).get(alias))
             if platform.get('source')=='ok' and platform.get('topicBreakdownVerified') is True and counts is not None:
-                line=platform_progress_line({'platform':name,'counts':counts,
+                formatter=topic1_platform_progress_line if topic=='专题一' and platform.get('collectionPass') else platform_progress_line
+                line=formatter({'platform':name,'counts':counts,
                     'completedPendingImport':counts['completedPendingImport']})
             else:line=name+'：专题进度未确认'
             rows.append((name,line))
         for name,line in rows:
             volume=db.get('topicVolumes',{}).get(topic,{}).get(name) if db.get('source')=='ok' else None
             if volume is not None:
-                line+=f" · 入库 {volume['posts']:,}篇／{volume['comments']:,}条评论"
+                line+=f" · {'累计入库' if topic=='专题一' else '入库'} {volume['posts']:,}篇／{volume['comments']:,}条评论"
             else:line+=' · 入库量未确认'
             lines.append(line)
     return lines
@@ -105,6 +130,15 @@ def retry_task_issues(snapshot):
         if video_issue:issues.append(video_issue)
     for platform in snapshot.get('platformTasks', []):
         counts = platform.get('counts')
+        if platform.get('collectionPass') and platform.get('activeTopics') and platform.get('topicBreakdownVerified'):
+            for topic in platform['activeTopics']:
+                topic_counts=platform.get('topics',{}).get(topic,{})
+                if platform.get('source')=='ok' and topic_counts.get('retryPending'):
+                    issues.append(f"{platform['platform']}{topic}：待重试 {topic_counts['retryPending']} 个关键词 → 按当前优先专题继续")
+                uncertain=topic_counts.get('expiredLeases',0)+topic_counts.get('missingLeaseEvidence',0)
+                if platform.get('source')=='ok' and uncertain:
+                    issues.append(f"{platform['platform']}{topic}：{uncertain}词租约待核 → 核对回收状态，避免重复采集")
+            continue
         if platform.get('source') == 'ok' and counts is not None and counts.get('retryPending'):
             issues.append(f"{platform['platform']}：待重试 {counts['retryPending']} 个关键词 → 按现有策略重试")
     return issues
@@ -258,7 +292,7 @@ def brief_notification(snapshot, db, *, include_diagnostics=False):
     generated = stamp(snapshot.get('generatedAt'))
     when = generated.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M') if generated else '时间未确认'
     headline = f"{when}（北京）｜{str(len(all_issues))+'项需关注' if all_issues else '未观察到失败待重试任务'}"
-    notes = ['完成含跳过结案，非全量采齐或入库确认；视频号待入库见异常项，不计采集重试；待领为未尝试', '入库为各专题历史累计（文章/评论），非本轮新增；字段非空≠合格；视频内容仅视频行；净增≠新增']
+    notes = ['完成含跳过结案，非全量采齐或入库确认；视频号待入库见异常项，不计采集重试；待领为未尝试', '专题一本轮按最新检索词的文章＋评论批次统计，旧文章版结案不计入；执行／等待为有效任务租约，不代表全部正在操作页面', '入库为各专题历史累计（文章/评论），非本轮新增；字段非空≠合格；视频内容仅视频行；净增≠新增']
     if platforms:
         notes += ['有效租约不等于确认在线', '百度资讯/公众号未接入']
     if any(w.get('observation') in ('heartbeat_stale', 'registration_unobserved') for w in workers):

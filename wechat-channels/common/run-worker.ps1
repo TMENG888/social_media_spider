@@ -88,6 +88,7 @@ $queueFile = if ($env:WECHAT_QUEUE_FILE) {
 if (-not (Test-Path $queueFile)) { $queueFile = Join-Path $Root 'common\task-queue.json' }
 Write-Host "Task queue: $queueFile"
 $queue = Get-Content $queueFile -Raw -Encoding UTF8 | ConvertFrom-Json
+foreach ($entry in $queue.tasks) { $entry | Add-Member -NotePropertyName collectComments -NotePropertyValue $true -Force; if ($entry.id -eq 'topic1') { $entry | Add-Member -NotePropertyName collectionPass -NotePropertyValue 'articles-comments-20261110-v1' -Force } }
 $configuredMaxResults = if ($queue.PSObject.Properties.Name -contains 'maxResultsPerKeyword') { [int]$queue.maxResultsPerKeyword } else { 0 }
 # Production collection must cover the complete date window. Legacy worker
 # packages used 100 here as a per-keyword cap, which produced partial_limit at
@@ -116,7 +117,7 @@ $stateRoot = if ($redisStateScope) { Join-Path $WorkerRoot ('.state\redis-runs\'
 $runsRoot = if ($redisStateScope) { Join-Path $WorkerRoot ('runs\redis-runs\' + $redisStateScope) } else { Join-Path $WorkerRoot 'runs' }
 New-Item -ItemType Directory -Force -Path $stateRoot,$runsRoot | Out-Null
 if ($redisStateScope) { Write-Host "Redis state scope: $redisStateScope (fresh reset generations do not reuse older local checkpoints)." }
-$CompletionSchemaVersion = 'channels-pagination-v8-bound-search-end'
+$CompletionSchemaVersion = 'channels-articles-comments-v9'
 # The outer Redis scheduler owns the safe-stop marker for dynamic workers.
 # Clearing it in every per-keyword child creates a race where the scheduler
 # can claim several new keywords after the operator requested a stop.  Static
@@ -135,8 +136,8 @@ foreach ($task in $queue.tasks) {
   } else {
     Join-Path $Root ([string]$task.keywordsFile)
   }
-  $taskRoot = Join-Path $runsRoot $task.id
-  $stateDb = Join-Path $stateRoot ($task.id + '.sqlite')
+  $localTaskKey = if ($task.collectionPass) { $task.id + '-' + $task.collectionPass } else { $task.id }; $taskRoot = Join-Path $runsRoot $localTaskKey
+  $stateDb = Join-Path $stateRoot ($localTaskKey + '.sqlite')
   $screens = Join-Path $stateRoot ("screenshots\" + $task.id)
   New-Item -ItemType Directory -Force -Path $taskRoot,$screens | Out-Null
   $taskStatusPath = Join-Path $taskRoot 'task_status.json'

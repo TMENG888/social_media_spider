@@ -1,3 +1,4 @@
+import {verifiedAnnualRangeBoundary} from './annual-range-boundary.mjs';
 export const POLICY_VERSION = "20260928-streaming-year-window-v1";
 export const PROJECTS = Object.freeze({
   专题一: "全国地产设计产品力监测",
@@ -77,6 +78,7 @@ export function searchExhaustionEvidence({keyword,after,sortConfirmed,pages=[],f
 }
 
 export function verifiedAnnualSearchEnd(summary){
+ if(verifiedAnnualRangeBoundary(summary))return true;
  const evidence=summary?.searchExhaustion;
  return summary?.sortConfirmed===true&&summary.stopReason==='search_exhausted'
   &&evidence?.confirmed===true&&evidence.reason==='search_exhausted'

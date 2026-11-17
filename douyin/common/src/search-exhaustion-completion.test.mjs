@@ -11,6 +11,8 @@ import {applyVolumeDecision} from './volume-queue-policy.mjs';
 import {keywordQueueConfirmed,volumeQueueConfirmed,reconcileVolumeCompletion} from './volume-confirmation.mjs';
 import {openVolumeRuntime} from './volume-runtime.mjs';
 import {RedisDispatcher} from './redis-dispatcher.mjs';
+import {assessAnnualLowVolume} from './keyword-annual-acceptance.mjs';
+import {collectorAnnualScan} from './annual-scan-adapter.mjs';
 
 const clone=value=>structuredClone(value);
 function fixture({posts=0,now=Date.now()}={}){
@@ -35,10 +37,10 @@ test('13 candidates, 12 old, 1 unresolved and 0/37 SQL rows may business-complet
  assert.equal(assessSearchExhaustion(fixture({posts:4}).decision,f.task,f.record).ok,true);
 });
 
-test('zero visible results can close, but high quantity uses existing P80 acceptance',()=>{
+test('verified search end can close both below and above historical P80',()=>{
  const f=fixture();f.record.knownIncomplete=[];Object.assign(f.record.searchExhaustion,{gaps:[],returnedCount:0,checkpointCount:0,uiText:'暂无搜索结果'});
  const e=assessSearchExhaustion(f.decision,f.task,f.record);assert.equal(e.ok,true);assert.equal(e.allItemsCollected,true);
- assert.equal(assessSearchExhaustion(fixture({posts:37}).decision,f.task,f.record).ok,false);
+ assert.equal(assessSearchExhaustion(fixture({posts:37}).decision,f.task,f.record).ok,true);
 });
 
 test('a missing or forged search end is never quantity-shortage success',()=>{
@@ -115,8 +117,49 @@ function luaClient(f){
    const out=JSON.parse(run.stdout);this.state=out.state;this.types=out.types;this.calls.push(...out.calls);
    if(out.error)throw Error(out.error);return out.result;
   }};
- queue.client=client;return queue;
+ queue.client=client;queue.inspect=async id=>({status:client.state[queue.keys[1]][id]});return queue;
 }
+
+test('quantity commit and confirmation are disabled even for high historical inventory',async()=>{
+ const f=fixture({posts:100}),q={client:{eval(){throw Error('MUST_NOT_WRITE_REDIS');}}};
+ const out=await applyVolumeDecision(q,f.snapshot,f.decision,{generation:'fixture-v1',token:'token',commit:true});
+ assert.equal(out.status,'quantity_completion_disabled');assert.equal(out.changed,false);
+ assert.equal(keywordQueueConfirmed({status:'completed',acceptedByVolume:true}),false);
+});
+
+test('annual endpoint acceptance no longer requires inventory below P80',()=>{
+ const f=fixture({posts:100}),scan=collectorAnnualScan(f.record,{taskId:f.task.id,keyword:f.task.keyword,projectName:f.task.projectName,year:2026});
+ const e=assessAnnualLowVolume(f.decision,{scan,inventory:[],year:2026},{now:f.now});
+ assert.equal(e.ok,true);assert.equal(e.quantityAccepted,false);
+ assert.equal(assessAnnualLowVolume(f.decision,{scan:{...scan,ok:false},inventory:[],year:2026}).ok,false);
+});
+
+test('Lua accepts verified search exhaustion above P80, still enforcing live lease', {skip:!luaEnabled},async()=>{
+ const f=fixture({posts:100}),q=luaClient(f);
+ const out=await completeExhaustedSearch(q,f.snapshot,f.decision,f.task,f.record,{generation:'fixture-v1',token:'token',commit:true,now:f.now});
+ assert.equal(out.confirmation.acceptedBySearchExhaustion,true);
+ assert.equal(JSON.parse(q.client.state[q.keys[7]][f.task.id]).quantityAccepted,false);
+});
+
+test('runtime cannot auto-complete high inventory without search proof, including security or pause', {skip:!luaEnabled},async()=>{
+ const f=fixture({posts:100}),q=luaClient(f),dir=await fs.mkdtemp(path.join(os.tmpdir(),'dy-no-quantity-'));
+ q.client.state[q.namespace+':volume-policy-snapshots']={'fixture-v1':JSON.stringify(f.snapshot)};
+ const original=mysql.createConnection,env={MYSQL_USER:process.env.MYSQL_USER,MYSQL_PASSWORD:process.env.MYSQL_PASSWORD};
+ process.env.MYSQL_USER='fixture';process.env.MYSQL_PASSWORD='fixture';
+ mysql.createConnection=async()=>({query:async()=>{},beginTransaction:async()=>{},execute:async()=>[[{posts:100}]],commit:async()=>{},rollback:async()=>{},end:async()=>{}});
+ try{
+  await fs.writeFile(path.join(dir,'acceptance-policy.json'),JSON.stringify({enabled:true,policy:f.snapshot.policy,population:'nonzero_keywords',generation:'fixture-v1'}));
+  const runtime=await openVolumeRuntime({root:dir,stateRoot:dir,queue:q,manifest:{tasks:[{...f.task,collectionPass:'new-comments-pass'}]},platform:'抖音'});
+  runtime.apply=async()=>{throw Error('QUANTITY_PATH_MUST_NOT_RUN');};
+  const record={...f.record,savedPosts:1,stopReason:'volume_threshold',error:null,searchExhaustion:null};
+  const before=clone(q.client.state);
+  assert.equal((await runtime.prepare(f.task.id)).confirmation.status,'leased');
+  assert.equal((await runtime.finish(f.task.id,'token',record)).confirmation,null);
+  assert.equal((await runtime.finish(f.task.id,'token',{...record,error:'STOP_SECURITY_CHALLENGE'})).confirmation,null);
+  assert.equal((await runtime.finish(f.task.id,'token',record,{pause:true})).confirmation,null);
+  assert.deepEqual(q.client.state,before);
+ }finally{mysql.createConnection=original;for(const[k,v]of Object.entries(env)){if(v===undefined)delete process.env[k];else process.env[k]=v;}await fs.rm(dir,{recursive:true,force:true});}
+});
 
 test('Lua closes original lease, preserves attempts/evidence; prepare is idempotent and cannot reset it', {skip:!luaEnabled},async()=>{
  const f=fixture(),q=luaClient(f),options={generation:'fixture-v1',token:'token',commit:true,now:f.now};
@@ -187,7 +230,7 @@ test('full volume runtime + dispatcher closes 0/37 and yields next original keyw
   assert.equal(f.record.collectionError,'VOLUME_BELOW_THRESHOLD');assert.deepEqual(f.record.missingCandidateIds,['7697504010770016763']);
   assert.equal(q.client.state[q.keys[2]][f.task.id],attempts);
   const item=await tasks.next();assert.equal(item.done,false);assert.equal(item.value[1].keyword,next.keyword);
-  dispatcher.current=null;assert.equal((await tasks.next()).done,true);assert.ok(connections>=3);
+  dispatcher.current=null;assert.equal((await tasks.next()).done,true);assert.ok(connections>=1);
  }finally{mysql.createConnection=original;for(const [key,value] of Object.entries(priorEnv)){
   if(value===undefined)delete process.env[key];else process.env[key]=value;
  }await fs.rm(dir,{recursive:true,force:true});}

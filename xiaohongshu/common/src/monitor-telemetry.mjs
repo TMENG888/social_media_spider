@@ -1,5 +1,9 @@
-// Monitoring writes are restricted to new :monitor: keys; never import a dispatcher.
+import {publishOpsState,refreshOpsCopies} from './ops-state.mjs';
+let opsRefreshPending=null;
+// Telemetry uses :monitor: keys. The separate XHS P80 refresher writes only
+// :local-p80-* quantity snapshots; neither path imports a task dispatcher.
 import fs from 'node:fs/promises';
+import {appendFileSync} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {randomUUID} from 'node:crypto';
@@ -7,6 +11,8 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createClient} from 'redis';
 import {redisSettings} from './redis-connection.mjs';
 import {RemoteStopControl} from './remote-stop-control.mjs';
+import {refreshLocalP80,readDatabaseUniquePosts,LOCAL_P80_REFRESH_POLICY} from './local-p80-refresh.mjs';
+import {mysqlTargetOptions} from './mysql-target-options.mjs';
 import {markControlFailure} from './remote-control-recovery.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -171,6 +177,7 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
   const sleep=runtime.sleep||(ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   let client;
   let control;
+  let p80RefreshPending=null,p80NextAttemptAt=0;
   let exitReason='parent_not_alive',failures=0,stage='starting';
   const lifecycle=async(reason,details={})=>{
     const record={schemaVersion:1,at:new Date().toISOString(),pid:process.pid,supervisorPid:parentPid,sessionId,reason,...details};
@@ -185,17 +192,24 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
     }catch{console.warn('[Monitor lifecycle] persistence_unavailable');}
   };
   const errorCode=error=>/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code||'')?error.code:'UNCLASSIFIED';
-  await lifecycle('started');
+  const progress=async()=>{
+    const value={schemaVersion:1,at:new Date().toISOString(),pid:process.pid,supervisorPid:parentPid,sessionId,stage,failures};
+    if(runtime.onProgress){await runtime.onProgress(value);return;}
+    if(runtime.context)return;
+    try{await writeJson(path.join(ctx.worker,'.state','monitor-helper-progress.json'),value);}catch{}
+  };
+  await lifecycle('started');await progress();
   try {
     while(alive(parentPid)) {
       const started=clock();
       try {
-        stage='read_supervisor_state';
+        stage='read_supervisor_state';await progress();
         const state=await readState();
+        if(!runtime.context){publishOpsState(stateFile,state);if(!opsRefreshPending){opsRefreshPending=refreshOpsCopies(ctx.worker).catch(()=>{}).finally(()=>{opsRefreshPending=null;});}}
         if(state.supervisorPid!==parentPid||state.sessionId!==sessionId){exitReason='supervisor_identity_changed';break;}
         if(!runtime.context||runtime.controlFactory){
           try{
-            stage='poll_remote_control';
+            stage='poll_remote_control';await progress();
             control ||= await (runtime.controlFactory?runtime.controlFactory():RemoteStopControl.open(root,workerRoot));
             await control.poll({terminal:['stopped','exit_unconfirmed'].includes(state.state)?state.state:null});
           }catch(error){
@@ -206,26 +220,47 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
             throw error;
           }
         }
-        stage='connect_telemetry';
+        stage='connect_telemetry';await progress();
         if(!client?.isReady){if(client?.isOpen)client.destroy();client=await connect(ctx);}
-        stage='read_server_time';
+        stage='read_server_time';await progress();
         const serverTime=await monitoringCommand(client,ctx.namespace,'TIME',null,[]);
         const lastSeenAt=new Date(Number(serverTime[0])*1000+Number(serverTime[1])/1000).toISOString();
         let reportedState=state;
         if(!runtime.context){
           try{reportedState=pauseHeartbeatState(state,JSON.parse(await fs.readFile(path.join(ctx.worker,'.state','collection-cycle-pause.json'),'utf8')),clock());}catch{}
         }
-        const record={schemaVersion:1,platform:ctx.platform,campaign:ctx.campaign,computer:ctx.computer,worker:ctx.workerId,
+        // A delayed old control read must not overwrite a new supervisor's heartbeat.
+        const current=await readState();
+        if(current.supervisorPid!==parentPid||current.sessionId!==sessionId){exitReason='supervisor_identity_changed';break;}
+        const record={schemaVersion:1,heartbeatSource:'supervisor_helper',reporterPid:process.pid,platform:ctx.platform,campaign:ctx.campaign,computer:ctx.computer,worker:ctx.workerId,
           supervisorPid:parentPid,sessionId,lastSeenAt,heartbeatIntervalSeconds:3,state:reportedState.state,resumeAt:reportedState.resumeAt||null,pauseMode:reportedState.pauseMode||null};
-        stage='write_heartbeat';
+        stage='write_heartbeat';await progress();
         await monitoringCommand(client,ctx.namespace,'HSET','workers',[ctx.computer+'/'+ctx.workerId,JSON.stringify(record)]);
-        stage='write_readiness';
+        stage='write_readiness';await progress();
         if(!runtime.context)await writeJson(path.join(ctx.worker,'.state','remote-control-ready.json'),{sessionId,supervisorPid:parentPid,readyAt:lastSeenAt});
-        stage='flush_outbox';await flush(client,ctx);
+        stage='flush_outbox';await progress();await flush(client,ctx);stage='frame_completed';await progress();
+        // Keep the SQL check off the heartbeat path. Redis grants a single
+        // cluster-wide check every five minutes, including while pages rest.
+        if(!runtime.context&&ctx.platform==='小红书'&&!p80RefreshPending&&clock()>=p80NextAttemptAt){
+          p80NextAttemptAt=clock()+60000;
+          const refreshClient=client;
+          const adapter={eval:(script,{keys,arguments:args})=>bounded(refreshClient,['EVAL',script,String(keys.length),...keys,...args])};
+          p80RefreshPending=refreshLocalP80({client:adapter,namespace:ctx.namespace,
+            readDatabaseCount:()=>readDatabaseUniquePosts({connect:async()=>{
+              if(!process.env.MYSQL_USER||!process.env.MYSQL_PASSWORD)throw Object.assign(new Error('Missing database credentials'),{code:'P80_MYSQL_CREDENTIALS_MISSING'});
+              const mysql=await import('mysql2/promise');
+              return mysql.default.createConnection({...mysqlTargetOptions(),user:process.env.MYSQL_USER,password:process.env.MYSQL_PASSWORD,connectTimeout:15000});
+            }})}).then(async result=>{
+              await writeJson(path.join(ctx.worker,'.state','local-p80-refresh-status.json'),{policy:LOCAL_P80_REFRESH_POLICY,
+                helperPid:process.pid,sessionId,checkedAt:new Date().toISOString(),...result});
+              if(result.refreshed)console.log('[P80 threshold refreshed] '+JSON.stringify({policy:LOCAL_P80_REFRESH_POLICY,...result}));
+            }).catch(error=>console.warn('[P80 refresh deferred] '+errorCode(error)))
+            .finally(()=>{p80RefreshPending=null;});
+        }
         if(failures){await lifecycle('connection_recovered',{previousFailures:failures});failures=0;}
         if(['stopped','exit_unconfirmed'].includes(state.state)){exitReason='supervisor_'+state.state;break;}
       } catch(error) {
-        failures++;
+        failures++;await progress();
         if(failures===1||(failures&(failures-1))===0)await lifecycle('frame_failed',{stage,failures,code:errorCode(error)});
         // No secrets, raw error text, task state changes, or automatic crawler restart.
         if(client?.isOpen)client.destroy();client=null;
@@ -240,11 +275,39 @@ export async function heartbeatLoop(workerRoot,parentPid,sessionId,runtime={}) {
     await lifecycle('exited',{exitReason,failures});
   }
 }
+
+export async function stoppedObservationLoop(workerRoot,parentPid,sessionId,guardianPid) {
+  const ctx=await context(workerRoot);let client;
+  try{
+    while(parentAlive(guardianPid)){
+      const state=JSON.parse(await fs.readFile(path.join(ctx.worker,'.state','monitor-supervisor.json'),'utf8'));
+      if(state.sessionId!==sessionId||state.supervisorPid!==parentPid||!['stopped','exit_unconfirmed'].includes(state.state)||parentAlive(parentPid))break;
+      try{
+        await writeJson(path.join(ctx.worker,'.state','monitor-helper-progress.json'),{schemaVersion:1,at:new Date().toISOString(),pid:process.pid,supervisorPid:parentPid,sessionId,stage:'stopped_observation'});
+        if(!client?.isReady){if(client?.isOpen)client.destroy();client=await clientFor(ctx);}
+        const now=await monitoringCommand(client,ctx.namespace,'TIME',null,[]);
+        const lastSeenAt=new Date(Number(now[0])*1000+Number(now[1])/1000).toISOString();
+        const current=JSON.parse(await fs.readFile(path.join(ctx.worker,'.state','monitor-supervisor.json'),'utf8'));
+        if(current.sessionId!==sessionId||current.supervisorPid!==parentPid||!['stopped','exit_unconfirmed'].includes(current.state)||parentAlive(parentPid))break;
+        await monitoringCommand(client,ctx.namespace,'HSET','workers',[ctx.computer+'/'+ctx.workerId,JSON.stringify({schemaVersion:1,platform:ctx.platform,campaign:ctx.campaign,computer:ctx.computer,worker:ctx.workerId,supervisorPid:parentPid,supervisorAlive:false,sessionId,heartbeatSource:'stopped_observer',reporterPid:process.pid,guardianPid,lastSeenAt,heartbeatIntervalSeconds:3,state:current.state,resumeAt:null})]);
+        for(let n=0;n<3;n++)await flushOutbox(client,ctx);
+      }catch(error){if(client?.isOpen)client.destroy();client=null;}
+      await new Promise(resolve=>setTimeout(resolve,3000));
+    }
+  }finally{if(client?.isOpen)client.destroy();}
+}
+
 if(process.argv[1]&&pathToFileURL(path.resolve(process.argv[1])).href===import.meta.url) {
-  const args=process.argv.slice(2);
-  if(args[0]!=='--heartbeat')throw new Error('Explicit heartbeat mode required');
-  const parentPid=Number(args[2]),sessionId=args[3];
-  if(!Number.isSafeInteger(parentPid)||parentPid<1||!sessionId)throw new Error('Invalid supervisor identity');
-  try{await heartbeatLoop(args[1],parentPid,sessionId);}
-  catch(error){console.error('[Monitor lifecycle] '+JSON.stringify({reason:'startup_or_loop_failure',code:/^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code||'')?error.code:'UNCLASSIFIED'}));process.exitCode=1;}
+  const args=process.argv.slice(2),mode=args[0],parentPid=Number(args[2]),sessionId=args[3],guardianPid=Number(args[4]);
+  if(!['--heartbeat','--observe-stopped'].includes(mode)||!Number.isSafeInteger(parentPid)||parentPid<1||!/^[a-f0-9-]{36}$/.test(sessionId||''))throw new Error('Invalid heartbeat identity');
+  const journal=path.join(path.resolve(args[1]),'runs','monitor-helper-'+sessionId+'.jsonl');
+  const syncEvent=(reason,details={})=>{try{appendFileSync(journal,JSON.stringify({schemaVersion:1,at:new Date().toISOString(),pid:process.pid,supervisorPid:parentPid,sessionId,reason,...details})+'\n');}catch{}};
+  process.on('uncaughtExceptionMonitor',(error,origin)=>syncEvent('uncaught_exception',{origin,errorClass:/^[A-Za-z]{1,64}$/.test(error?.constructor?.name||'')?error.constructor.name:'Error',code:/^[A-Z0-9_]{1,64}$/.test(error?.code||'')?error.code:null}));
+  process.on('exit',code=>syncEvent('process_exit',{exitCode:code}));
+  try{
+    if(mode==='--observe-stopped'){
+      if(!Number.isSafeInteger(guardianPid)||guardianPid<1)throw new Error('Guardian identity required');
+      await stoppedObservationLoop(args[1],parentPid,sessionId,guardianPid);
+    }else await heartbeatLoop(args[1],parentPid,sessionId);
+  }catch(error){syncEvent('startup_or_loop_failure',{code:/^[A-Z0-9_]{1,64}$/.test(error?.code||'')?error.code:'UNCLASSIFIED'});process.exitCode=1;}
 }

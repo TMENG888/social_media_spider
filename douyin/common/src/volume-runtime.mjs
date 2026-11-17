@@ -9,8 +9,8 @@ import {annualInputFromCollector} from './annual-runtime-evidence.mjs';
 import {completeAnnualKeyword} from './annual-queue-policy.mjs';
 import {operationalFailure} from './retry-exhaustion.mjs';
 import {ResetOncePolicy} from './reset-once.mjs';
-import {completeRiskVolume,riskStopGate,RISK_VOLUME_VERSION} from './risk-volume-completion.mjs';
 import {completeExhaustedSearch} from './search-exhaustion-completion.mjs';
+import {verifiedAnnualRangeBoundary} from './annual-range-boundary.mjs';
 
 export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}){
  let config;
@@ -43,25 +43,29 @@ export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}
    .catch(()=>console.warn('[数量核验诊断] 本地诊断写入失败；不忽略核验错误'));
  };
  const recheck=(taskId,operation)=>retryFreshSqlEvidence(operation,{onDiagnostic:row=>diagnostic({...row,taskId})});
- console.log(`[数量验收] ${platform}，非零入库词P80=${snapshot.threshold}篇；字幕质量不阻塞；阈值版本=${config.generation}`);
- await fs.writeFile(path.join(stateRoot,'risk-volume-policy.json'),JSON.stringify({version:RISK_VOLUME_VERSION,platform,pid:process.pid,loadedAt:new Date().toISOString()}));
+ console.log('[结案规则] 抖音已禁用累计文章数量结案；数量只作统计，不触发采集停止。');
+ await fs.writeFile(path.join(stateRoot,'completion-policy.json'),JSON.stringify({version:'douyin-no-quantity-20261110-v1',quantityCompletionEnabled:false,pid:process.pid,loadedAt:new Date().toISOString()}));
  return {snapshot,snapshotFile,generation:config.generation,recollection,
-  canCompleteRisk:()=>riskStopGate(stateRoot),
+  canCompleteRisk:async()=>false,
   read:taskId=>readTaskVolume({connect,snapshot,taskId,redisClient:queue.client}),
   apply:(decision,options={})=>applyVolumeDecision(queue,snapshot,decision,{generation:config.generation,...options}),
-  async prepare(taskId){return recheck(taskId,async()=>{
-   const replay=await recollection.prepare(taskId);
-   if(replay.status!=='absent')return {decision:{posts:null,threshold:snapshot.threshold},confirmation:replay};
-   const decision=await this.read(taskId);const confirmation=await this.apply(decision,{commit:true});return {decision,confirmation};});},
+  async prepare(taskId){return {decision:{posts:null,threshold:snapshot.threshold,quantityCompletionEnabled:false},confirmation:await queue.inspect(taskId)};},
   async finish(taskId,token,record,{pause=false}={}){return recheck(taskId,async()=>{
-   const risk=await completeRiskVolume(this,taskId,token,record);if(risk)return risk;
-   const replay=await recollection.finish(taskId,token,record,{pause});
-   if(replay?.acceptedByResetOnce||replay?.acceptedByRiskVolume)return {confirmation:replay};
-   if(replay)return {confirmation:null};
+   // Empty verified searches are valid; quantity and security-volume shortcuts are disabled.
+   // Verified annual completion takes precedence over attempt-count business
+   // closure, including a task previously armed for a one-time replay.
+   if(!pause&&!operationalFailure(record)&&verifiedAnnualRangeBoundary(record)){
+    const decision=await this.read(taskId);
+    const task=manifest.tasks.find(t=>(t.redisTaskId||t.id)===taskId);
+    const input=await annualInputFromCollector({decision,task,record,stateRoot,connect});
+    if(input){const {evidence,confirmation}=await completeAnnualKeyword(queue,snapshot,decision,input,{generation:config.generation,token,commit:true,record});
+     if(confirmation)return {decision,annualEvidence:evidence,confirmation};}
+    return {decision,confirmation:null};
+   }
+   // Legacy replay/quantity flags cannot replace search endpoint proof.
    if(pause)return {confirmation:null};
    if(operationalFailure(record))return {confirmation:null};
    const decision=await this.read(taskId);
-   if(decision.ok)return {decision,confirmation:await this.apply(decision,{token,commit:true})};
    const task=manifest.tasks.find(t=>(t.redisTaskId||t.id)===taskId);
    const exhausted=await completeExhaustedSearch(queue,snapshot,decision,task,record,
     {generation:config.generation,token,commit:true});
@@ -72,6 +76,7 @@ export async function openVolumeRuntime({root,stateRoot,queue,manifest,platform}
      {generation:config.generation,token,commit:true,record});
     if(confirmation)return {decision,annualEvidence:evidence,confirmation};
    }
+   if(decision.ok)return {decision,confirmation:null}; // Above P80 without endpoint proof stays open.
    const terminal=await this.apply(decision,{token,commit:true,finishBelow:true,record});
    return {decision,confirmation:terminal.status==='completed'?terminal:null};
   });}};

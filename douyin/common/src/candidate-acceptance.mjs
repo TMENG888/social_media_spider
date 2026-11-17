@@ -1,3 +1,4 @@
+import {frontendClosed} from './foreground-budget.mjs';
 import {checkpointCandidates,markSkipped} from './checkpoint.mjs';
 import {validDate,inTargetYear} from './collection-policy.mjs';
 import {shanghaiTime} from './douyin-data.mjs';
@@ -37,6 +38,6 @@ export function settleObservedOldCandidates(db,keyword,awemes,year,cutoff,{evide
 }
 
 export function incompleteCandidates(notes){
- return notes.filter(n=>!['completed','skipped_old','dead_letter'].includes(n.status)
+ return notes.filter(n=>!frontendClosed(n.result)&&n.status!=='front_timeout').filter(n=>!['completed','skipped_old','dead_letter'].includes(n.status)
   || (n.status==='completed' && n.result?.audit?.commentsComplete===false));
 }

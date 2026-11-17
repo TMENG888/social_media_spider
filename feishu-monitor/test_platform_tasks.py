@@ -102,7 +102,20 @@ class PlatformTests(unittest.TestCase):
         self.assertNotIn('无变化结束',text)
 
     def observe(self, fake):
-        return queue_observation(ReadOnlyRedis(fake), 'xhs:{production}', 'production', [{'redisTaskId': key} for key in ('a','b','c','d')])
+        return queue_observation(ReadOnlyRedis(fake), 'xhs:{production}', 'production', [{'redisTaskId': key} for key in fake.statuses])
+
+    def test_current_manifest_excludes_retired_history(self):
+        fake=FakeRedis(statuses={'current':'pending','retired':'completed'},leases=[])
+        row=queue_observation(ReadOnlyRedis(fake),'xhs:{production}','production',[{'redisTaskId':'current'}])
+        self.assertEqual(row['counts']['total'],1)
+        self.assertEqual(row['counts']['completed'],0)
+        self.assertEqual(row['topics']['专题一']['pendingNew'],1)
+
+    def test_topic_lease_evidence_matches_platform(self):
+        row=self.observe(FakeRedis())
+        self.assertEqual(row['topics']['专题一']['validLeases'],1)
+        row=self.observe(FakeRedis(leases=['c','999000']))
+        self.assertEqual(row['topics']['专题一']['expiredLeases'],1)
 
     def test_read_only_guard_rejects_mutation_and_lua(self):
         fake=FakeRedis();c=ReadOnlyRedis(fake)

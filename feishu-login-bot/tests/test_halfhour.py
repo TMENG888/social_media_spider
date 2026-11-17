@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(dir=temp) as d:
  snapshots(now);b._attention_summary(now);assert not l.calls
  snapshots(now+1799);b._attention_summary(now+1799);assert not l.calls
  snapshots(now+1800);b._attention_summary(now+1800);assert len(l.calls)==1
- content=l.calls[0][1]['stdin'];assert '人工验证码' in content and '扫码登录' in content and '重发验证码 work04 抖音' in content
+ content=l.calls[0][1]['stdin'];assert '页面安全验证' in content and '扫码登录' in content and '重发验证码 work04 抖音' in content
  assert 'work02 · 小红书' not in content and '短信不会由定时提醒自动重发' in content
  assert l.calls[0][0][1]=='+messages-send'
  snapshots(now+1808);b._attention_summary(now+1808);assert len(l.calls)==1

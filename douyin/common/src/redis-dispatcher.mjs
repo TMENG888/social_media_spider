@@ -8,6 +8,7 @@ import { loadTaskManifest } from './redis-task-manifest.mjs';
 import { writeJsonAtomic } from './checkpoint.mjs';
 import {openVolumeRuntime} from './volume-runtime.mjs';
 import {scopedTasks} from './task-scope.mjs';
+import {schedulingPlan} from './scheduling-priority.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -19,7 +20,7 @@ export class RedisDispatcher {
     // Different task revisions and export-only tests cannot acknowledge production work.
     const campaign = campaignOverride || (!skipImport && settings.taskPoolCampaign) || `${settings.campaign}-${skipImport ? 'export' : 'mysql'}-${manifest.manifestHash.slice(0, 16)}`;
     try {
-      const dispatcher = new RedisDispatcher({ settings, manifest, client, campaign, stateRoot, workerId, stopFile });
+      const dispatcher = new RedisDispatcher({ root, settings, manifest, client, campaign, stateRoot, workerId, stopFile });
       dispatcher.schedulingTasks = await scopedTasks(root, manifest.tasks);
       dispatcher.scopeLimited = dispatcher.schedulingTasks.length !== manifest.tasks.length;
       if (dispatcher.schedulingTasks.length !== manifest.tasks.length) {
@@ -38,8 +39,8 @@ export class RedisDispatcher {
     } catch (error) { await client.close(); throw error; }
   }
 
-  constructor({ settings, manifest, client, campaign, stateRoot, workerId, stopFile }) {
-    Object.assign(this, { settings, manifest, client, campaign, stateRoot, workerId, stopFile });
+  constructor({ root, settings, manifest, client, campaign, stateRoot, workerId, stopFile }) {
+    Object.assign(this, { root, settings, manifest, client, campaign, stateRoot, workerId, stopFile });
     this.owner = `${workerId}-${randomUUID()}`;
     this.queue = new RedisTaskQueue({ client, campaign, leaseMs: settings.leaseMs, maxAttempts: settings.maxAttempts, retryDelayMs: settings.retryDelayMs });
     this.leaseFile = path.join(stateRoot, 'redis-active-lease.json');
@@ -70,13 +71,17 @@ export class RedisDispatcher {
       if(correctionPolicy)throw new Error('VOLUME_AND_LEGACY_CORRECTION_ARE_EXCLUSIVE');
       let index=0;
       const eligible=this.schedulingTasks || this.manifest.tasks;
-      const chosen=taskIds?taskIds.map(id=>eligible.find(t=>(t.redisTaskId||t.id)===id)):eligible;
-      if(chosen.some(t=>!t))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
-      for(const task of chosen){
+      const selected=taskIds?taskIds.map(id=>eligible.find(t=>(t.redisTaskId||t.id)===id)):eligible;
+      if(selected.some(t=>!t))throw new Error('SELECTED_TASK_NOT_IN_MANIFEST');
+      let plan,lastPriority=null;
+      do{
+      plan=taskIds?{tasks:selected,priorityActive:false}:await schedulingPlan(this.root,this.manifest.tasks,this.queue);
+      if(lastPriority!==plan.priorityActive){console.log(`[品牌调度] ${plan.priorityActive?plan.label+'优先，其他品牌保留断点排后':'优先品牌已处理，按原顺序继续后续任务'}`);lastPriority=plan.priorityActive;}
+      for(const task of plan.tasks){
         if(this.halted||await this.stopped())return;
         if(this.operations&&!(await this.operations.wait({shouldStop:this.operationalShouldStop})).ready)return;
         const id=task.redisTaskId||task.id,prepared=await this.volume.prepare(id);
-        console.log(`[数量判定] ${task.keyword}：${prepared.decision.posts}/${prepared.decision.threshold}篇，${prepared.confirmation.status}`);
+        console.log(`[任务状态] ${task.keyword}：${prepared.confirmation.status}；不按文章数量结案`);
         if(prepared.confirmation.status!=='pending')continue;
         const started=Date.now(),lease=await this.queue.claim(this.owner,id);if(!lease)continue;
         if(prepared.confirmation.recollection){await this.volume.recollection.start(id,lease.token);lease.recollectionPolicy=prepared.confirmation.policy;}
@@ -84,6 +89,8 @@ export class RedisDispatcher {
         yield[index++,lease.task];
         if(this.current)throw new Error('VOLUME_PREVIOUS_LEASE_NOT_CONFIRMED');
       }
+      if(plan.priorityActive&&!this.halted&&!await this.stopped())await sleep(5000);
+      }while(plan.priorityActive&&!this.halted&&!await this.stopped());
       return;
     }
     if(correctionPolicy&&(!taskIds||taskIds.length!==1))throw new Error('CORRECTION_EXACT_TASK_REQUIRED');
@@ -220,7 +227,7 @@ export class RedisDispatcher {
     else if (kind === 'release') confirmation = await this.queue.release(taskId, token);
     else if (kind === 'defer') confirmation = await this.queue.defer(taskId, token, result);
     else confirmation = await this.queue.fail(taskId, token, result?.error || result?.status || 'Worker interrupted', result);
-    if(confirmation?.acceptedBySearchExhaustion)console.log(`[搜索耗尽结案] ${result?.keyword||taskId}：成功完成；入库${volumeResult.decision.posts}/${volumeResult.decision.threshold}篇，保留未解决候选${volumeResult.searchExhaustionEvidence.missingCandidateIds.length}条，非P80达标；继续后续任务`);
+    if(confirmation?.acceptedBySearchExhaustion)console.log(`[搜索耗尽结案] ${result?.keyword||taskId}：搜索结束证据已确认；累计入库${volumeResult.decision.posts}篇，保留未解决候选${volumeResult.searchExhaustionEvidence.missingCandidateIds.length}条；继续后续任务`);
     if(confirmation?.acceptedByRiskVolume)console.log(`[风控达量结案] ${result?.keyword||taskId}：数据库数量已达标且本轮入库成功；保留节点冷却，后续不再重采该词`);
     this.current = null;
     try { await this.writeLease({ active: false, validUntil: 0 }); }

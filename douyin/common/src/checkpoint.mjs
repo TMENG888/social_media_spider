@@ -1,3 +1,4 @@
+import {publishOpsState} from './ops-state.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -527,4 +528,5 @@ async function exportCheckpointDetailedImpl(db, outputDir, extra = {}) {
 export async function writeJsonAtomic(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   await atomicWrite(file, JSON.stringify(value, null, 2));
+  publishOpsState(file,value);
 }

@@ -84,3 +84,5 @@ automation-labeling/**/scope_control.json
 automation-labeling/**/status.json
 
 feishu-login-bot/config.json
+
+crawler-ops/config.json

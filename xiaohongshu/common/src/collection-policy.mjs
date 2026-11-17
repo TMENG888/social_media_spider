@@ -25,9 +25,8 @@ export function inTargetYear(value, year, cutoff = `${year}-01-01`) {
   return Boolean(day && day.slice(0, 4) === String(year) && day >= cutoff);
 }
 
-// Only distinct, consecutive detail-page observations count. Unknown or failed
-// details occupy a slot, so eight older observations separated by an unknown
-// cannot accidentally satisfy the stopping rule.
+// Only distinct, consecutive, verified earlier-year detail dates count.
+// Unknown, failed, current-year or future-dated observations break the streak.
 export class YearBoundary {
   constructor(year, size = 8) {
     this.year = Number(year);
@@ -43,12 +42,12 @@ export class YearBoundary {
     return this.reached;
   }
   get reached() {
-    return this.recent.length === this.size && this.recent.every(x => x.date && x.date.slice(0, 4) !== String(this.year));
+    return this.recent.length === this.size && this.recent.every(x => x.date && Number(x.date.slice(0, 4)) < this.year);
   }
 }
 
 // A cap is meaningful only for explicit sampling. Annual collection continues
-// until the verified date boundary or repeated no-growth is observed.
+// until the verified earlier-year boundary or healthy search endpoint is observed.
 export function scrollBudget(collectAll, configured) {
   return collectAll ? Infinity : Math.max(1, Number(configured) || 20);
 }

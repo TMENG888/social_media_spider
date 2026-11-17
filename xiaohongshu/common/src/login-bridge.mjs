@@ -1,3 +1,8 @@
+import {inspectBrowserCredential,LOGIN_PROOF_VERSION} from './login-proof.mjs';
+import {inspectLoginFeedback,loginFeedback} from './login-feedback.mjs';
+import {verifyManualLogin} from './recovery-login-check.mjs';
+import {createCaptchaRefresh} from './captcha-refresh.mjs';
+import {inspectHumanChallenge} from './human-challenge.mjs';
 // Runs only inside the existing interactive login recovery process.
 import fs from 'node:fs/promises';
 import {createSmsLogin} from './sms-login.mjs';
@@ -11,7 +16,7 @@ const sha=b=>createHash('sha256').update(b).digest('hex');
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 async function json(file){return JSON.parse((await fs.readFile(file,'utf8')).replace(/^\uFEFF/,''));}
-async function atomic(file,value){const tmp=file+'.'+process.pid+'.tmp';await fs.writeFile(tmp,JSON.stringify(value));await fs.rename(tmp,file);}
+import {atomicLoginState as atomic} from './login-state-io.mjs';
 export function validateCommand(c,s,now=Date.now()){
  if(!c||!uuid.test(c.commandId||'')||c.sessionId!==s.sessionId||c.machine!==s.machine||c.platform!==s.platform||c.workerId!==s.workerId)throw new Error('TARGET_OR_SESSION_MISMATCH');
  if(!['refresh','screenshot','status','submit_sms','request_sms'].includes(c.action))throw new Error('ACTION_NOT_ALLOWED');
@@ -26,7 +31,8 @@ export async function startLoginBridge({common,worker,context,page,platform,inci
  try{const v=await json(path.join(worker,'.state','monitor-supervisor.json')),age=Date.now()-Date.parse(v.updatedAt);if(Number.isInteger(v.supervisorPid)&&age>=-5000&&age<45000){process.kill(v.supervisorPid,0);supervisor={pid:v.supervisorPid,sessionId:v.sessionId};}}catch{}
  const s={schema:1,sessionId:randomUUID(),machine:config.machine,hostname:os.hostname(),platform,workerId:path.basename(worker),incidentId:incidentId||null,pid:process.pid,supervisor,createdAt:Date.now(),updatedAt:Date.now(),phase:'opening',generation:0,image:null,ack:null};
  const smsLogin=createSmsLogin({page,platform,session:s,assertAllowed});
- let busy=false,closed=false,timer,lastRefresh=0,lastOpen=0,lastCapture=0,seen=new Set();
+ const captchaRefresh=createCaptchaRefresh({page,platform,session:s,file:path.join(root,'captcha-refresh.json'),assertAllowed});
+ let busy=false,closed=false,timer,lastRefresh=0,lastOpen=0,lastCapture=0,seen=new Set(),validatedProof=null,smsWasVisible=false,sawIntermediate=false;
  const accountObserver=observeAccountNickname({context,stateRoot:path.join(worker,'.state'),platform});
  const persist=async()=>{s.account=await accountObserver.snapshot();s.updatedAt=Date.now();await atomic(path.join(root,'session.json'),s);};
  const targetAllowed=()=>{const u=new URL(page.url());return u.protocol==='https:'&&(platform==='小红书'?/(^|\.)xiaohongshu\.com$/i:/(^|\.)douyin\.com$/i).test(u.hostname);};
@@ -65,12 +71,23 @@ export async function startLoginBridge({common,worker,context,page,platform,inci
   return false;
  }
  async function capture(){
-  const access=await check();
-  if(access.evidence==='sms_identity_verification'){const sms=await smsLogin.observe();s.image=null;s.phase=sms?.phase||'sms_manual';s.sms=sms?.sms||null;s.smsReason=sms?.reason||null;s.smsRequest=sms?.request||null;return false;}
-  if(s.sms){smsLogin.clear();s.sms=null;}
+ const access=await check();
+ s.feedback=await inspectLoginFeedback(page,platform);
+ const credential=await inspectBrowserCredential(context,platform);
+ s.auth={version:LOGIN_PROOF_VERSION,credentialPresent:credential.credentialPresent,verified:false,checkedAt:credential.checkedAt};
+ s.captchaRefresh=await captchaRefresh.observe(access);
+ s.challenge=null;
+ if(access.kind==='captcha'&&access.evidence!=='sms_identity_verification'){
+  try{s.challenge={...(await inspectHumanChallenge(page,platform)),observedAt:Date.now()};}
+  catch{s.challenge={type:'unknown',evidence:'challenge_type_unconfirmed',observedAt:Date.now()};}
+ }
+ if(access.evidence==='sms_identity_verification'){smsWasVisible=true;sawIntermediate=true;const sms=await smsLogin.observe();s.image=null;s.phase=sms?.phase||'sms_manual';s.sms=sms?.sms||null;s.smsReason=sms?.reason||null;s.smsPolicyVersion=sms?.policyVersion||null;s.smsRequest=sms?.request||null;s.feedback=sms?.feedback||null;if(s.feedback?.type==='sms_code_incorrect')s.phase='sms_rejected';if(s.feedback?.type==='sms_code_expired')s.phase='sms_expired';return false;}
+  if(smsWasVisible){smsLogin.clear();Object.assign(smsLogin,createSmsLogin({page,platform,session:{...s,ack:null,smsRequest:null},assertAllowed}));smsWasVisible=false;s.sms=null;s.smsReason=null;s.smsRequest=null;}
   if(['security','captcha','gateway'].includes(access.kind)){s.phase='manual_'+access.kind;s.image=null;return false;}
-  if(access.kind!=='login'||await scanPending()){s.phase='verifying';s.image=null;return false;}
-  if(await expired()){s.phase='qr_expired';s.image=null;return false;}
+  if(s.feedback?.type==='qr_expired'||await expired()){s.phase='qr_expired';s.feedback||=loginFeedback('qr_expired');s.image=null;return false;}
+  if(s.feedback?.type==='qr_rejected'){s.phase='qr_rejected';s.image=null;return false;}
+  if(access.kind!=='login'||await scanPending()){sawIntermediate=true;s.phase='verifying';s.image=null;return false;}
+  if(sawIntermediate)s.feedback=loginFeedback('login_required_again');
   let el=await qr();
   if(!el&&Date.now()-lastOpen>60000){
    lastOpen=Date.now();
@@ -94,20 +111,29 @@ export async function startLoginBridge({common,worker,context,page,platform,inci
   try{
    if(c.action==='request_sms'){
     const access=await check();if(access.evidence!=='sms_identity_verification')throw Error('SMS_PAGE_REQUIRED');
-    const sms=await smsLogin.requestFresh();s.phase=sms.phase;s.sms=sms.sms;s.smsRequest=sms.request;s.smsReason=null;s.image=null;
+    const sms=await smsLogin.requestFresh();s.phase=sms.phase;s.sms=sms.sms;s.smsRequest=sms.request;s.smsReason=null;s.feedback=null;s.image=null;
    }else if(c.action==='submit_sms'){
     const access=await check();if(access.evidence!=='sms_identity_verification')throw Error('SMS_PAGE_REQUIRED');
-    await smsLogin.submit(c);s.phase='sms_submitted';s.image=null;
+    await smsLogin.submit(c);s.phase='sms_submitted';s.feedback=null;s.image=null;
    }else if(c.action!=='status'){
-    if(s.phase.startsWith('sms_')||s.phase==='waiting_sms')throw Error('SMS_VERIFICATION_IN_PROGRESS');
-    if(await scanPending()){s.phase='verifying';s.image=null;throw new Error('SCAN_CONFIRMATION_PENDING');}
-    const access=await check();if(access.kind!=='login')throw new Error('REFRESH_REQUIRES_LOGIN_ONLY');
+    const restartSms=c.action==='refresh'&&platform==='小红书'&&s.phase==='sms_send_failed'&&s.smsRequest?.source==='platform_send_response'&&s.smsRequest?.restartRequired===true;
+    if((s.phase.startsWith('sms_')||s.phase==='waiting_sms')&&!restartSms)throw Error('SMS_VERIFICATION_IN_PROGRESS');
+    if(!restartSms&&await scanPending()){s.phase='verifying';s.image=null;throw new Error('SCAN_CONFIRMATION_PENDING');}
+    const access=await check();if(access.kind!=='login'&&!restartSms)throw new Error('REFRESH_REQUIRES_LOGIN_ONLY');
     if(c.action==='refresh'){
      if(Date.now()-lastRefresh<15000)throw new Error('REFRESH_RATE_LIMIT_15_SECONDS');
      lastRefresh=Date.now();const old=s.lastQrHash;
+     if(restartSms){
+      // The platform rejected this SMS session and explicitly requires a restart.
+      // Preserve the browser profile; never log out or refresh an active SMS.
+      await assertAllowed();await page.reload({waitUntil:'domcontentloaded',timeout:30000});
+      smsLogin.clear();s.sms=null;s.smsRequest=null;s.smsReason=null;s.phase='opening';
+      Object.assign(smsLogin,createSmsLogin({page,platform,session:{...s,ack:null,smsRequest:null},assertAllowed}));
+     }else{
      const refresh=page.getByText(/^(?:刷新二维码|点击刷新|点击刷新二维码|重新获取二维码|刷新|重新加载)$/).first();
      if(await refresh.isVisible().catch(()=>false))await refresh.click({timeout:2500});
      else await page.reload({waitUntil:'domcontentloaded',timeout:30000});
+     }
      let changed=false;
      for(let i=0;i<8;i++){await delay(800);if(await capture()&&s.image?.sha256!==old){changed=true;break;}}
      if(!changed)throw new Error('QR_REFRESH_NOT_CONFIRMED');
@@ -121,7 +147,7 @@ export async function startLoginBridge({common,worker,context,page,platform,inci
    await assertAllowed();
    let c;try{c=await json(path.join(root,'command.json'));}catch(e){if(e.code!=='ENOENT'&&!(e instanceof SyntaxError))throw e;}
    if(c&&!seen.has(c.commandId)){try{await command(c);}catch(e){if(uuid.test(c.commandId||'')){seen.add(c.commandId);s.ack={commandId:c.commandId,ok:false,reason:e.message,at:Date.now()};}}}
-   if(Date.now()-lastCapture>8000){lastCapture=Date.now();await capture();}
+   if(Date.now()-lastCapture>1500){lastCapture=Date.now();await capture();}
    delete s.error;
   }catch(e){s.phase='unavailable';s.image=null;s.error=String(e.message).split('：')[0].slice(0,90);}
   finally{await persist().catch(()=>{});busy=false;}
@@ -129,7 +155,7 @@ export async function startLoginBridge({common,worker,context,page,platform,inci
  await persist();timer=setInterval(()=>{void tick();},2000);timer.unref();void tick();
  async function stop(phase){closed=true;clearInterval(timer);accountObserver.stop();smsLogin.clear();s.sms=null;await accountObserver.flush().catch(()=>{});for(let i=0;busy&&i<240;i++)await delay(250);if(busy)throw new Error('BRIDGE_BUSY');s.phase=phase;s.image=null;await persist();}
  return {verification:check=>{s.verification={ok:check.ok,reason:check.reason,at:Date.now()};},
-  prepareClose:()=>stop('verifying'),verified:async()=>{s.phase='verified';s.verifiedAt=Date.now();await persist();},
+  prepareClose:async()=>{const proof=await verifyManualLogin(context,platform,{settleMs:800});if(!proof.ok||!proof.credentialVerified||proof.proofVersion!==LOGIN_PROOF_VERSION)throw Error('LOGIN_CREDENTIAL_NOT_VERIFIED');validatedProof=proof;await stop('verifying');},verified:async()=>{if(!validatedProof?.credentialVerified||Date.now()-Date.parse(validatedProof.verifiedAt)>60000)throw Error('LOGIN_CREDENTIAL_NOT_VERIFIED');s.auth={version:LOGIN_PROOF_VERSION,credentialPresent:true,verified:true,checkedAt:Date.now()};s.feedback=null;s.phase='verified';s.verifiedAt=Date.now();await persist();},
   close:async()=>{if(!closed)await stop('cancelled');else if(s.phase!=='verified'){s.phase='cancelled';await persist();}}};
 }
 
@@ -138,17 +164,27 @@ export async function startLoginBridge({common,worker,context,page,platform,inci
 export async function noteTaskResumed({worker,stateRoot,keyword,evidence='original_supervisor_worker_entered_keyword'}){
  const root=path.join(worker,'.state','login-bridge');
  let s;try{s=await json(path.join(root,'session.json'));}catch(e){if(e.code==='ENOENT')return;throw e;}
- if(s.phase!=='verified'||!s.supervisor||s.supervisor.pid!==process.ppid||s.hostname!==os.hostname()||!Number.isFinite(s.verifiedAt)||Date.now()<s.verifiedAt||Date.now()-s.verifiedAt>86400000)return;
+ if(s.phase!=='verified'||(s.supervisor&&s.supervisor.pid!==process.ppid)||s.hostname!==os.hostname()||!Number.isFinite(s.verifiedAt)||Date.now()<s.verifiedAt||Date.now()-s.verifiedAt>86400000)return;
+ const attachSupervisor=!s.supervisor;
+ if(attachSupervisor&&Date.now()-s.verifiedAt>3600000)return;
  if(s.platform==='抖音'&&evidence!=='original_supervisor_content_imported')return;
  const v=await json(path.join(worker,'.state','monitor-supervisor.json'));
  const age=Date.now()-Date.parse(v.updatedAt);
  // The supervisor file records phase boundaries, not a periodic heartbeat.
  // Content import can finish minutes after entering the collecting phase.
- if(v.sessionId!==s.supervisor.sessionId||v.supervisorPid!==process.ppid||!(age>=-5000&&age<=86400000))return;
+ if((s.supervisor&&v.sessionId!==s.supervisor.sessionId)||v.supervisorPid!==process.ppid||v.state!=='collecting'||!(age>=-5000&&age<=86400000))return;
  try{process.kill(process.ppid,0);}catch{return;}
  const lock=await json(path.join(stateRoot,'worker.lock'));if(lock.pid!==process.pid)return;
  for(const name of ['supervisor.stop','stop.requested']){try{await fs.access(path.join(stateRoot,name));return;}catch(e){if(e.code!=='ENOENT')throw e;}}
  try{const previous=await json(path.join(root,'resume.json'));if(previous.sessionId===s.sessionId)return;}catch(e){if(e.code!=='ENOENT')throw e;}
+ if(attachSupervisor){
+  const lockStarted=Date.parse(lock.at||lock.startedAt||'');
+  if(!Number.isFinite(lockStarted)||lockStarted<s.verifiedAt)return;
+  const latest=await json(path.join(root,'session.json'));
+  if(latest.sessionId!==s.sessionId||latest.phase!=='verified'||latest.verifiedAt!==s.verifiedAt||latest.supervisor)return;
+  s={...latest,supervisor:{pid:process.ppid,sessionId:v.sessionId}};
+  await atomic(path.join(root,'session.json'),s);
+ }
  await atomic(path.join(root,'resume.json'),{schema:1,sessionId:s.sessionId,workerId:s.workerId,platform:s.platform,machine:s.machine,
   supervisor:s.supervisor,workerPid:process.pid,keyword,at:Date.now(),evidence});
 }

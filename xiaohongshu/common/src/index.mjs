@@ -1,3 +1,12 @@
+import {ensureStartupViewport} from './startup-viewport.mjs';
+import {ARTICLE_COMMENT_TARGET_POLICY,markCommentProcessing,commentEvidence,selectArticleComments,targetProof,validTargetProof} from './article-comment-target.mjs';
+import {consumeSearchCandidates} from './year-boundary-stop.mjs';
+import {FRONTEND_BUDGET_VERSION,ForegroundBudget,withForegroundBudget,checkForegroundBudget,isForegroundTimeout,frontendClosed,withoutForegroundBudget} from './foreground-budget.mjs';
+import {completeForegroundTimeout,retainForegroundComments} from './foreground-completion.mjs';
+import {DETAIL_OBSERVATION_VERSION,inspectDetailInPage,waitForObservedDetail,textlessReview,isTextlessReview,retainTextlessReview} from './detail-observation.mjs';
+import {queueRetainedImports} from './background-recovery.mjs';
+import {ANNUAL_RESUME_VERSION,AnnualCheckpointStore,resumeWindow,cardDate,beforeResumeStart} from './annual-resume.mjs';
+import {redisSettings,connectRedis} from './redis-connection.mjs';
 import {observeAccountNickname} from './account-nickname.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import fs from "node:fs/promises";
@@ -19,9 +28,7 @@ import { openCheckpoint, setMeta, saveCandidates, checkpointCandidates, markComp
 import { recordAsrMediaImport } from './asr-media-cleanup.mjs';
 import {currentMediaSnapshot,bindCurrentMedia} from './media-provenance.mjs';
 import { assessAsrAcceptance } from "./acceptance-gate.mjs";
-import { importRows,mysqlConnectionOptions } from "./import-mysql.mjs";
-import mysql from 'mysql2/promise';
-import {readTaskVolume,validateVolumeSnapshot} from './volume-acceptance.mjs';
+import { importRows } from "./import-mysql.mjs";
 import { POLICY_VERSION, ACCEPTANCE_VERSION, YearBoundary, inTargetYear, validDate, scrollBudget } from "./collection-policy.mjs";
 import { assertLocalLease } from "./lease-guard.mjs";
 import { captureSearchState, closeDetailToSearch, ensureLatestSort, isKeywordSearchUrl, renderedControl, visibleAny, searchEndpointSnapshot, advanceSearchScroll } from "./xhs-browser-state.mjs";
@@ -29,7 +36,7 @@ import { collectionFailurePolicy } from "./collection-failure.mjs";
 import { assertWebNoteAccessible, recoverWebUnavailableToSearch, WebUnavailableStreak, WEB_NOTE_UNAVAILABLE_PATTERN } from "./web-access-state.mjs";
 import { itemPause, waitForPacing } from "./collection-pacing.mjs";
 import { RateLimitCooldown, restrictionKind } from "./rate-limit-cooldown.mjs";
-import {createPageDiagnostics} from './page-diagnostics.mjs';
+import {createPageDiagnostics,traceDetailClick} from './page-diagnostics.mjs';
 import {CollectionCyclePause,pausePlaywright} from './collection-cycle-pause.mjs';
 
 function argsOf(argv) {
@@ -44,9 +51,7 @@ function argsOf(argv) {
 }
 
 const cli = argsOf(process.argv);
-const volumeMode=process.env.SOCIAL_VOLUME_ENABLED==='1';
-const volumeSnapshot=volumeMode?validateVolumeSnapshot(JSON.parse(await fs.readFile(process.env.SOCIAL_VOLUME_SNAPSHOT,'utf8')),{platform:'小红书'}):null;
-const volumeRead=()=>readTaskVolume({connect:()=>mysql.createConnection(mysqlConnectionOptions()),snapshot:volumeSnapshot,taskId:process.env.XHS_LEASE_TASK_ID});
+const annualResumeMode=process.env.XHS_ANNUAL_RESUME==='1';
 const configPath = path.resolve(String(cli.config || "config.json"));
 let fileConfig = {};
 try { fileConfig = JSON.parse(await fs.readFile(configPath, "utf8")); } catch {}
@@ -163,7 +168,7 @@ if (process.platform === "win32") process.on("SIGBREAK", () => requestGracefulSt
 let collectionPause = null;
 const stopRequested = async () => {
   await assertLocalLease();
-  if(signalStopRequested){timingStop('os_signal');return true;}const flagged=Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false));if(flagged)timingStop('stop_file');return flagged;
+  if(signalStopRequested){timingStop('os_signal');return true;}const flagged=Boolean(cfg.stopFile && await fs.access(cfg.stopFile).then(() => true).catch(() => false));if(flagged)timingStop('stop_file');if(!flagged)checkForegroundBudget();return flagged;
 };
 
 async function connectBrowser(...args){return timed('startup',()=>connectBrowserTimingImpl(...args),{});}
@@ -221,23 +226,9 @@ async function assertNoSecurityChallenge(page,{allowWebUnavailable=false}={}) {
   });
 }
 
-async function waitForDetailOrSecurityChallenge(page) {
-  const detailSelector = "#detail-title,#detail-desc";
-  // 安全限制页会替代详情 DOM。等待两种结果中的任意一种，避免先空等完整
-  // navigation timeout，再把风控误记为普通帖子失败并继续消耗其它任务。
-  await assertNoSecurityChallenge(page);
-  await page.waitForFunction(({ selector, securityPattern, unavailablePattern }) => {
-    const bodyText = document.body?.innerText || "";
-    const visible = [...document.querySelectorAll(selector)].some(node => {
-      const box = node.getBoundingClientRect(), style = getComputedStyle(node);
-      return box.width > 0 && box.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-    });
-    return visible || new RegExp(securityPattern).test(bodyText) || new RegExp(unavailablePattern).test(bodyText);
-  }, { selector: detailSelector, securityPattern: SECURITY_CHALLENGE_PATTERN.source, unavailablePattern: WEB_NOTE_UNAVAILABLE_PATTERN.source }, { timeout: cfg.timeout });
-  await assertNoSecurityChallenge(page);
-  if (!await visibleAny(page, detailSelector)) {
-    throw new Error("DETAIL_NOT_RENDERED：详情页主体未显示");
-  }
+async function waitForDetailOrSecurityChallenge(page,noteId='') {
+  return waitForObservedDetail(page,{noteId,timeout:cfg.timeout,assertSafe:assertNoSecurityChallenge,
+    securityPattern:SECURITY_CHALLENGE_PATTERN.source,unavailablePattern:WEB_NOTE_UNAVAILABLE_PATTERN.source});
 }
 
 async function* collectSearchLinks(...args){const iterator=collectSearchLinksTimingImpl(...args);try{while(true){const item=await timed('search',()=>iterator.next());if(item.done)return item.value;yield item.value;}}finally{await iterator.return?.();}}
@@ -349,7 +340,7 @@ async function* collectSearchLinksTimingImpl(page, keyword, progress) {
 }
 
 async function expandComments(...args){return timed('comment_expand_batch',()=>expandCommentsTimingImpl(...args),{});}
-async function expandCommentsTimingImpl(page) {
+async function expandCommentsTimingImpl(page,onSnapshot=async()=>{}) {
   for (let round = 0; round < cfg.maxCommentScrolls; round += 1) {
     const expanders = page.getByText(/展开.*回复|查看更多回复|展开更多/, { exact: false });
     const count = await expanders.count().catch(() => 0);
@@ -360,6 +351,7 @@ async function expandCommentsTimingImpl(page) {
     const list = page.locator(".comments-container,.list-container").last();
     if (await list.count()) await timed('comment_scroll',()=>list.evaluate((node) => node.scrollBy(0, node.scrollHeight)),{round}).catch(error=>timingFailure('comment_scroll_failure',error,{round}));
     else await timed('comment_scroll',()=>page.mouse.wheel(0,800),{round});
+    await onSnapshot();
     timingProgress('comment_progress',{round,availableControls:count});
     await rand(Math.max(700, Math.floor(cfg.actionDelayMs[0] / 2)), Math.max(1400, Math.floor(cfg.actionDelayMs[1] / 2)));
   }
@@ -382,9 +374,42 @@ async function parseCommentItemDetailedImpl(item) {
   };
 }
 
+
+async function snapshotLoadedComments(page,post,context){
+ const raw=await page.locator('.list-container .parent-comment').evaluateAll(roots=>roots.map(root=>({
+  items:[...root.querySelectorAll('.comment-item')].map(item=>({
+   id:item.id,author:item.querySelector('.author .name,a.name')?.textContent?.trim(),
+   link:item.querySelector('a.name[href*="/user/profile/"],a[href*="/user/profile/"]')?.getAttribute('href'),
+   content:item.querySelector('.content .note-text,.content')?.textContent?.trim(),
+   date:item.querySelector('.info .date,.date')?.textContent?.trim(),location:item.querySelector('.info .location,.location')?.textContent?.trim(),
+   likes:item.querySelector('.info .like .count,.like-wrapper .count')?.textContent?.trim()
+  }))
+ })));
+ // Virtualized comments can disappear from the DOM after scrolling. Keep all
+ // observed nodes in memory until this item's local checkpoint is committed.
+ const snapshots=context.frontDraft?.threadSnapshots||new Map();
+ if(context.frontDraft)context.frontDraft.threadSnapshots=snapshots;
+ for(const thread of raw){
+  const key=thread.items[0]?.id;if(!key)continue;
+  const prior=snapshots.get(key)||{items:[]},items=new Map(prior.items.map(item=>[item.id,item]));
+  for(const item of thread.items){if(item.id)items.set(item.id,item);}
+  snapshots.set(key,{items:[...items.values()]});
+ }
+ const rows=[],audits=[];
+ for(const thread of snapshots.values()){
+  const items=thread.items.map(x=>({commentId:extractId(x.id,'comment'),author:removeEmoji(x.author),content:removeEmoji(x.content),userLink:x.link?new URL(x.link,'https://www.xiaohongshu.com').toString():null,userId:extractId(x.link,'user'),dateText:x.date,location:x.location,likeCount:x.likes==='赞'?0:parseCount(x.likes)}));
+  const root=items[0];if(!root?.commentId||!root.content)continue;const replies=items.slice(1).filter(r=>r.content);
+  const content=cleanText(buildThreadContent(root,replies),{removeEmoji:true,singleParagraph:true}).text;
+  rows.push({...blankRecord(COMMENT_FIELDS),评论id:root.commentId,评论用户链接:root.userLink,评论用户id:root.userId,评论用户名字:root.author,评论内容:content,评论时间:parsePublishedText(root.dateText)||root.dateText,评论IP:root.location,评论点赞数:threadLikeCount(root,replies),评论回复数:replies.length,文章链接:post.文章链接,文章id:post.文章id,关键词:context.keyword,评论获取时间:context.capturedAt,平台:'小红书',项目:context.projectName||cfg.projectName});
+  audits.push({article_id:post.文章id,comment_id:root.commentId,aggregation_mode:'comment_thread',thread_complete:false,captured_reply_count:replies.length,child_comments:replies.map(r=>({comment_id:r.commentId,user_id:r.userId,user_name:r.author}))});
+ }
+ if(context.frontDraft){context.frontDraft.comments=rows;context.frontDraft.commentAudits=audits;}
+}
+
 async function parseThreads(...args){return timed('comments',()=>parseThreadsTimingImpl(...args),{});}
 async function parseThreadsTimingImpl(page, post, context) {
-  await expandComments(page);
+  await snapshotLoadedComments(page,post,context);
+  await expandComments(page,()=>snapshotLoadedComments(page,post,context));
   const rows = [], audits = [];
   const containers = page.locator(".list-container .parent-comment");
   for (let i = 0; i < await containers.count(); i += 1) {
@@ -529,8 +554,16 @@ async function openPostFromSearchTimingImpl(page, note, keyword) {
   const pagesBefore = new Set(page.context().pages());
   await link.scrollIntoViewIfNeeded().catch(() => {});
   await link.evaluate((node) => node.removeAttribute("target")).catch(() => {});
-  await link.click({ timeout: 10000 });
-  await waitForDetailOrSecurityChallenge(page);
+  const diagnostics=pageDiagnosticContexts.get(page);
+  await traceDetailClick(diagnostics,{noteId:note.noteId,keyword},()=>link.click({timeout:10000}));
+  const readyStarted=Date.now();
+  try{
+    await waitForDetailOrSecurityChallenge(page,note.noteId);
+    await diagnostics?.observeDetail('detail_wait_succeeded',{noteId:note.noteId,elapsedMs:Date.now()-readyStarted});
+  }catch(error){
+    await diagnostics?.observeDetail('detail_wait_failed',{noteId:note.noteId,elapsedMs:Date.now()-readyStarted});
+    throw error;
+  }
   const unexpectedPages = page.context().pages().filter((candidate) => !pagesBefore.has(candidate));
   if (unexpectedPages.length) {
     for (const unexpected of unexpectedPages) await unexpected.close().catch(() => {});
@@ -557,7 +590,7 @@ async function closePostToSearchTimingImpl(page, state,{allowWebUnavailable=fals
 async function parsePost(...args){return timed('detail_parse',()=>parsePostTimingImpl(...args),{});}
 async function parsePostTimingImpl(page, note, context, { navigate = true } = {}) {
   if (navigate) await page.goto(note.url, { waitUntil: "domcontentloaded", timeout: cfg.timeout });
-  await waitForDetailOrSecurityChallenge(page);
+  await waitForDetailOrSecurityChallenge(page,note.noteId);
   await page.waitForTimeout(1800);
   await assertNoSecurityChallenge(page);
   // Capture the immutable article URL before visiting the author profile. The
@@ -581,10 +614,17 @@ async function parsePostTimingImpl(page, note, context, { navigate = true } = {}
   if (!inTargetYear(publishedAt, cfg.targetYear, cfg.minPublishedDate || `${cfg.targetYear}-01-01`)) {
     return { outsideYear: true, publishedAt, dateRaw, comments: [] };
   }
+  if(annualResumeMode&&!context.ignoreResumeWindow&&beforeResumeStart(publishedAt,annualWindows.get(context.keyword)))return {outsideResumeWindow:true,publishedAt,comments:[]};
   const scopeEvidence={title,body:parsedDescription.content,tags:parsedDescription.tags};
   const scopeAssessment=assessKeywordScope(context.keyword,{scopeEvidence},{excludedEntities:cfg.scopeExcludedEntitiesByKeyword[context.keyword]||[]});
-  if(scopeAssessment.status==='unobserved')throw new Error('SCOPE_DETAIL_CONTENT_NOT_OBSERVED：未读取到相关性核验正文，不可自动跳过');
-  if(scopeAssessment.status==='out_of_scope')return {outsideScope:true,publishedAt,scopeEvidence,scopeAssessment,comments:[]};
+  const detailObservation={version:DETAIL_OBSERVATION_VERSION,...await page.evaluate(inspectDetailInPage,{noteId:note.noteId})};
+  if(!detailObservation.ready)throw new Error('DETAIL_NOT_RENDERED：详情读取期间当前帖子主体发生变化或尚未加载');
+  if(scopeAssessment.status==='unobserved'){
+    const review=textlessReview({keyword:context.keyword,noteId:note.noteId,publishedAt,scopeEvidence,scopeAssessment,observation:detailObservation});
+    if(review)return review;
+    throw new Error('SCOPE_DETAIL_CONTENT_NOT_OBSERVED：未读取到详情文字，保留待核记录');
+  }
+  if(context.frontDraft)context.frontDraft.post={...blankRecord(POST_FIELDS),文章id:note.noteId||extractId(detailUrl),文章链接:detailUrl,文章标题:title,文章内容:parsedDescription.content,文章标签:parsedDescription.tags,作者名字:authorName,作者主页链接:authorUrl,作者id:extractId(authorUrl,'user'),文章时间地点:publishedAt,平台:'小红书',关键词:context.keyword,项目:context.projectName||cfg.projectName,文章获取时间:context.capturedAt};
   const location = await text(root, [".bottom-container .location", ".note-content .location"]);
   const countValue = async (selectors, zeroLabel) => {
     const value = await text(root, selectors);
@@ -642,9 +682,11 @@ async function parsePostTimingImpl(page, note, context, { navigate = true } = {}
     项目: context.projectName || cfg.projectName, 地点: location || dateRaw?.match(/\s(北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门|海外)$/)?.[1] || null, 内容类型: isVideoPost ? "视频" : images.length ? "图文" : "纯文本",
     是否广告: null, 广告关键词: null
   });
+  if(context.frontDraft)Object.assign(context.frontDraft,{post,asrJob,mediaProvenance:media.ok?media.binding:{verified:false,reason:media.reason||'not_video'}});
   const comments = cfg.collectComments ? await parseThreads(page, post, context) : { rows: [], audits: [] };
   return {
-    post, comments: comments.rows, commentAudits: comments.audits,
+    post, comments: comments.rows, commentAudits: comments.audits,detailObservation,
+    commentCollection:cfg.collectComments?markCommentProcessing(post,comments.rows):null,
     postTextAudit: { article_id: post["文章id"], date_source: "detail_page", date_raw: dateRaw, raw_text: rawContent || "", body_before_cleaning: parsedDescription.bodyBeforeCleaning, cleaned_text: parsedDescription.content, tags: parsedDescription.tags, cleaning_stats: parsedDescription.stats, subtitle_source: subtitle.source, subtitle_status: !isVideoPost ? "not_video" : subtitle.text ? "extracted" : !asrMediaUrl ? "media_url_missing" : asrJob ? "pending" : subtitle.audit?.status === "no_speech" ? "no_speech" : "asr_failed", subtitle_error: subtitle.error || null, subtitle_audit: subtitle.audit || null },
     asrJob,
     mediaProvenance:media.ok?media.binding:{verified:false,reason:media.reason||'not_video'}
@@ -655,6 +697,27 @@ await fs.mkdir(cfg.outputDir, { recursive: true });
 await fs.mkdir(path.dirname(cfg.checkpointDb), { recursive: true });
 configureTiming({directory:path.join(cfg.outputDir,'timing'),platform:'小红书',workerId:process.env.XHS_COOLDOWN_WORKER_ID||path.basename(process.env.XHS_WORKER_ROOT||''),keyword:entries[0]?.keyword||'',topic:entries[0]?.topic||'',runId:cfg.runId,lane:'foreground'});
 const checkpoint = openCheckpoint(cfg.checkpointDb);
+let annualClient=null,annualStore=null;
+if(annualResumeMode){
+ const root=path.resolve(process.env.XHS_WORKER_ROOT||'.');
+ annualClient=await connectRedis(await redisSettings(root));
+ annualStore=new AnnualCheckpointStore({client:annualClient,namespace:`xhs:{${process.env.XHS_LEASE_CAMPAIGN}}`,
+   taskId:process.env.XHS_LEASE_TASK_ID,token:process.env.XHS_LEASE_TOKEN,source:process.env.XHS_CHECKPOINT_SOURCE||root});
+ await annualStore.hydrate(checkpoint,entries[0].keyword);
+}
+const annualWindows=new Map();
+for(const task of entries){
+ let cursor=null;try{cursor=JSON.parse(checkpoint.prepare('SELECT value FROM run_meta WHERE key=?').get(`annual-cursor:${task.keyword}`)?.value||'null');}catch{}
+ const w=resumeWindow(cursor?.publishedAt,{year:cfg.targetYear});annualWindows.set(task.keyword,w);
+ if(annualResumeMode)console.log(`[日期断点] ${task.keyword}：上次留存日期=${w.center||'无'}；窗口=${w.windowStart}至${w.windowEnd}；从${w.start}向前采至${w.cutoff}，帖子ID去重`);
+}
+if(annualResumeMode){
+ for(const task of entries)setMeta(checkpoint,`annual-window:${task.keyword}`,annualWindows.get(task.keyword));
+ await writeJsonAtomic(path.join(cfg.outputDir,'annual_resume_status.json'),{
+  policy:ANNUAL_RESUME_VERSION,runId:cfg.runId,at:new Date().toISOString(),windows:Object.fromEntries(annualWindows),
+  retained:checkpoint.prepare("SELECT COUNT(*) AS n FROM candidate WHERE status='completed'").get().n,
+   phase:'ready_for_platform_access',quantityEarlyStop:process.env.XHS_ARTICLE_COMMENT_TARGET_POLICY===ARTICLE_COMMENT_TARGET_POLICY&&cfg.collectComments&&cfg.collectAllCurrentYear,recollectionMode:false});
+}
 const retryBefore = entries.length===1 ? timedSync('checkpoint_read',()=>retrySnapshot(checkpoint,entries[0].keyword)) : null;timingProgress('keyword_baseline',{priorRetained:retryBefore?.retainedArticleIds?.length||0});
 const repairedQuality = repairCheckpointDataQuality(checkpoint);
 if (repairedQuality.links || repairedQuality.asr) console.log(`[数据质量修复] 文章链接${repairedQuality.links}条，低质量ASR${repairedQuality.asr}条已标记重采`);
@@ -669,12 +732,15 @@ function enqueueImport(keyword, batch) {
   if (!batch.length || cfg.skipImport) return;
   importSeq += 1;
   const batchId = `${stableId(keyword)}-${cfg.runId}-${String(importSeq).padStart(3, "0")}`;
-  importQueue = importQueue.then(() => runIncrementalImport(keyword, batchId, batch)).catch((error) => {
+  importQueue = withoutForegroundBudget(()=>importQueue.then(() => runIncrementalImport(keyword, batchId, batch)).catch((error) => {
     console.warn(`[增量入库] 批次${batchId}失败，任务收尾时仍会全量兜底入库：${String(error?.message || error).split("\n")[0]}`);
-  });
+  }));
 }
 async function runIncrementalImport(...args){return timed('database_batch',()=>runIncrementalImportTimingImpl(...args),{keyword:args[0],lane:'persistence'});}
 async function runIncrementalImportTimingImpl(keyword, batchId, batch) {
+  // A stop keeps unstarted batches in the durable checkpoint; finish only the
+  // active batch rather than making shutdown replay the entire historical set.
+  if(await stopRequested())return;
   const posts = batch.map((item) => item.post).filter(Boolean);
   const comments = batch.flatMap((item) => item.comments || []);
   if (!posts.length) return;
@@ -700,6 +766,11 @@ async function runIncrementalImportTimingImpl(keyword, batchId, batch) {
       try { recordAsrMediaImport(checkpoint,{keyword,noteId:item.noteId || item.post['文章id']},item); }
       catch { console.warn('[ASR媒体保留] 入库确认记录未保存；媒体暂留，不影响已提交文章'); }
     }
+    // Only a confirmed base import releases the durable transcription job.
+    for(const item of batch){
+      checkpoint.prepare("UPDATE asr_job SET status='pending' WHERE keyword=? AND note_id=? AND status='waiting_import'").run(keyword,item.noteId||String(item.post.文章id));
+    }
+    asrJobs?.wake();
     await asrJobs?.cleanupMedia();
     await writeJsonAtomic(path.join(batchDir, "mysql_import_status.json"), { status: "success", postResult: result.postResult, commentResult: result.commentResult, batchId, keyword, committedAt: startedAt });
     console.log(`[增量入库] 批次${batchId}：${posts.length}篇帖子、${comments.length}条评论讨论串已入库（累计${incrementalBatches}批次 / ${incrementalPosts}篇）`);
@@ -737,7 +808,12 @@ const asrJobs = cfg.asrEnabled ? new AsrJobProcessor({
     return true; // Explicit commit/readback acknowledgment for media cleanup.
   }
 }) : null;
+if(!cfg.skipImport&&process.env.MYSQL_USER&&process.env.MYSQL_PASSWORD){
+ const recovery=queueRetainedImports({checkpoint,entries,batchSize:cfg.importBatchSize,enqueue:enqueueImport});
+ console.log(`[历史补库后台排队] ${recovery.notes}篇、${recovery.batches}批；不等待补库完成，前台继续恢复采集。`);
+}
 asrJobs?.start();
+console.log(`[单篇前台预算] ${FRONTEND_BUDGET_VERSION}：每篇15分钟；后台转写、入库、取锁排队不计时且不阻塞下一篇`);
 let session = null;
 let searchPage = null;
 let pageDiagnostics = null, failureDiagnostic = null, firstFailureAt = null;
@@ -763,6 +839,7 @@ try {
   session = await connectBrowser();
   observeAccountNickname({context:session.context,stateRoot:path.dirname(cfg.profileDir),platform:'小红书'});
   let rawSearchPage = session.context.pages()[0] || await session.context.newPage();
+  await ensureStartupViewport(rawSearchPage);
   // The callback above runs later, after the same page has been obtained.
   if(collectionPause){
     collectionPause.onResume=async()=>{
@@ -772,7 +849,7 @@ try {
     session={...session,context:pausePlaywright(session.context,collectionPause),
       browser:session.browser?pausePlaywright(session.browser,collectionPause):null};
   }
-  searchPage = collectionPause?pausePlaywright(rawSearchPage,collectionPause):rawSearchPage;
+  searchPage = pausePlaywright(collectionPause?pausePlaywright(rawSearchPage,collectionPause):rawSearchPage,{beforeAction:async()=>{},activeNow:Date.now});
   searchPage.setDefaultTimeout(cfg.timeout);
   pageDiagnostics=createPageDiagnostics({page:searchPage,platform:'小红书',keyword:entries[0]?.keyword||'',
     outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId,pageRole:'search'});
@@ -786,7 +863,7 @@ try {
     pageDiagnosticContexts.set(searchPage,pageDiagnostics);
     pageDiagnostics.mark('keyword_started');
     console.log(`[检索开始] ${task.keyword}`);
-    const progress = { keyword: task.keyword, rounds: 0, discovered: 0, examined: 0, accepted: 0, skipped: 0, excludedScope:0, failed: 0, reason: null };
+    const progress = { targetYear:cfg.targetYear,annualResume:annualResumeMode?annualWindows.get(task.keyword):null,dateDeferred:[],keyword: task.keyword, rounds: 0, discovered: 0, examined: 0, accepted: 0, skipped: 0, excludedScope:0, failed: 0, reason: null };
     searchSummaries.push(progress);
     const saved = new Map(attachScopeAudits(checkpoint,checkpointCandidates(checkpoint, task.keyword),task.keyword).map(item => [item.noteId, item]));
     const boundary = new YearBoundary(cfg.targetYear, cfg.searchStopWindow);
@@ -794,10 +871,30 @@ try {
     const failedNotes = new Set();
     const importBuffer = [];
     const projectName = task.projectName || cfg.projectName;
+    // New collectors must not early-stop beneath an old in-memory worker that
+    // cannot verify and ACK the independent quantity rule yet.
+    const targetEnabled=process.env.XHS_ARTICLE_COMMENT_TARGET_POLICY===ARTICLE_COMMENT_TARGET_POLICY
+      &&cfg.collectComments&&cfg.collectAllCurrentYear&&!directNoteUrl;
+    const targetOptions={keyword:task.keyword,projectName,year:cfg.targetYear,cutoff:cfg.minPublishedDate};
+    const targetReached=()=>{
+      if(!targetEnabled)return false;
+      const proof=targetProof(selectArticleComments([...saved.values()],targetOptions),targetOptions);
+      progress.articleCommentTarget=proof;
+      return validTargetProof(proof,targetOptions);
+    };
+    if(targetEnabled)console.log(`[新增结案条件] ${task.keyword}：累计200篇去重文章及对应评论；最终还需数据库回读，原年度和搜索结束规则保留`);
     async function processNote(note, trackBoundary = true, recoverSaved = false) {
       if (await stopRequested()) throw new Error("STOP_REQUESTED：已在打开下一篇笔记前安全停止");
-      const cached = saved.get(note.noteId);timingProgress('candidate_check',{articleId:note.noteId,priorStatus:cached?.status||'unseen'});
+      const cached = saved.get(note.noteId);if(cached?.status==='front_timeout'||frontendClosed(cached?.result)){if(trackBoundary)boundary.observe(note.noteId,null);timingProgress('checkpoint_skip',{articleId:note.noteId,reason:'foreground_already_completed'});return;}timingProgress('candidate_check',{articleId:note.noteId,priorStatus:cached?.status||'unseen'});
+      if(isTextlessReview(cached,task.keyword)){
+        if(trackBoundary)boundary.observe(note.noteId,null);
+        progress.textlessReview=(progress.textlessReview||0)+1;
+        timingProgress('checkpoint_skip',{articleId:note.noteId,reason:'rendered_without_scope_text_review'});
+        console.log(`[无文字待核] ${note.noteId}：已确认页面打开，未确认相关性；保留证据，不重复等待正文、不计采集成功`);
+        return;
+      }
       if(cached?.status==='skipped_irrelevant'&&verifiedScopeExclusion(cached,task.keyword)){
+        if(trackBoundary)boundary.observe(note.noteId,cached.publishedAt||null);
         progress.examined++;progress.excludedScope++;
         console.log(`[范围排除] ${note.noteId}：已留存关键词锚点缺失证据，不重新采集、不计有效帖子`);
         return;
@@ -805,27 +902,35 @@ try {
       // A parent-keyword reset may revisit a naturally encountered old detail
       // gap once in this scan. Keep its cumulative attempts and old evidence;
       // do not spawn an individual-note recovery task or reset its history.
-      if(!volumeMode&&cached?.status==='dead_letter'){
+      if(cached?.status==='dead_letter'){
         if(trackBoundary)boundary.observe(note.noteId,null);
         progress.deadLetters=(progress.deadLetters||0)+1;
         console.log(`[明确跳过] ${note.noteId}：已保留不可采证据，不自动复活，不计采集成功`);
         return;
       }
-      const retryFailedAsr = !volumeMode && cached?.status === "completed" && cached.attempts < detailAttemptLimit(checkpoint,task.keyword,note.noteId) &&
+      const retryFailedAsr = !annualResumeMode && cached?.status === "completed" && cached.attempts < detailAttemptLimit(checkpoint,task.keyword,note.noteId) &&
         cached.result?.post?.["内容类型"] === "视频" && !cached.result?.post?.["文章视频内容"] &&
         ['asr_failed','media_url_missing','source_recheck_required'].includes(cached.result?.postTextAudit?.subtitle_status);
       if (retryFailedAsr) console.log(`[ASR重试] ${task.keyword} / ${note.noteId}：旧断点为ASR失败，使用本地模型重新解析（第${cached.attempts + 1}次）`);
-      if (cached?.status === "completed" && !retryFailedAsr && cached.projectName === projectName && inTargetYear(cached.publishedAt, cfg.targetYear, cfg.minPublishedDate)) {
+      if (cached?.status === "completed" && !retryFailedAsr && (!targetEnabled||commentEvidence(cached.result)) && cached.projectName === projectName && inTargetYear(cached.publishedAt, cfg.targetYear, cfg.minPublishedDate)) {
         if (trackBoundary) boundary.observe(note.noteId, cached.publishedAt);
         progress.examined += 1;
         progress.accepted += 1;
         timingProgress('checkpoint_skip',{articleId:note.noteId,reason:'local_completed'});console.log(`[断点跳过] ${task.keyword} / ${note.noteId}：已核验${cached.publishedAt}`);
         return;
       }
-      if (cached?.status === "skipped_old" && validDate(cached.publishedAt) && !inTargetYear(cached.publishedAt, cfg.targetYear, cfg.minPublishedDate)) {
+      if (cached?.status === "skipped_old" && cached.result?.source==='detail_page' && validDate(cached.publishedAt) && !inTargetYear(cached.publishedAt, cfg.targetYear, cfg.minPublishedDate)) {
         if (trackBoundary) boundary.observe(note.noteId, cached.publishedAt);
         progress.examined += 1;
         progress.skipped += 1;
+        return;
+      }
+      const visibleDate=cardDate(note.dateText);
+      if(annualResumeMode&&!recoverSaved&&cached?.status!=='completed'&&beforeResumeStart(visibleDate,annualWindows.get(task.keyword))){
+        if(trackBoundary)boundary.observe(note.noteId,null);
+        progress.dateDeferred.push(note.noteId);progress.locating=(progress.locating||0)+1;
+        checkpoint.prepare("UPDATE candidate SET last_error='ANNUAL_DATE_LOCATING' WHERE keyword=? AND note_id=?").run(task.keyword,note.noteId);
+        timingProgress('date_window_locating',{articleId:note.noteId,publishedAt:visibleDate,start:annualWindows.get(task.keyword).start});
         return;
       }
       await contentTiming({keyword:task.keyword,topic:task.topic,articleId:note.noteId},async()=>{
@@ -833,7 +938,7 @@ try {
       // A saved candidate may no longer have a clickable card in the current
       // virtual search list. Verify its original detail URL in a temporary tab
       // instead of repeatedly treating the missing card as a content failure.
-      const detail = recoverSaved ? await session.context.newPage() : searchPage;
+      const detail = recoverSaved ? pausePlaywright(await session.context.newPage(),{beforeAction:async()=>{},activeNow:Date.now}) : searchPage;
       detail.setDefaultTimeout(cfg.timeout);
       const detailDiagnostics=recoverSaved?createPageDiagnostics({page:detail,platform:'小红书',keyword:task.keyword,
         outputDir:cfg.outputDir,workerId:process.env.XHS_COOLDOWN_WORKER_ID||'',runId:cfg.runId,pageRole:'saved_detail'}):pageDiagnostics;
@@ -841,7 +946,9 @@ try {
       let inPlaceState = null;
       let primaryError = null;
       let handledUnavailable=false;
+      let result;const frontDraft={comments:[],commentAudits:[]};const frontBudget=new ForegroundBudget({articleId:note.noteId});
       try {
+       try{await withForegroundBudget(frontBudget,async()=>{
         const useInPlaceClick = !recoverSaved && cfg.detailInteractionMode === "click" && !directNoteUrl;
         if (useInPlaceClick) {
           // Capture before opening: even a partially opened/missing detail must
@@ -855,13 +962,38 @@ try {
           await detail.goto(note.url, { waitUntil: 'domcontentloaded', timeout: cfg.timeout });
           await ensureLogin(detail);
         }
-        const result = await parsePost(detail, note, { keyword: task.keyword, projectName, capturedAt: beijingDateTime(), searchState:inPlaceState }, { navigate: !useInPlaceClick && !recoverSaved });
-        const publishedAt = result.publishedAt || result.post["文章时间地点"];
+        result = await parsePost(detail, note, { keyword: task.keyword, projectName, capturedAt: beijingDateTime(), searchState:inPlaceState,ignoreResumeWindow:recoverSaved,frontDraft }, { navigate: !useInPlaceClick && !recoverSaved });
+       });}catch(error){
+        if(!isForegroundTimeout(error))throw error;
+        const evidence=error.foregroundCompletion;
+        if(frontDraft.post){
+          // Read-only final snapshot: no click, scroll, reload or navigation.
+          await withoutForegroundBudget(()=>snapshotLoadedComments(detail,frontDraft.post,{keyword:task.keyword,projectName,capturedAt:beijingDateTime(),frontDraft})).catch(()=>{});
+          const {threadSnapshots,...partial}=error.partialResult||frontDraft;
+          result=retainForegroundComments({...partial,audit:{...partial.audit,commentsComplete:false,foregroundCompletion:evidence}},cached?.result);
+        }
+        else result=completeForegroundTimeout(checkpoint,task.keyword,note,error,{prior:cached?.result});
+        timingProgress('content_foreground_timeout',{articleId:note.noteId,elapsedMs:evidence.activeMs,reason:'single_content_15min'});
+        console.warn(`[单篇前台超时] ${note.noteId}：结束前台采集并保留已采内容，继续下一篇；后台任务单独处理`);
+        progress.foregroundTimeouts=(progress.foregroundTimeouts||0)+1;
+        if(!result.post){if(trackBoundary)boundary.observe(note.noteId,null);saved.set(note.noteId,{status:'front_timeout',result});await annualStore?.publish(checkpoint,task.keyword,note.noteId);failedNotes.delete(note.noteId);return;}
+       }
+        const publishedAt = result.publishedAt || result.post?.["文章时间地点"];
         unavailableStreak.observe(null);
         if (trackBoundary) boundary.observe(note.noteId, publishedAt);
         consecutiveFailures = 0;
         progress.examined += 1;
-        if(result.outsideScope){
+        if(result.textlessReview){
+          retainTextlessReview(checkpoint,task.keyword,note,result);
+          saved.set(note.noteId,{...note,status:'textless_review',result});
+          progress.textlessReview=(progress.textlessReview||0)+1;
+          timingDisposition('textless_review');timingProgress('detail_rendered_without_scope_text',{articleId:note.noteId});
+          console.log(`[无文字待核] ${note.noteId}：页面、作者、日期和媒体已加载；没有可核验的文字正文，保留链接和媒体待核，继续下一篇`);
+        }else if(result.outsideResumeWindow){
+          progress.dateDeferred.push(note.noteId);
+          checkpoint.prepare("UPDATE candidate SET last_error='ANNUAL_DATE_LOCATING' WHERE keyword=? AND note_id=?").run(task.keyword,note.noteId);
+          timingProgress('date_window_locating',{articleId:note.noteId,publishedAt,start:annualWindows.get(task.keyword).start});
+        }else if(result.outsideScope){
           recordScope(checkpoint,task.keyword,note,result,result.scopeAssessment,{fresh:true});
           progress.excludedScope++;
           console.log(`[范围排除] ${note.noteId}：详情明确命中已配置的范围外实体，已留证；不计采集成功`);
@@ -872,18 +1004,23 @@ try {
         } else {
           recordScope(checkpoint,task.keyword,note,result,assessKeywordScope(task.keyword,result,{excludedEntities:cfg.scopeExcludedEntitiesByKeyword[task.keyword]||[]}));
           const { asrJob, ...storedResult } = result;
-          const audit = { keyword: task.keyword, articleId: result.post["文章id"], title: result.post["文章标题"], status: "已持久化", commentThreads: result.comments.length, missing: POST_FIELDS.filter(f => !["id", "文章图片信息", "文章标注", "分类", "清洗标注", "是否广告", "广告关键词"].includes(f) && result.post[f] == null) };
+          const audit = { ...result.audit, keyword: task.keyword, articleId: result.post["文章id"], title: result.post["文章标题"], status: "已持久化", commentThreads: result.comments.length, missing: POST_FIELDS.filter(f => !["id", "文章图片信息", "文章标注", "分类", "清洗标注", "是否广告", "广告关键词"].includes(f) && result.post[f] == null) };
           timedSync('checkpoint_write',()=>markCompleted(checkpoint, task.keyword, note, { ...storedResult, audit },{asrJob,asrMaxAttempts:cfg.asrJobMaxAttempts}));timingProgress('content_saved',{newToLocal:!cached?.result,afterCount:storedResult.comments?.length||0,beforeCount:cached?.result?.comments?.length||0,deltaCount:Math.max(0,(storedResult.comments?.length||0)-(cached?.result?.comments?.length||0))});
+          await annualStore?.publish(checkpoint,task.keyword,note.noteId,{advance:true});
+          saved.set(note.noteId,checkpointCandidates(checkpoint,task.keyword).find(n=>n.noteId===note.noteId));
           progress.accepted += 1;
           importBuffer.push({ noteId: note.noteId, post: result.post, comments: result.comments });
           if (asrJob) {
             // Ensure the base article exists before a fast ASR completion can upsert its transcript.
             enqueueImport(task.keyword, importBuffer.splice(0));
-            await timed('database_queue_wait',()=>importQueue);
-            asrJobs?.enqueue(asrJob);
+            // Durable ASR intent already lives in markCompleted; only release it
+            // after its base import, without blocking the next foreground item.
+            // runIncrementalImport releases the persisted job on success.
+            // A failed base import keeps it waiting_import for later backfill.
           } else if (importBuffer.length >= cfg.importBatchSize) enqueueImport(task.keyword, importBuffer.splice(0, cfg.importBatchSize));
           console.log(`[详情完成] ${result.post["文章标题"] || note.noteId}，评论讨论串${result.comments.length}条（已写入断点库）`);
         }
+        if(!result.outsideResumeWindow)await annualStore?.publish(checkpoint,task.keyword,note.noteId);
         failedNotes.delete(note.noteId);
       } catch (error) {
         primaryError = error;timingDisposition('failed');
@@ -947,31 +1084,33 @@ try {
         progress.reason = "direct_note";
         progress.discovered = 1;
       } else source = collectSearchLinks(searchPage, task.keyword, progress);
-      for await (const note of source) {
-        progress.freshSearch = true;
-        await processNote(note);
-        if(volumeMode){
-          if(importBuffer.length)enqueueImport(task.keyword,importBuffer.splice(0));
-          await importQueue;
-          const decision=await volumeRead();
-          if(decision.ok&&!process.env.SOCIAL_RECOLLECT_ONCE){progress.reason='volume_threshold';progress.volumeAcceptance=decision;break;}
-        }
-        if(boundary.reached)progress.oldDateWindowObserved=true; // Diagnostic only, never terminate a live search.
-        if (!cfg.collectAllCurrentYear && progress.accepted >= cfg.maxNotesPerKeyword) { progress.reason = "sample_limit"; break; }
+      await consumeSearchCandidates(source,{processNote,boundary,progress,collectAllCurrentYear:cfg.collectAllCurrentYear,maxNotesPerKeyword:cfg.maxNotesPerKeyword,targetReached});
+      if(progress.reason==='article_comment_target'){
+        console.log(`[文章评论数量达标] ${task.keyword}：已留存200篇去重文章及对应评论；停止继续滚动，保全入库后核验；未处理候选和待转写任务按原机制保留`);
+        timingProgress('article_comment_target_stop',{count:200});
       }
-      // A visit is not a disposition: recover both omitted old candidates and
-      // cards that failed this run, once via their saved URL after the verified
-      // search endpoint. Existing per-note attempt limits remain authoritative.
-      if (!volumeMode && progress.reason === "platform_exhausted") {
+      if(progress.reason==='year_boundary'){
+        console.log(`[年度边界停止] ${task.keyword}：已确认最新排序，连续${boundary.size}篇不同笔记的详情日期早于${cfg.targetYear}年；停止继续滚动加载，转入已发现候选处理和入库收尾`);
+        timingProgress('year_boundary_stop',{reason:'verified_consecutive_old_details',beforeCount:boundary.size});
+      }
+      // A search stop is not a candidate disposition. After a verified endpoint
+      // or date boundary, recover known gaps without discovering more cards.
+      // Existing per-note attempt limits remain authoritative.
+      if (['platform_exhausted','year_boundary'].includes(progress.reason)) {
         const remaining = incompleteCandidates(attachScopeAudits(checkpoint,checkpointCandidates(checkpoint,task.keyword),task.keyword),{keyword:task.keyword});
-        for (const note of remaining) await processNote(note, false, true);
+        for (const note of remaining){
+          if(targetReached()){progress.reason='article_comment_target';break;}
+          await processNote(note, false, true);
+        }
+        if(targetReached())progress.reason='article_comment_target';
       }
       const knownGaps=incompleteCandidates(attachScopeAudits(checkpoint,checkpointCandidates(checkpoint,task.keyword),task.keyword),{keyword:task.keyword});
       progress.knownIncomplete=knownGaps.map(n=>n.noteId);
       if(knownGaps.length)console.warn(`[详情缺口保留] ${knownGaps.length}篇未完成，全部保留在80%入库验收分母，不中断已验证搜索终点后的保全入库`);
+      if(annualResumeMode&&knownGaps.length&&!targetReached())throw new Error('ANNUAL_KNOWN_GAPS：仍有未完成帖子，保留日期断点等待继续，不结案');
       if (progress.reason === "search_limit") throw new Error("SEARCH_LIMIT_REACHED：样本滚动上限已达到，不能声明年度采集完成");
       const searchCheck=assessSearchAcceptance([progress],{annual:cfg.collectAllCurrentYear,direct:Boolean(directNoteUrl)});
-      if(!volumeMode&&!searchCheck.ok)throw new Error('SEARCH_END_UNVERIFIED：未验证搜索终点');
+      if(!searchCheck.ok&&!targetReached())throw new Error('SEARCH_END_UNVERIFIED：未验证年度日期边界或搜索终点');
     } finally {
       if (importBuffer.length) enqueueImport(task.keyword, importBuffer.splice(0));
       await importQueue;
@@ -993,11 +1132,11 @@ try {
 } finally {
   await collectionPause?.close();
   await timed('persistence_queue_drain',()=>importQueue).catch(() => {});
-  const asrSummary = await timed('asr_finalize',()=>finalizeAsr(asrJobs,{volumeMode,readStats:()=>asrJobStats(checkpoint)})).catch((error) => {
+  const asrSummary = await timed('asr_finalize',()=>finalizeAsr(asrJobs,{closeOnly:annualResumeMode,readStats:()=>asrJobStats(checkpoint)})).catch((error) => {
     console.warn(`[ASR队列] 收尾异常，未完成任务仍保存在asr_job：${String(error.message || error).split("\n")[0]}`);
     return null;
   });
-  const asrAcceptance=assessAsrAcceptance(asrSummary,{required:!volumeMode&&Boolean(asrJobs),allowExhaustedSkip:true});
+  const asrAcceptance=assessAsrAcceptance(asrSummary,{required:!annualResumeMode&&Boolean(asrJobs),allowExhaustedSkip:true});
   const skippedDetails=Number(checkpoint.prepare("SELECT COUNT(*) AS n FROM note_dead_letter WHERE status='dead_letter'").get().n);
   if(runStatus==='completed' && asrAcceptance.status==='accepted_with_skips'){
     runStatus='completed_with_skips';
@@ -1010,21 +1149,35 @@ try {
     console.warn("[ASR任务保留] 文章采集结果已保存；关键词任务不会确认完成，待ASR环境恢复后重新领取并补齐字幕");
   }
   if(runStatus==='completed' && skippedDetails>0)runStatus='completed_with_skips';
+  if(annualStore){
+    try{for(const n of checkpointCandidates(checkpoint,entries[0].keyword))await annualStore.publish(checkpoint,entries[0].keyword,n.noteId);}
+    catch(e){
+      console.warn(`[年度断点同步] 本地断点已保留；共享同步未确认：${e.code||'SYNC_FAILED'}`);
+      if(['completed','completed_with_skips'].includes(runStatus)){runStatus='incomplete';runError=new Error('ANNUAL_SYNC_UNCONFIRMED');}
+    }
+  }
   const searchAcceptance=assessSearchAcceptance(searchSummaries,{annual:cfg.collectAllCurrentYear,direct:Boolean(directNoteUrl)});
+  const articleCommentTarget=searchSummaries.length===1?searchSummaries[0].articleCommentTarget||null:null;
+  const targetAccepted=validTargetProof(articleCommentTarget,{keyword:entries[0]?.keyword,projectName:entries[0]?.projectName||cfg.projectName});
   const scopeAcceptance={ok:true,unknownCountedAsFailure:true,acceptanceVersion:ACCEPTANCE_VERSION,
     policy:SCOPE_POLICY,tasks:entries.map(task=>({keyword:task.keyword,...scopeSummary(checkpoint,task.keyword)}))};
-  if(!volumeMode&&['completed','completed_with_skips'].includes(runStatus)&&!searchAcceptance.ok){
+  if(['completed','completed_with_skips'].includes(runStatus)&&!searchAcceptance.ok&&!targetAccepted){
     runStatus='incomplete';runError=new Error('SEARCH_END_UNVERIFIED');
   }
   setMeta(checkpoint, "last_run", { status: runStatus, error: runError ? String(runError.message || runError) : null, finishedAt: beijingDateTime() });
-  const retryObservation=retryBefore ? {before:retryBefore,after:retrySnapshot(checkpoint,entries[0].keyword),freshSearch:searchSummaries.some(s=>s.freshSearch),boundedRecoverySearch:false,asrDrainConfirmed:Boolean(!asrJobs||(asrSummary&&!volumeMode))} : null;
+  const retryObservation=retryBefore ? {before:retryBefore,after:retrySnapshot(checkpoint,entries[0].keyword),freshSearch:searchSummaries.some(s=>s.freshSearch),boundedRecoverySearch:false,asrDrainConfirmed:Boolean(!asrJobs||(asrSummary&&!annualResumeMode))} : null;
   const exported = await exportCheckpoint(checkpoint, cfg.outputDir, { browserMode: session?.mode || null, status: runStatus, policyVersion: POLICY_VERSION, searchSummaries, targetYear: cfg.targetYear, cutoff: cfg.minPublishedDate, projectName: cfg.projectName, category: null, keywords: entries.map((x) => x.keyword), collectComments: cfg.collectComments, outputDir: cfg.outputDir, requiresHumanReview: false, databaseImported: false, finishedAt: beijingDateTime(), error: runError ? String(runError.message || runError) : null });
-  await writeJsonAtomic(path.join(cfg.outputDir, "collector_status.json"), { searchAcceptance,scopeAcceptance,retryObservation, cooldownPublication, runId: cfg.runId, policyVersion: POLICY_VERSION, status: runStatus, searchSummaries, error: runError ? String(runError.message || runError) : null, firstFailureAt,pageDiagnostics:failureDiagnostic,posts: exported.posts.length, commentThreads: exported.comments.length, deadLetterNotes:exported.summary.deadLetterNotes,collectionCompleteness:exported.summary.collectionCompleteness,asrJobs: asrSummary, incrementalImports: { batches: incrementalBatches, posts: incrementalPosts, comments: incrementalComments }, checkpointDb: cfg.checkpointDb, finishedAt: beijingDateTime() });
+  await writeJsonAtomic(path.join(cfg.outputDir, "collector_status.json"), { annualResumePolicy:annualResumeMode?ANNUAL_RESUME_VERSION:null,annualResume:annualResumeMode?Object.fromEntries(annualWindows):null,articleCommentTarget,searchAcceptance,scopeAcceptance,retryObservation, cooldownPublication, runId: cfg.runId, policyVersion: POLICY_VERSION, status: runStatus, searchSummaries, error: runError ? String(runError.message || runError) : null, firstFailureAt,pageDiagnostics:failureDiagnostic,posts: exported.posts.length, commentThreads: exported.comments.length, deadLetterNotes:exported.summary.deadLetterNotes,collectionCompleteness:exported.summary.collectionCompleteness,asrJobs: asrSummary, incrementalImports: { batches: incrementalBatches, posts: incrementalPosts, comments: incrementalComments }, checkpointDb: cfg.checkpointDb, finishedAt: beijingDateTime() });
+  if(annualStore){
+    try{for(const n of checkpointCandidates(checkpoint,entries[0].keyword))await annualStore.publish(checkpoint,entries[0].keyword,n.noteId);}
+    catch(e){console.warn(`[年度断点同步] 本地断点已保留；共享同步未确认：${e.code||'SYNC_FAILED'}`);}
+  }
   pageDiagnostics?.dispose();
   await asrJobs?.close().catch(() => {});
   await asrService?.close().catch(() => {});
   if (session?.owned) await session.context.close().catch(() => {});
   else await session?.browser?.close().catch(() => {});
+  await annualClient?.close().catch(()=>{});
   checkpoint.close();
 }
 if (runError) process.exitCode = runStatus === "partial_stopped" ? 4 : 3;

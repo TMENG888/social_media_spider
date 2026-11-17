@@ -29,7 +29,8 @@ export async function redisSettings(root, env = process.env) {
   return { url, username: env.REDIS_USERNAME || config.username || undefined,
     password: env.REDIS_PASSWORD || undefined, campaign, leaseMs, heartbeatMs, commandTimeoutMs,
     heartbeatRetryMs, leaseSafetyMs,
-    maxAttempts: Number(config.maxAttempts ?? 3), retryDelayMs: Number(config.retryDelayMs ?? 60000) };
+    maxAttempts: Number(config.maxAttempts ?? 3), retryDelayMs: Number(config.retryDelayMs ?? 60000),
+    taskPoolCampaign: config.taskPoolCampaign || null };
 }
 
 // Commands are never queued offline. A later explicit call may reconnect, but every
@@ -92,4 +93,3 @@ export async function connectRedis(settings) {
       raw = null;
     } };
 }
-

@@ -148,6 +148,10 @@ end
 local field=id..'|'..generation
 local old=redis.call('HGET',status,id)
 local count=tonumber(redis.call('HGET',tries,field)) or 0
+local pass=task.queue and task.queue.tasks and task.queue.tasks[1] and task.queue.tasks[1].collectionPass
+if pass and mode~='finish' and old and redis.call('HGET',history,field..'|completion') then
+ local r=cjson.decode(old);if r.status=='completed' and r.accepted==true then return cjson.encode({status='completed',changed=false}) end
+end
 local exhausted_field=field..'|retry-exhausted-completion'
 local exhausted_ledger=redis.call('HGET',history,exhausted_field)
 if old and exhausted_ledger then
@@ -220,7 +224,7 @@ local value=cjson.encode({status='completed',accepted=true,businessCompleted=tru
  retryExhaustedCompletion=exhausted,attempts=count,retryBudget=tonumber(ARGV[12]),missingPosts=math.max(0,d.threshold-d.posts),
  qualityVerified=false,subtitleRetriesRequired=false,volumeAcceptance=d,topic=task.topic,
  keyword=task.keyword,messageId=mid,updatedAt=ARGV[14],worker=consumer})
-if d.posts>=d.threshold or annual_ok or exhausted then
+if (d.posts>=d.threshold and (not pass or mode=='finish')) or annual_ok or exhausted then
  if not redis.call('HGET',history,field) then redis.call('HSET',history,field,archive) end
  redis.call('HSET',history,field..'|completion',archive)
  if annual_ok then redis.call('HSET',history,annual_field,cjson.encode({generation=generation,completedResult=value,archive=archive,at=now})) end
@@ -525,6 +529,10 @@ def open_runtime(api,args,tasks):
         if getattr(args, 'only_task_id', None):
             raise RuntimeError('SELECTED_ORIGINAL_REQUIRES_VOLUME_POLICY')
         return None
+    comment_tasks=[t for t in tasks if (t.get('queue') or {}).get('tasks',[{}])[0].get('collectionPass')]
+    if comment_tasks:
+        api.ensure_group(args.redis_url,args.redis_password,args.stream,args.group)
+        api.seed_tasks(args.redis_url,args.redis_password,args.stream,args.prefix+':seeded',comment_tasks)
     return VolumeRuntime(api,args,tasks,config)
 
 

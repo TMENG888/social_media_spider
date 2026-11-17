@@ -28,6 +28,18 @@ function Set-MonitorSupervisorState([string]$Phase,[string]$ResumeAt='') {
   try {
     [IO.File]::WriteAllText($temporary,($document|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temporary -Destination $destination -Force
+    # Public display copy is independent of the authoritative supervisor file.
+    try {
+      $opsDirectory=Join-Path $Worker '.state\ops'
+      [void][IO.Directory]::CreateDirectory($opsDirectory)
+      $opsFile=Join-Path $opsDirectory 'supervisor.json'
+      $opsTemporary=$opsFile+'.tmp-'+$PID
+      $opsStops=@(foreach($stopName in 'supervisor.stop','stop.requested'){if(Test-Path -LiteralPath (Join-Path $Worker ('.state\'+$stopName))){$stopName}})
+      $opsDocument=@{schemaVersion=1;version='ops-state-split-20261111-v1';kind='supervisor';publishedAt=[DateTime]::UtcNow.ToString('o');data=$document;stops=$opsStops}
+      [IO.File]::WriteAllText($opsTemporary,($opsDocument|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+      Move-Item -LiteralPath $opsTemporary -Destination $opsFile -Force
+    }catch{Write-Warning '[Monitoring] Public snapshot unavailable; collection state retained.'}
+
     # Append phase boundaries for hourly keyword timelines. Monitoring failure
     # must never alter collection, protection, login, or task ownership.
     try {
@@ -97,5 +109,42 @@ function Close-MonitorSupervisor([string]$FinalState='exit_unconfirmed') {
     if($script:MonitorSupervisorLock){$script:MonitorSupervisorLock.Dispose();$script:MonitorSupervisorLock=$null}
     $script:MonitorHeartbeatProcess=$null
     $script:MonitorSessionId=$null
+  }
+}
+
+
+# Called only between workers; no live collector or task lease is reused.
+function Wait-ControlFailureRecovery {
+  $RecoveryScript=Join-Path $Common 'src\connection-recovery.mjs'
+  $RecoveryArgs=@('--root',$Common,'--worker-root',$Worker)
+  & $Node $RecoveryScript @RecoveryArgs --action inspect | Out-Host
+  $InspectExit=$LASTEXITCODE
+  if($InspectExit -ne 10){return $false}
+  $Attempt=0
+  while($true){
+    Assert-RemoteControlAvailable
+    Set-MonitorSupervisorState 'reconnecting'
+    $OwnerArgs=@()
+    if($script:MonitorSessionId){$OwnerArgs=@('--supervisor-pid',[string]$PID,'--session',$script:MonitorSessionId)}
+    & $Node $RecoveryScript @RecoveryArgs @OwnerArgs --action recover | Out-Host
+    $RecoveryExit=$LASTEXITCODE
+    Write-MonitorSupervisorDiagnostic 'connection_recovery_attempt' $RecoveryExit
+    if($RecoveryExit -eq 0){Write-Host '[Connection recovery] Ready for original protection gate and a fresh task lease.';return $true}
+    if($RecoveryExit -eq 40){
+      $Attempt=0
+      $Delay=15
+      Write-MonitorSupervisorDiagnostic 'network_wait_no_redis_retry' 40
+    }elseif($RecoveryExit -eq 30){
+      if($Attempt -ge 3){Write-Warning '[Connection recovery] Network is available but Redis verification exhausted three retries; flags retained for review.';return $false}
+      $Delay=@(30,60,120)[$Attempt]
+      $Attempt++
+    }else{Write-Warning '[Connection recovery] Protected stop or local state requires review.';return $false}
+    Write-Host "[Connection recovery] Waiting $Delay seconds before fresh verification; no collection while waiting."
+    for($Waited=0;$Waited -lt $Delay;$Waited+=5){
+      Assert-RemoteControlAvailable
+      & $Node $RecoveryScript @RecoveryArgs --action inspect | Out-Host
+      if($LASTEXITCODE -ne 10){return $false}
+      Start-Sleep -Seconds ([Math]::Min(5,$Delay-$Waited))
+    }
   }
 }

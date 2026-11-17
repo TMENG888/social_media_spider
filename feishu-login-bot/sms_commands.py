@@ -5,10 +5,12 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from login_bridge import fresh as fresh_session
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 COMMAND=re.compile(r'^验证码\s+(work0[1-4])\s+(小红书|抖音)(?:\s+(worker-0[1-5]))?\s+([0-9]{4,8})$',re.I)
+REPLY_CODE=re.compile(r'^验证码\s*(?:（\s*([0-9]{4,8})\s*）|\(\s*([0-9]{4,8})\s*\)|([0-9]{4,8}))$')
 RESEND=re.compile(r'^重发验证码\s+(work0[1-4])\s+(小红书|抖音)(?:\s+(worker-0[1-5]))?$',re.I)
 def sensitive_sms(text):
     text=str(text or '')
@@ -67,6 +69,29 @@ class SmsIntake:
             try:run()
             finally:self.slots.release()
         threading.Thread(target=wrapped,name='sms-command',daemon=True).start()
+    def reply_target(self,event):
+        # A reply ID must name a card this bot actually delivered in this chat.
+        parent=event.get('parent_id') or event.get('reply_to')
+        if event.get('parent_id') and event.get('reply_to') and event['parent_id']!=event['reply_to']:return None
+        if not isinstance(parent,str) or not parent:return None
+        with self.bridge.lock:
+            items=[(k,dict(v)) for k,v in self.bridge.state.items()
+                   if v.get('message_id')==parent and v.get('status')=='sent' and v.get('chat_id')==self.cfg['chat_id']]
+        bindings=[]
+        for key,item in items:
+            fields=key.split(':')
+            if len(fields)!=5 or fields[0]!=self.cfg['chat_id'] or fields[2] not in {'waiting_sms','sms_rejected'}:continue
+            meta=item.get('smsTarget') or {}
+            machines=[meta['machine']] if meta.get('machine') in self.bridge.roots else list(self.bridge.roots)
+            for machine in machines:
+                for root,s in self.bridge.sessions(machine):
+                    ch=s.get('sms') or {}
+                    if (s.get('sessionId')==fields[1] and s.get('phase') in {'waiting_sms','sms_rejected'} and fresh_session(s)
+                        and ch.get('challengeId')==fields[3] and str(ch.get('attempts',0))==fields[4]
+                        and (not meta or all(meta.get(k)==s.get(k) for k in ('machine','platform','workerId','sessionId')))):
+                        bindings.append((s['machine'],s['platform'],s['workerId'],s['sessionId'],ch['challengeId'],ch.get('attempts',0)))
+        return bindings[0] if len(bindings)==1 else None
+
     def execute(self,text,event):
         if (event.get('sender_type')!='user' or event.get('chat_id')!=self.cfg['chat_id'] or event.get('chat_type')!='group'
             or not any(x.get('id')==self.cfg['bot_open_id'] for x in event.get('mentions',[]))):
@@ -75,9 +100,15 @@ class SmsIntake:
         if not -5<=time.time()-created<=60:return '验证码指令已过期，请在当前验证页面重新提供。'
         resend=RESEND.fullmatch(text.strip())
         if resend:return self.request_sms(*resend.groups(),event)
-        m=COMMAND.fullmatch(text.strip())
-        if not m:return '请使用：@本机器人 验证码 work01 抖音 加上短信中的数字验证码。'
-        machine,platform,worker,code=m.groups();machine=machine.lower()
+        reply=REPLY_CODE.fullmatch(text.strip());binding=None
+        if reply:
+            binding=self.reply_target(event)
+            if not binding:return '请直接回复当前有效的短信验证码卡片并 @本机器人；旧卡片或非本次验证卡片不能用于提交。'
+            machine,platform,worker,*_=binding;code=next(x for x in reply.groups() if x is not None)
+        else:
+            m=COMMAND.fullmatch(text.strip())
+            if not m:return '请回复短信验证码卡片并 @本机器人 发送：验证码（手机收到的数字）；也可使用完整的机器和平台指令。'
+            machine,platform,worker,code=m.groups();machine=machine.lower()
         lock=self.bridge.target_lock(machine,platform)
         if not lock.acquire(timeout=8):return '该平台的上一条登录操作尚未结束，未重复提交验证码。'
         try:
@@ -85,6 +116,7 @@ class SmsIntake:
             matches=[(r,s) for r,s in self.bridge.sessions(machine) if s['platform']==platform and (not worker or s['workerId']==worker) and fresh(s) and s['phase'] in {'waiting_sms','sms_rejected'}]
             if len(matches)!=1:return '未找到唯一的待输入短信验证码会话，请先查询该机器的登录状态。'
             root,s=matches[0];ch=s.get('sms') or {};now=time.time()*1000
+            if binding and (s['sessionId'],ch.get('challengeId'),ch.get('attempts',0))!=binding[3:]:return '该卡片对应的短信验证已更换，请回复最新卡片。'
             if (s.get('smsRequest') or {}).get('accepted') is not True:return '尚未确认本次短信发送被平台受理，请先重发验证码或检查该机器页面。'
             if not (isinstance(ch.get('expiresAt'),(int,float)) and now<ch['expiresAt']<=now+305000 and str(uuid.UUID(ch['challengeId']))==ch['challengeId']):return '当前短信验证已过期，请在对应机器检查登录页面。'
             cid=str(uuid.uuid5(uuid.NAMESPACE_URL,'sms-command:'+event['message_id']))
@@ -131,6 +163,7 @@ class SmsIntake:
                 ack=current.get('ack') or {}
                 if ack.get('commandId')!=cid:continue
                 if not ack.get('ok'):
+                    if ack.get('reason')=='SMS_SESSION_RESTART_REQUIRED':return f'{machine} {platform}：平台要求重新开始登录，请 @机器人 刷新登录 {machine} {platform}，随后重新扫码；未再次发送短信。'
                     if ack.get('reason')=='SMS_REQUEST_RATE_LIMIT_60_SECONDS':return '距离上次请求不足60秒，未再次发送短信。'
                     return f'{machine} {platform}：未确认短信重发，请检查该机器的验证页面。'
                 if current['phase'] in {'waiting_sms','sms_send_failed','sms_send_unconfirmed'}:

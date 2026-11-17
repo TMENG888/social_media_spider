@@ -44,6 +44,7 @@ Write-Host "Starting $Mode for $(Split-Path $WorkerRoot -Leaf)..."
 $queueFile = Join-Path $WorkerRoot 'task-queue.json'
 if (-not (Test-Path $queueFile)) { $queueFile = Join-Path $Root 'common\task-queue.json' }
 $queue = Get-Content $queueFile -Raw -Encoding UTF8 | ConvertFrom-Json
+foreach ($entry in $queue.tasks) { $entry | Add-Member -NotePropertyName collectComments -NotePropertyValue $true -Force; if ($entry.id -eq 'topic1') { $entry | Add-Member -NotePropertyName collectionPass -NotePropertyValue 'articles-comments-20261110-v1' -Force } }
 $scopePath = Join-Path $Common 'task-scope.json'
 if (Test-Path -LiteralPath $scopePath) {
   $topicScope = Get-Content -LiteralPath $scopePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -52,7 +53,7 @@ if (Test-Path -LiteralPath $scopePath) {
     if ($topicScope.version -ne 1 -or -not $allowedTopics.Count -or @($allowedTopics | Where-Object { $_ -notin @('topic1','topic2') }).Count) { throw 'TASK_SCOPE_INVALID' }
     $queue.tasks = @($queue.tasks | Where-Object { $_.id -in $allowedTopics })
     if (-not $queue.tasks.Count) { throw 'TASK_SCOPE_EMPTY' }
-    Write-Host '[Topic priority] Only Topic 2 is enabled; Topic 1 checkpoints are retained.'
+    Write-Host ('[Topic priority] Allowed topics: '+($allowedTopics -join ', ')+'; other checkpoints are retained.')
   }
 }
 $configuredMaxResults = if ($queue.PSObject.Properties.Name -contains 'maxResultsPerKeyword') { [int]$queue.maxResultsPerKeyword } else { 0 }
@@ -74,14 +75,14 @@ $post = Join-Path $Root 'common\src\wechat_ods_postprocess.mjs'
 $importer = Join-Path $Root 'common\src\mysql-import.mjs'
 $workerStatus = [ordered]@{workerId=(Split-Path $WorkerRoot -Leaf); mode=$Mode; startedAt=(Get-Date).ToString('o'); tasks=@()}
 $stopFile = Join-Path $WorkerRoot '.state\stop.requested'
-$CompletionSchemaVersion = 'wechat-pagination-v2'
+$CompletionSchemaVersion = 'wechat-articles-comments-v3'
 Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
 foreach ($task in $queue.tasks) {
   if (Test-Path $stopFile) { Write-Host "Safe stop requested; ending the worker session before the next task." -ForegroundColor Yellow; break }
   if (($task.PSObject.Properties.Name -contains 'keywordAllowList') -and @($task.keywordAllowList).Count -eq 0) { $workerStatus.tasks += [pscustomobject]@{taskId=$task.id;status='skipped_unassigned'}; continue }
   $taskFile = Join-Path $Root $task.keywordsFile
-  $taskRoot = Join-Path $WorkerRoot ("runs\" + $task.id)
-  $stateDb = Join-Path $WorkerRoot (".state\" + $task.id + '.sqlite')
+  $localTaskKey = if ($task.collectionPass) { $task.id + '-' + $task.collectionPass } else { $task.id }; $taskRoot = Join-Path $WorkerRoot ("runs\" + $localTaskKey)
+  $stateDb = Join-Path $WorkerRoot (".state\" + $localTaskKey + '.sqlite')
   $screens = Join-Path $WorkerRoot (".state\screenshots\" + $task.id)
   New-Item -ItemType Directory -Force -Path $taskRoot,$screens | Out-Null
   $taskStatusPath = Join-Path $taskRoot 'task_status.json'

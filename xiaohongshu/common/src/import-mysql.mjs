@@ -7,6 +7,7 @@ import { POST_FIELDS, COMMENT_FIELDS, canonicalXhsNoteUrl } from "./schema.mjs";
 import { pathToFileURL } from "node:url";
 import { assertLocalLease, withImportLease } from "./lease-guard.mjs";
 import { createImportBatches, retryImportBatch, IMPORT_PENDING_EXIT_CODE } from "./import-recovery.mjs";
+import { queryImportLock } from './import-lock-request.mjs';
 import { writeJsonAtomic } from "./checkpoint.mjs";
 import {recordCommittedPosts,subtitleWriteCount} from './monitor-telemetry.mjs';
 
@@ -210,20 +211,21 @@ async function importRowsTimingImpl({ posts = [], comments = [], verify = false,
     committedBatches: 0, totalBatches: batches.length, charsetCompatibility: compatibility };
   try {
     for (const [index, batch] of batches.entries()) {
+      let writeAttempt = 0;
       const result = await retryImportBatch(async () => {
+        writeAttempt += 1;
         const connection = await mysql.createConnection(mysqlConnectionOptions());
         let acquired = false, transaction = false;
         try {
-          // A failed tail must not wait behind the shared write lock merely
-          // to rewrite earlier committed batches. Verify all effective fields
-          // read-only first; only genuine differences enter the write path.
-          const postChanges=await rowsNeedingImport(connection,'ods_social_media_post',POST_FIELDS,batch.posts,row=>({sql:'`文章id`=? AND `平台`=? AND `项目`=?',values:[row.文章id,row.平台,row.项目]}));
-          const commentChanges=await rowsNeedingImport(connection,'ods_social_media_comment',COMMENT_FIELDS,batch.comments,row=>({sql:'`评论id`=? AND `文章id`=? AND `平台`=? AND `项目`=?',values:[row.评论id,row.文章id,row.平台,row.项目]}));
+          // A normal import updates matching business IDs, including identical rows.
+          // On retry, read back a possibly committed batch before writing it again.
+          const postChanges=writeAttempt===1?batch.posts:await rowsNeedingImport(connection,'ods_social_media_post',POST_FIELDS,batch.posts,row=>({sql:'`文章id`=? AND `平台`=? AND `项目`=?',values:[row.文章id,row.平台,row.项目]}));
+          const commentChanges=writeAttempt===1?batch.comments:await rowsNeedingImport(connection,'ods_social_media_comment',COMMENT_FIELDS,batch.comments,row=>({sql:'`评论id`=? AND `文章id`=? AND `平台`=? AND `项目`=?',values:[row.评论id,row.文章id,row.平台,row.项目]}));
           await verifyLease();
           if(!postChanges.length&&!commentChanges.length)return {
             postResult:{inserted:0,updated:0,videoContentWrites:0,verifiedUnchanged:batch.posts.length},
             commentResult:{inserted:0,updated:0,verifiedUnchanged:batch.comments.length}};
-          const [lock] = await timed('database_lock',()=>connection.query("SELECT GET_LOCK('social_xhs_distributed_import', ?) AS acquired", [lockTimeoutSeconds]));
+          const [lock] = await timed('database_lock',()=>queryImportLock(connection,{lockTimeoutSeconds}));
           if (Number(lock[0]?.acquired) !== 1) throw Object.assign(new Error('等待小红书分布式入库锁超时，请稍后重试'), { code: 'MYSQL_IMPORT_LOCK_TIMEOUT' });
           acquired = true;
           await verifyLease();

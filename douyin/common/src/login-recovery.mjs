@@ -1,3 +1,4 @@
+import {inspectBrowserCredential,LOGIN_PROOF_VERSION} from './login-proof.mjs';
 import {OperationalGate} from './operational-gate.mjs';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -195,8 +196,7 @@ export async function inspectLoginPage(page,platform){
    if(value&&typeof value==='object'&&'_value' in value)return value._value;
    return value;
   };
-  // Read rendered application login flags only. Never read cookies, storage,
-  // account IDs, tokens, credentials or request headers.
+  // Inspect rendered application signals here. Credential values stay in the browser-context verifier.
   const user=unwrap(window.__INITIAL_STATE__?.user);
   const explicit=unwrap(user?.isLogin)??unwrap(user?.isLoggedIn);
   const appLoggedIn=typeof explicit==='boolean'?explicit:null;
@@ -235,7 +235,9 @@ export async function inspectLoginPage(page,platform){
  if(!state.ready)return {ok:false,reason:'PAGE_NOT_READY',signals:state};
  if(state.appLoggedIn===false)return {ok:false,reason:'APP_REPORTS_LOGGED_OUT',signals:state};
  if(state.appLoggedIn!==true&&!state.ownAccount)return {ok:false,reason:'LOGIN_STATE_UNCONFIRMED',signals:state};
- return {ok:true,evidence:state.appLoggedIn===true?'rendered_app_login_flag':'own_account_navigation'};
+ const proof=await inspectBrowserCredential(page.context(),platform);
+ if(!proof.credentialPresent)return {ok:false,reason:proof.reason,credentialVerified:false};
+ return {ok:true,evidence:state.appLoggedIn===true?'rendered_app_login_flag':'own_account_navigation',credentialVerified:true,proofVersion:LOGIN_PROOF_VERSION,credentialCheckedAt:proof.checkedAt};
 }
 export async function verifyManualLogin(context,platform,{settleMs=800}={}){
  let page=null,first=null,last=null;
@@ -255,7 +257,7 @@ export async function verifyManualLogin(context,platform,{settleMs=800}={}){
   if(check.reason==='LOGIN_OR_SECURITY_STILL_VISIBLE'||check.reason==='APP_REPORTS_LOGGED_OUT')return check;
  }
  const second=await inspectLoginPage(page,platform);
- return second.ok?{ok:true,evidence:first.evidence,verifiedAt:new Date().toISOString()}:second;
+ return second.ok?{...second,verifiedAt:new Date().toISOString()}:second;
 }
 export async function waitForManualLogin(context,platform,{timeoutMs=15000,pollMs=750,settleMs=800,onCheck=()=>{}}={}){
  const deadline=Date.now()+Math.max(0,timeoutMs);let last;

@@ -82,7 +82,15 @@ class NotificationTests(unittest.TestCase):
             'noChangeCompleted':1},'resetOnceCompleted':1}
         self.assertEqual(platform_progress_line(platform),'抖音：完成✅ 15/279 · 重试 8 · 待领 256')
         platform['completedPendingImport']=1
-        self.assertEqual(platform_progress_line(platform),'抖音：完成✅ 14/279 · 重试 9 · 待领 256')
+        self.assertEqual(platform_progress_line(platform),'抖音：完成✅ 15/279 · 重试 8 · 待领 256 · 已结案待补库 1词')
+
+    def test_p80_closed_keywords_remain_closed_while_waiting_import(self):
+        platform={'platform':'小红书','counts':{'total':56,'completed':11,
+            'pendingNew':11,'retryPending':31,'leased':3,'failed':0},
+            'completedPendingImport':11}
+        self.assertEqual(platform_progress_line(platform),
+            '小红书：完成✅ 11/56 · 重试 34 · 待领 11 · 已结案待补库 11词')
+        self.assertEqual(platform['counts']['completed'],11)
 
     def test_leased_and_failed_are_unfinished_not_completed(self):
         platform={'platform':'小红书','counts':{'total':7,'completed':1,'pendingNew':1,

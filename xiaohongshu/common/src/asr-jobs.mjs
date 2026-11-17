@@ -15,6 +15,8 @@ const extensionFor = url => {
   } catch { return ".mp4"; }
 };
 
+export const ASR_QUEUE_STOP_VERSION = 'xhs-asr-queue-stop-20261114-v1';
+
 export class AsrJobProcessor {
   constructor({ db, service, mediaDir, maxAttempts = 3, retryDelayMs = 3000, keepMedia = false, onCompleted = null, shouldStop = async () => false }) {
     this.db = db;
@@ -30,6 +32,7 @@ export class AsrJobProcessor {
     this.stopping = false;
     this.drainRequested = false;
     this.haltedReason = null;
+    console.log('[ASR队列版本] ' + ASR_QUEUE_STOP_VERSION);
   }
 
   start() {
@@ -50,7 +53,12 @@ export class AsrJobProcessor {
   }
 
   async waitForWork() {
-    await new Promise(resolve => { this.waiter = resolve; });
+    // Check the persistent state and register the waiter in one synchronous
+    // step: close/drain may already have sent their one-shot wake signal.
+    await new Promise(resolve => {
+      if (this.stopping || this.drainRequested) resolve();
+      else this.waiter = resolve;
+    });
   }
 
   mediaPath(job) {
@@ -140,6 +148,9 @@ export class AsrJobProcessor {
         console.log('[ASR安全停止] 当前任务已收尾，剩余ASR任务保留，不再领取');
         break;
       }
+      // shouldStop can await the collection pause. close() may have run while
+      // it was pending, so do not claim another job or enter an idle wait.
+      if (this.stopping) break;
       const job = claimAsrJob(this.db);
       if (job) {
         const keepRunning = await this.process(job);

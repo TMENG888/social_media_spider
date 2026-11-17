@@ -15,7 +15,7 @@ function excluded(id){
  n.scopeAudit={keyword,noteId:String(id),checkedAt:'2026-10-15T10:00:00Z',assessment:{policy:'20261015-positive-scope-evidence-v2',status:'out_of_scope',anchors:['保利熙瑞'],matches:[],reason:'configured_other_entity_observed',exclusion:{kind:'configured_entity',entity:'广州天河',field:'title'}}};
  return n;
 }
-for(const [platform,gate] of [['xhs',x],['douyin',d]]){
+for(const [platform,gate] of [['douyin',d]]){
  test(`${platform}: missing entity name is uncertain, never an exclusion or a verified positive`,()=>{
   const n=note('uncertain');n.result.post.文章标题='家人们，保利这个给我都去看';n.result.post.文章内容='西四环的保利新房，海淀南北双阳台';
   const r=gate.assessCoverage([n],{keyword,scanComplete:true,verifiedIds:[n.noteId]});
@@ -68,9 +68,20 @@ test('read-only scoped audit attaches only matching keyword/identity, tolerates 
   db.prepare('INSERT INTO scope_audit VALUES(?,?,?,?)').run(keyword,'n',JSON.stringify(n.scopeAudit.assessment),n.scopeAudit.checkedAt);
   const input={...n,scopeAudit:null};
   const [attached]=attachScopeAudits(db,[input],keyword);
-  assert.equal(x.assessCoverage([attached],{keyword,scanComplete:true}).excludedWithScopeEvidence,1);
+  assert.equal(x.assessCoverage([attached],{keyword,scanComplete:true}).excludedWithScopeEvidence,0);
   assert.equal(input.scopeAudit,null);
   db.exec("UPDATE scope_audit SET assessment_json='{broken'");
   assert.equal(x.assessCoverage(attachScopeAudits(db,[input],keyword),{keyword,scanComplete:true}).denominator,1);
  }finally{db.close();}
+});
+
+test('xhs: saved usable detail counts without exact entity or topic words',()=>{
+ const n=note('observed');n.result.post.文章标题='产品矩阵介绍';n.result.post.文章内容='悦府、瑞府、润府';
+ const r=x.assessCoverage([n],{keyword:'华润置地 产品体系',scanComplete:true,verifiedIds:[n.noteId]});
+ assert.equal(r.numerator,1);assert.equal(r.denominator,1);assert.equal(r.ok,true);
+ assert.equal(r.lexicalMatchEnabled,false);assert.equal(r.semanticRelevance,'not_evaluated');
+});
+test('xhs: historical word exclusions remain gaps until original details recovered',()=>{
+ const n=excluded('legacy');const r=x.assessCoverage([n],{keyword,scanComplete:true});
+ assert.equal(r.denominator,1);assert.equal(r.excludedWithScopeEvidence,0);assert.equal(r.ok,false);
 });

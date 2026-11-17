@@ -1,3 +1,4 @@
+import {atomicLoginState} from './login-state-io.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 import path from 'node:path';
 import {openRecoveryPage} from './recovery-navigation.mjs';
@@ -32,8 +33,7 @@ async function requireVerifiedLoginTimingImpl(){
    bridge?.verification(check);
    console.log('[自动恢复核验] '+JSON.stringify(check));if(!check.ok)onStage('WAITING_AUTO_VERIFICATION');
    const diagnostic={platform,machine:os.hostname(),worker:workerId,at:new Date().toISOString(),...check};
-   const target=path.join(stateRootForStop,'login-auto-recovery-status.json'),temporary=target+'.tmp-'+process.pid;
-   await fs.writeFile(temporary,JSON.stringify(diagnostic));await fs.rename(temporary,target);
+   await atomicLoginState(path.join(stateRootForStop,'login-auto-recovery-status.json'),diagnostic);
   }});
 }
 try{
@@ -101,8 +101,9 @@ try{
  onStage('VERIFY_LOGIN');
  await requireVerifiedLogin();
  // Release the profile before waking a supervisor.
- onStage('CLOSE_BROWSER');
+ onStage('PREPARE_CLOSE');
  await bridge?.prepareClose();
+ onStage('CLOSE_BROWSER');
  await context.close();context=null;
  onStage('RECHECK_IDLE');
  await assertWorkerIdle(stateRoot);
@@ -117,7 +118,7 @@ try{
  else console.log('原采集监督器若仍在等待会自动继续；本次单独登录入口是否续采，以启动请求授权为准。');
  console.log('人工停止标记保持原样，不会由此工具清除。');
 }catch(error){
- const diagnostic=loginFailure(error,stage);
+ const diagnostic={...loginFailure(error,stage),operation:['rename','unlink','rmdir','kill','write','open'].includes(error.syscall)?error.syscall:'not_reported'};
  if(stateRootForStop){const safe={at:Date.now(),pid:process.pid,retryable:error.code==='RECOVERY_NAVIGATION_FAILED',code:diagnostic.code,stage};await fs.writeFile(path.join(stateRootForStop,'login-auto-recovery-error.json'),JSON.stringify(safe)).catch(()=>{});}
  console.error('[登录恢复诊断] '+JSON.stringify(diagnostic));
  console.error('LOGIN_RECOVERY_FAILED：未确认成功；'+diagnostic.hint+' 未强行解除监控保护；人工停止标记保持原样。');

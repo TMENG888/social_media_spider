@@ -1,3 +1,4 @@
+import {checkForegroundBudget} from './foreground-budget.mjs';
 import {configureTiming,timed,timedSync,contentTiming,timingDisposition,timingMarker,timingProgress,timingFailure,timingStop} from './keyword-timing.mjs';
 // Load shedding only: these pauses do not bypass platform restrictions.
 export function pacingRange(value, fallback) {
@@ -37,6 +38,7 @@ export async function waitForPacing(...args){return timed('pacing',()=>waitForPa
 async function waitForPacingTimingImpl(ms, {shouldStop = async () => false, sleep = n => new Promise(resolve => setTimeout(resolve, n)), now = Date.now} = {}) {
   const deadline = now() + Math.max(0, ms);
   while (true) {
+    checkForegroundBudget();
     if (await shouldStop()) throw new Error('STOP_REQUESTED：休息期间收到安全停止请求');
     const remaining = deadline - now();
     if (remaining <= 0) return;

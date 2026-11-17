@@ -67,7 +67,8 @@ export function normalizeTask(task, queueDefaults = {}, sharedDefaults = {}) {
     queueDefaults.minPublishedDate, config.cutoff, config.minPublishedDate, "2026-01-01"));
   if (validDate(cutoff) !== cutoff) throw new Error(`任务截止起点格式无效：${cutoff}`);
   const projectName = projectForTopic(topic);
-  const collectComments = topic === "专题二";
+  const collectComments = true;
+  const collectionPass = topic === "专题一" ? "articles-comments-20261110-v1" : null;
   const maxNotes = integer(first(task.maxNotes, queueDefaults.maxNotes, config.maxNotesPerKeyword, 3), "maxNotes");
   const maxSearchScrolls = integer(config.maxSearchScrolls, "maxSearchScrolls", 0);
   const collectAllCurrentYear = flag(config.collectAllCurrentYear, "collectAllCurrentYear");
@@ -80,12 +81,12 @@ export function normalizeTask(task, queueDefaults = {}, sharedDefaults = {}) {
   if (/^(?:[a-zA-Z]:[\\/]|[\\/])/.test(String(config.asrModel))) throw new Error("共享任务asrModel不能使用本机绝对路径");
   Object.assign(config, { projectName, collectComments, cutoff, minPublishedDate: cutoff,
     maxNotesPerKeyword: maxNotes, maxSearchScrolls, collectAllCurrentYear, searchStopWindow, importBatchSize });
-  const redisTaskId = `dy-${hash({ topic, keyword, cutoff })}`;
+  const redisTaskId = `dy-${hash({ topic, keyword, cutoff, ...(collectionPass ? {collectionPass} : {}) })}`;
   const payload = {
     topic, keyword, cutoff, minPublishedDate: cutoff, projectName, category: config.category,
     enabled: true, maxNotes, maxSearchScrolls, collectAllCurrentYear, collectComments,
     searchStopWindow, importBatchSize, transitionDelaySeconds, sequence, policyVersion: POLICY_VERSION,
-    collectorConfig: config
+    collectorConfig: config, ...(collectionPass ? {collectionPass} : {})
   };
   return { id: String(task.id || redisTaskId), redisTaskId, payloadHash: hash(payload), ...payload };
 }
@@ -144,4 +145,3 @@ export async function loadTaskManifest(file) {
   if (verified.manifestHash !== source.manifestHash || verified.taskCount !== source.taskCount || canonicalJson(verified.topicCounts) !== canonicalJson(source.topicCounts)) throw new Error("Redis任务清单manifestHash或任务统计不匹配");
   return verified;
 }
-

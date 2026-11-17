@@ -1,9 +1,12 @@
+import {CooldownDiagnostics} from './cooldown-diagnostics.mjs';
+import {performance} from 'node:perf_hooks';
+import {publishOpsState,flushOpsState} from './ops-state.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {redisSettings,connectRedis} from './redis-connection.mjs';
 import {loadTaskManifest} from './redis-task-manifest.mjs';
-import {writeJsonAtomic} from './checkpoint.mjs';
+import {BackgroundStateWriter} from './background-state-writer.mjs';
 import {OperationalGate,classifyRestriction} from './operational-gate.mjs';
 import {COOLDOWN_SCOPE_LUA} from './cooldown-scope.mjs';
 import {isStorageFull,storageStopMarker} from './local-storage-stop.mjs';
@@ -102,31 +105,38 @@ export class CooldownActiveError extends Error {
   }
 }
 export class RateLimitCooldown {
-  static async open({root,stateRoot,workerId,campaign=null,onStage=()=>{}}) {
-    onStage('READ_REDIS_SETTINGS');
+  static async open({root,stateRoot,workerId,campaign=null,onStage=()=>{},diagnosticContext=()=>({})}) {
+    const diagnostics=new CooldownDiagnostics({stateRoot,workerId,context:diagnosticContext});
+    let openStage='READ_REDIS_SETTINGS',client;
+    const started=performance.now();
+    const stage=value=>{openStage=value;onStage(value);diagnostics.event('open_stage',{stage:value});};
+    try {
+    stage('READ_REDIS_SETTINGS');
     const settings=await redisSettings(root);
+    diagnostics.configure({redisUrl:settings.url,commandTimeoutMs:settings.commandTimeoutMs});
     if(!campaign){
       campaign=settings.taskPoolCampaign;
       if(!campaign){
-        onStage('READ_MANIFEST');
+        stage('READ_MANIFEST');
         const manifest=await loadTaskManifest(path.join(root,'tasks','redis-tasks.json'));
         campaign=`${settings.campaign}-mysql-${manifest.manifestHash.slice(0,16)}`;
       }
     }
-    onStage('READ_PLATFORM_CONFIG');
+    stage('READ_PLATFORM_CONFIG');
     const config=JSON.parse((await fs.readFile(path.join(root,'config.json'),'utf8')).replace(/^\uFEFF/,''));
     const policy=config.rateLimitCooldown || {};
-    onStage('CONNECT_REDIS');
-    const client=await connectRedis(settings);
-    try {
+    stage('CONNECT_REDIS');
+    client=await connectRedis(settings);
+    diagnostics.success('connect_redis',performance.now()-started);
       const controller=new RateLimitCooldown({client,campaign,stateRoot,workerId,group:policy.group || 'shared',
-        scope:policy.scope || 'machine',delaysMs:policy.delaysMs || [7200000,14400000]});
+        scope:policy.scope || 'machine',delaysMs:policy.delaysMs || [7200000,14400000],diagnostics});
+      openStage='prepare_machine_scope';
       await controller.prepareMachineScope();
       return controller;
     }
-    catch(error){await client.close();throw error;}
+    catch(error){diagnostics.failure('open',openStage,error,performance.now()-started);await diagnostics.flush();await client?.close();throw error;}
   }
-  constructor({client,campaign,stateRoot,workerId,group='shared',scope='machine',machine=os.hostname(),delaysMs=[7200000,14400000]}) {
+  constructor({client,campaign,stateRoot,workerId,group='shared',scope='machine',machine=os.hostname(),delaysMs=[7200000,14400000],diagnostics=null}) {
     if(!/^[A-Za-z0-9_-]{1,160}$/.test(campaign) || !/^[A-Za-z0-9_-]{1,64}$/.test(group))
       throw new Error('Invalid cooldown campaign/group');
     if(delaysMs.length!==2 || !delaysMs.every(n=>Number.isSafeInteger(n)&&n>0))
@@ -136,29 +146,39 @@ export class RateLimitCooldown {
     Object.assign(this,{client,campaign,stateRoot,workerId,group:effectiveGroup,baseGroup:group,scope,machine,delaysMs});
     this.key=`xhs:{${campaign}}:rate-limit-cooldown:${effectiveGroup}`;
     this.legacyKey=`xhs:{${campaign}}:rate-limit-cooldown:${group}`;
-    this.writes=Promise.resolve();
+    this.stateWriter=this.stateRoot?new BackgroundStateWriter({file:path.join(this.stateRoot,'rate-limit-cooldown.json')}):null;
     this.operations=new OperationalGate({client,workerId,machine,platform:'小红书',keys:[`xhs:{${campaign}}:monitor:incidents`,`xhs:{${campaign}}:monitor:outbox`]});
     this.last=null;
+    this.diagnostics=diagnostics||new CooldownDiagnostics({stateRoot,workerId,machine});
+    this.diagnostics.configure({campaign,scope,group:effectiveGroup});
   }
-  async evaluate(script,args=[]) {
+  async diagnosticCall(stage,work,{validate=()=>{},stateSummary=false}={}) {
+    const started=performance.now();let phase='redis_command';
+    try {
+      const raw=await work();phase='response_parse';const value=JSON.parse(raw);
+      phase='state_validation';validate(value);
+      this.diagnostics.success(stage,performance.now()-started,stateSummary?value:null);return value;
+    }catch(error){this.diagnostics.failure(stage,phase,error,performance.now()-started);throw error;}
+  }
+  async evaluate(script,args=[],stage='read_scoped_cooldown') {
     let state;
     try {
-      state=JSON.parse(await this.client.eval(script,{keys:[this.key,this.operations.keys[0]],arguments:args.map(String)}));
-      if(!Number.isFinite(state.serverTime)||typeof state.active!=='boolean')throw new Error('Invalid cooldown response');
+      state=await this.diagnosticCall(stage,()=>this.client.eval(script,{keys:[this.key,this.operations.keys[0]],arguments:args.map(String)}),{
+        stateSummary:true,validate:value=>{if(!Number.isFinite(value.serverTime)||typeof value.active!=='boolean')throw new Error('COOLDOWN_STATE_INVALID');}});
     } catch(cause){throw Object.assign(new Error('COOLDOWN_STATE_UNAVAILABLE：无法确认共享冷却状态，停止自动访问',{cause}),{code:'COOLDOWN_STATE_UNAVAILABLE'});}
     this.last={...state,campaign:this.campaign,group:this.group,cooldownScope:this.scope,cooldownMachine:this.machine,scopeVersion:MACHINE_COOLDOWN_VERSION};
     const snapshot=this.last;
-    if(this.stateRoot){
-      const write=this.writes.catch(()=>{}).then(()=>writeJsonAtomic(path.join(this.stateRoot,'rate-limit-cooldown.json'),snapshot));
-      this.writes=write;
-      await write;
-    }
+    // Redis is the authority for the safety decision. Saving a regenerable
+    // monitoring snapshot must not delay this check or turn an SMB reader's
+    // transient file lock into a platform protection stop.
+    this.stateWriter?.enqueue(snapshot);
+    if(this.stateRoot)publishOpsState(path.join(this.stateRoot,'rate-limit-cooldown.json'),snapshot);
     return snapshot;
   }
   async prepareMachineScope(){
     if(this.scope!=='machine')return;
     try{
-      return JSON.parse(await this.client.eval(IMPORT_MACHINE_COOLDOWN,{keys:[this.key,this.legacyKey,this.operations.keys[0]],arguments:[this.machine]}));
+      return await this.diagnosticCall('prepare_machine_scope',()=>this.client.eval(IMPORT_MACHINE_COOLDOWN,{keys:[this.key,this.legacyKey,this.operations.keys[0]],arguments:[this.machine]}));
     }catch(cause){throw Object.assign(new Error('COOLDOWN_STATE_UNAVAILABLE：旧冷却归属或本机保护无法确认，保留保护并停止访问',{cause}),{code:'COOLDOWN_STATE_UNAVAILABLE'});}
   }
   async read(){await this.prepareMachineScope();return this.evaluate(READ_SCOPED_COOLDOWN,[this.operations.field]);}
@@ -170,7 +190,7 @@ export class RateLimitCooldown {
     queue.cooldownNodeField=this.operations.field;
     return true;
   }
-  async assertReady(){const s=await this.read();if(s.active)throw new CooldownActiveError(s);return s;}
+  async assertReady(){const s=await this.read();if(s.active){this.diagnostics.event('protection_active',{scope:s.scope,untilMs:s.untilMs,manualRequired:s.manualRequired});throw new CooldownActiveError(s);}return s;}
   async record(message,eventId){
     const kind=restrictionKind(message);
     if(!kind)return Promise.resolve(null);
@@ -183,11 +203,11 @@ export class RateLimitCooldown {
     }
     const id=createHash('sha256').update(String(eventId)).digest('hex');
     await this.prepareMachineScope();
-    const state=await this.evaluate(RECORD,[id,kind,this.workerId,...this.delaysMs,this.machine,this.scope]);
+    const state=await this.evaluate(RECORD,[id,kind,this.workerId,...this.delaysMs,this.machine,this.scope],'record_rate_limit');
     await this.operations.record(message,{cooldownMs:kind==='rate'?Math.max(1,state.untilMs-state.serverTime):this.delaysMs[0]});
     return this.read();
   }
-  async resetConfirmed(){const result=await this.evaluate(RESET,[`${Date.now()}-${process.pid}`,this.workerId]);await this.operations.resolve();return result;}
+  async resetConfirmed(){const result=await this.evaluate(RESET,[`${Date.now()}-${process.pid}`,this.workerId],'reset_confirmed');await this.operations.resolve();return result;}
   async wait({shouldStop=async()=>false,onState=()=>{},pollMs=15000,tickMs=250,waitForManual=false}={}) {
     while(true){
       if(await shouldStop())return {stopped:true};
@@ -195,7 +215,7 @@ export class RateLimitCooldown {
       if(await shouldStop())return {stopped:true};
       onState(state);
       if(state.manualRequired&&!waitForManual)return {manual:true,state};
-      if(!state.active)return {ready:true,state};
+      if(!state.active){this.diagnostics.event('wait_ready');return {ready:true,state};}
       const end=Date.now()+(state.manualRequired?pollMs:Math.min(pollMs,state.remainingMs));
       while(Date.now()<end){
         if(await shouldStop())return {stopped:true};
@@ -217,7 +237,12 @@ export class RateLimitCooldown {
           // Cooperative stop keeps current note/import intact and lease renewable.
           const marker=isStorageFull(error)?JSON.stringify(storageStopMarker({workerId:this.workerId})):
             error.code || 'COOLDOWN_STATE_UNAVAILABLE';
-          await fs.writeFile(stopFile,marker,{encoding:'utf8',flag:'wx'}).catch(e=>{if(e.code!=='EEXIST')throw e;});
+          let markerCreated=true;
+          try{await fs.writeFile(stopFile,marker,{encoding:'utf8',flag:'wx'});}catch(e){
+            if(e.code!=='EEXIST'){this.diagnostics.failure('write_local_stop','file_write',e,0);throw e;}
+            markerCreated=false;
+          }
+          this.diagnostics.event('local_stop_decided',{reason:error.code||'COOLDOWN_STATE_UNAVAILABLE',markerCreated,stopScope:'local_worker',automaticResume:error.code==='RATE_LIMIT_COOLDOWN_ACTIVE',resumePolicy:error.code==='RATE_LIMIT_COOLDOWN_ACTIVE'?'timed_cooldown':error.code==='COOLDOWN_MANUAL_REQUIRED'?'wait_for_operator':'explicit_recovery_required'});
           onStop(error);
           closed=true;
         }
@@ -228,5 +253,5 @@ export class RateLimitCooldown {
     timer=setTimeout(()=>void check(),intervalMs);
     return async()=>{closed=true;clearTimeout(timer);await pending;};
   }
-  async close(){await this.writes.catch(()=>{});await this.client.close();}
+  async close(){try{await this.diagnostics.flush();await this.stateWriter?.close();if(this.stateRoot)await flushOpsState(path.join(this.stateRoot,'rate-limit-cooldown.json'));}finally{await this.client.close();}}
 }

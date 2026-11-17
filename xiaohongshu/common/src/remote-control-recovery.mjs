@@ -4,7 +4,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 
 const names=['supervisor.stop','stop.requested'];
-export const recoveryVersion='xhs-control-recovery-20261105-v2';
+export const recoveryVersion='control-auto-recovery-20261113-v1';
 export function failureCode(error) {
   const code=String(error?.code||'')+' '+String(error?.message||'');
   if(/TIMEOUT|ETIMEDOUT/i.test(code))return 'CONTROL_TIMEOUT';
@@ -47,34 +47,56 @@ async function snapshot(file) {
   }catch(error){if(error.code==='ENOENT')return null;throw error;}
 }
 function same(a,b){return a&&b&&a.bytes.equals(b.bytes)&&a.stat.ino===b.stat.ino&&a.stat.dev===b.stat.dev&&a.stat.mtimeMs===b.stat.mtimeMs;}
-async function assertIdle(state) {
+async function assertIdle(state,owner=null) {
   for(const [name,key] of [['worker.lock','pid'],['monitor-supervisor.json','supervisorPid']]){
-    const item=await snapshot(path.join(state,name));if(!item)continue;
+    const item=await snapshot(path.join(state,name));if(!item){if(owner&&name==='monitor-supervisor.json')throw new Error('CONTROL_RECOVERY_SUPERVISOR_CHANGED');continue;}
     let pid;try{pid=JSON.parse(item.bytes.toString('utf8').replace(/^\uFEFF/,''))[key];}catch{}
     if(!Number.isSafeInteger(pid)||pid<=0)throw new Error('CONTROL_RECOVERY_PROCESS_UNKNOWN');
     try{process.kill(pid,0);}
-    catch(error){if(error.code==='ESRCH')continue;throw new Error('CONTROL_RECOVERY_PROCESS_UNKNOWN');}
+    catch(error){if(error.code==='ESRCH'&&!(owner&&name==='monitor-supervisor.json'))continue;throw new Error('CONTROL_RECOVERY_PROCESS_UNKNOWN');}
+    if(name==='monitor-supervisor.json'&&owner){
+      const supervisor=JSON.parse(item.bytes.toString('utf8').replace(/^\uFEFF/,''));
+      if(pid===owner.pid&&supervisor.sessionId===owner.sessionId&&supervisor.state==='reconnecting')continue;
+      throw new Error('CONTROL_RECOVERY_SUPERVISOR_CHANGED');
+    }
     throw new Error('CONTROL_RECOVERY_NODE_ACTIVE');
   }
 }
-export async function recoverControlFailure(ctx,verifyNoHold) {
+export function ownedFailure(item,ctx) {
+  if(!item)return false;
+  const text=item.bytes.toString('utf8').replace(/^\uFEFF/,'');
+  if(ctx.platform==='小红书'&&text==='COOLDOWN_STATE_UNAVAILABLE')return true;
+  try{return isControlFailure(JSON.parse(text),ctx);}catch{return false;}
+}
+export async function inspectControlFailure(ctx){
+  const state=path.join(ctx.workerRoot,'.state');
+  const items=await Promise.all(names.map(n=>snapshot(path.join(state,n))));
+  const failures=items.filter(item=>ownedFailure(item,ctx));
+  const protectedStops=items.filter(item=>item&&!ownedFailure(item,ctx)&&!retainedProtection(item));
+  return {eligible:failures.length>0&&protectedStops.length===0,
+    failures:failures.map(item=>path.basename(item.file)),protectedStops:protectedStops.map(item=>path.basename(item.file))};
+}
+function retainedProtection(item){
+  return item&&path.basename(item.file)==='stop.requested'&&
+    ['RATE_LIMIT_COOLDOWN_ACTIVE','COOLDOWN_MANUAL_REQUIRED'].includes(item.bytes.toString('utf8'));
+}
+export async function recoverControlFailure(ctx,verifyNoHold,{owner=null}={}) {
   const state=path.join(ctx.workerRoot,'.state');
   if(await snapshot(path.join(state,'remote-control-recovery.lock')))throw new Error('CONTROL_RECOVERY_INCOMPLETE');
   const items=await Promise.all(names.map(n=>snapshot(path.join(state,n))));
-  const owned=item=>{try{return isControlFailure(JSON.parse(item.bytes.toString('utf8').replace(/^\uFEFF/,'')),ctx);}catch{return false;}};
+  const owned=item=>ownedFailure(item,ctx);
   if(!items.some(item=>item&&owned(item)))return {version:recoveryVersion,archived:[]};
   // Retain a collector's cooldown latch unchanged. The original cooldown gate
   // must still wait for Redis to report ready before consuming this marker.
   // No manual/login/captcha/unknown marker is eligible for this mixed case.
-  const retained=item=>item&&path.basename(item.file)==='stop.requested'&&
-    item.bytes.toString('utf8')==='RATE_LIMIT_COOLDOWN_ACTIVE';
+  const retained=retainedProtection;
   if(items.some(item=>item&&!owned(item)&&!retained(item)))throw new Error('CONTROL_RECOVERY_PROTECTED_STOP');
-  await assertIdle(state);
+  await assertIdle(state,owner);
   const lockFile=path.join(state,'remote-control-recovery.lock');
   const lock=await fs.open(lockFile,'wx');const moved=[];let restoreFailed=false;
   try{
     await lock.writeFile(JSON.stringify({version:recoveryVersion,target:ctx.target,pid:process.pid,startedAt:new Date().toISOString()}),'utf8');
-    await verifyNoHold();await assertIdle(state);
+    await verifyNoHold();await assertIdle(state,owner);
     for(let i=0;i<names.length;i++){
       const current=await snapshot(path.join(state,names[i]));
       if((items[i]||current)&&!same(items[i],current))throw new Error('CONTROL_RECOVERY_MARKER_CHANGED');
@@ -86,7 +108,7 @@ export async function recoverControlFailure(ctx,verifyNoHold) {
       await fs.rename(item.file,saved);moved.push({original:item.file,saved});
       if(!same(item,await snapshot(saved)))throw new Error('CONTROL_RECOVERY_MARKER_CHANGED');
     }
-    await verifyNoHold();await assertIdle(state);
+    await verifyNoHold();await assertIdle(state,owner);
     for(let i=0;i<names.length;i++){
       const current=await snapshot(path.join(state,names[i]));
       if(retained(items[i])){if(!same(items[i],current))throw new Error('CONTROL_RECOVERY_NEW_STOP');}

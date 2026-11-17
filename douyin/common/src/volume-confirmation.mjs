@@ -1,7 +1,7 @@
 // Collector-local counts are provisional. Only the final fenced SQL/Redis
 // confirmation can promote a keyword to quantity-completed.
 export function volumeQueueConfirmed(confirmation) {
- return confirmation?.status==='completed'&&confirmation?.acceptedByVolume===true;
+ return false; // Article quantity is no longer a valid Douyin completion reason.
 }
 
 export function keywordQueueConfirmed(confirmation) {
